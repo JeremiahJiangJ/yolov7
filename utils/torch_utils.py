@@ -4,6 +4,7 @@ import datetime
 import logging
 import math
 import os
+import pickle
 import platform
 import subprocess
 import time
@@ -34,6 +35,15 @@ def torch_distributed_zero_first(local_rank: int):
     yield
     if local_rank == 0:
         torch.distributed.barrier()
+
+
+def torch_load(f, **kwargs):
+    # PyTorch >= 2.6 defaults to weights_only=True, which rejects YOLOv7 checkpoints and label caches (pickled
+    # models, numpy arrays). Retry with the old behaviour; older PyTorch never raises here.
+    try:
+        return torch.load(f, **kwargs)
+    except pickle.UnpicklingError:
+        return torch.load(f, weights_only=False, **kwargs)
 
 
 def init_torch_seeds(seed=0):
