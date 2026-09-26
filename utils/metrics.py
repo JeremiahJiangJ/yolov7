@@ -8,6 +8,9 @@ import torch
 
 from . import general
 
+# np.trapz was removed in NumPy 2.4; np.trapezoid only exists from NumPy 2.0
+_trapz = getattr(np, 'trapezoid', None) or np.trapz
+
 
 def fitness(x):
     # Model fitness as a weighted combination of metrics
@@ -102,7 +105,7 @@ def compute_ap(recall, precision, v5_metric=False):
     method = 'interp'  # methods: 'continuous', 'interp'
     if method == 'interp':
         x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)  # integrate
+        ap = _trapz(np.interp(x, mrec, mpre), x)  # integrate
     else:  # 'continuous'
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve
