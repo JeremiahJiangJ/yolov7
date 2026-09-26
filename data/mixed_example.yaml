@@ -1,0 +1,36 @@
+# How training images are chosen:
+#   weighted     (default) per-source weights below, optional schedule, seeded & reproducible
+#   proportional no source weighting: every image once per epoch (shares = dataset sizes), but otherwise the
+#                same machinery as weighted (seeding, source-local mosaic, target anchors) -> use as the
+#                baseline when measuring what weighting buys you
+#   upstream     stock YOLOv7 loading, identical to `train: [paths...]`: pooled dataset, pooled mosaic
+#                partners, pooled autoanchor, not reproducible, no shuffle on 1 GPU unless --shuffle.
+#                weight / weight_schedule / epoch_size / target / cache are ignored
+sampling: weighted
+
+# Multi-source training. Weights are relative (any scale; normalized to sum to 1).
+# Exactly one source must set `target: true` (deployment domain; used for autoanchor).
+# `cache:` is optional per source. Default: target follows --cache-images, auxiliary sources are not cached.
+train_sources:
+  - {name: target,        path: /data/target/images/train, weight: 40, target: true}
+  - {name: supplementary, path: /data/supp/images/train,   weight: 30}
+  - {name: open_source,   path: /data/open/images/train,   weight: 20, cache: false}
+  - {name: synthetic,     path: /data/synth/images/train,  weight: 10}
+
+# Optional. The weights above apply from epoch 0; each point changes them from its epoch on.
+# mode: step (switch at the point) or linear (ramp from the previous point to this one).
+# Every point must list every source (0 switches a source off).
+weight_schedule:
+  mode: step
+  points:
+    - {epoch: 100, weights: {target: 60, supplementary: 25, open_source: 10, synthetic: 5}}
+
+# Images per epoch, fixed for the whole run. One of:
+#   int      -> fixed number, e.g. 20000
+#   <name>   -> len(source) / its epoch-0 weight (that source seen once per epoch at the start)
+#   omitted  -> total number of images across all sources
+epoch_size: target
+
+val: /data/target/images/val   # target domain only
+nc: 1
+names: ['object']

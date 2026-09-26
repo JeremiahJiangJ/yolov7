@@ -34,6 +34,7 @@ from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
+from utils.mixed_data import create_mixed_dataloader, rebuild_loader, seed_everything, stable_hash
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,12 @@ def train(hyp, opt, device, tb_writer=None):
     # Configure
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(2 + rank)
+    init_seeds(opt.seed + 2 + rank)
+    if opt.deterministic:  # bit-exact GPU math; slower (no cuDNN autotuning, deterministic kernels)
+        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = False, True
+        torch.use_deterministic_algorithms(True, warn_only=True)  # warns (doesn't crash) on ops with no deterministic kernel
+    else:
+        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = True, False
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
@@ -95,7 +101,15 @@ def train(hyp, opt, device, tb_writer=None):
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
-    train_path = data_dict['train']
+    train_path = data_dict.get('train')
+    sampling = data_dict.get('sampling', 'weighted') if 'train_sources' in data_dict else 'upstream'
+    assert sampling in ('weighted', 'proportional', 'upstream'), f'sampling must be weighted|proportional|upstream'
+    mixed = sampling != 'upstream'  # mixed-source loader (weighted or proportional); else stock YOLOv7 loading
+    if 'train_sources' in data_dict and not mixed:  # stock loader over all sources pooled, like `train: [a, b, c]`
+        assert train_path is None, 'set either train or train_sources, not both'
+        train_path = [s_['path'] for s_ in data_dict['train_sources']]
+        logger.info('sampling: upstream -- stock YOLOv7 data loading over the pooled sources; '
+                    'weights, weight_schedule, epoch_size, target and cache keys are ignored')
     test_path = data_dict['val']
 
     # Freeze
@@ -201,6 +215,7 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
+    sampler_sig = None
     if pretrained:
         # Optimizer
         if ckpt['optimizer'] is not None:
@@ -225,6 +240,7 @@ def train(hyp, opt, device, tb_writer=None):
                         (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  # finetune additional epochs
 
+        sampler_sig = ckpt.get('sampler') if opt.resume else None  # mixed-source config at checkpoint time
         del ckpt, state_dict
 
     # Image sizes
@@ -242,10 +258,21 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+    if mixed:
+        assert not opt.image_weights and not opt.rect, '--image-weights / --rect are not supported with train_sources'
+        dataloader, dataset = create_mixed_dataloader(data_dict, imgsz, batch_size, gs, opt, hyp=hyp,
+                                                      cache=opt.cache_images, rank=rank, world_size=opt.world_size,
+                                                      workers=opt.workers, quad=opt.quad, prefix=colorstr('train: '),
+                                                      start_epoch=start_epoch)
+        if sampler_sig is not None and sampler_sig != dataloader.sampler.signature():
+            logger.warning('--resume: mixed-source config (seed/sources/sizes/weights/epoch_size) differs from the '
+                           'checkpoint; the resumed run will not match an uninterrupted one')
+    else:
+        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                                world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
+                                                shuffle=opt.shuffle)
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -269,7 +296,8 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Anchors
             if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+                anchor_ds = dataset.target_dataset if mixed else dataset  # deployment-domain boxes only
+                check_anchors(anchor_ds, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
@@ -304,8 +332,19 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    mosaic_closed = False
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if mixed:  # main-process RNG (e.g. --multi-scale) = f(epoch); left alone in upstream mode
+            seed_everything(stable_hash(opt.seed, 'main', rank, epoch))
+
+        # Close mosaic for the final N epochs. InfiniteDataLoader workers hold their own copy of the dataset,
+        # so flipping dataset.mosaic here would never reach them: shut the workers down and rebuild the loader.
+        if opt.close_mosaic and not mosaic_closed and epoch >= epochs - opt.close_mosaic:
+            mosaic_closed = True
+            logger.info(f'Closing mosaic/mixup/paste-in for the last {epochs - epoch} epochs')
+            dataloader = rebuild_loader(dataloader, close_mosaic=True, epoch=epoch)  # same sampler (and its state), fresh workers
+            assert len(dataloader) == nb, 'batches per epoch changed after closing mosaic'
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -404,6 +443,9 @@ def train(hyp, opt, device, tb_writer=None):
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
         scheduler.step()
+        if mixed and rank in [-1, 0]:
+            ex = dataloader.sampler.exposure(epoch + 1)
+            logger.info('cumulative passes: ' + ', '.join(f'{n} {x:.2f}' for n, x in zip(dataset.names, ex)))
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
@@ -458,7 +500,8 @@ def train(hyp, opt, device, tb_writer=None):
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
-                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None,
+                        'sampler': dataloader.sampler.signature() if mixed else None}
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
@@ -554,6 +597,11 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
+    parser.add_argument('--seed', type=int, default=0, help='global seed: sampling, augmentation, init')
+    parser.add_argument('--shuffle', action='store_true', help='shuffle training images each epoch (stock loader only; '
+                        'upstream never shuffles on a single GPU)')
+    parser.add_argument('--deterministic', action='store_true', help='deterministic cuDNN/CUDA kernels (slower)')
+    parser.add_argument('--close-mosaic', type=int, default=0, help='disable mosaic/mixup/paste-in for the last N epochs')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
@@ -582,6 +630,8 @@ if __name__ == '__main__':
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.SafeLoader))  # replace
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
+        for k, v in {'seed': 0, 'deterministic': False, 'close_mosaic': 0, 'shuffle': False}.items():  # opt.yaml from older runs
+            setattr(opt, k, getattr(opt, k, v))
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
         opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
@@ -589,6 +639,9 @@ if __name__ == '__main__':
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+
+    if opt.deterministic:  # must be set before cuBLAS initializes
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
     # DDP mode
     opt.total_batch_size = opt.batch_size
