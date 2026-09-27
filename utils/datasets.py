@@ -63,7 +63,7 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False, seed=0):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -79,7 +79,11 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    # DDP: every rank must shuffle with the same seed, since DistributedSampler splits one shared permutation
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, seed=seed) if rank != -1 else None
+    # Seeds the shuffle (--shuffle) and each worker's base seed. Offset by rank so DDP ranks augment differently
+    generator = torch.Generator()
+    generator.manual_seed(seed + max(rank, 0))
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
@@ -88,8 +92,18 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         sampler=sampler,
                         shuffle=shuffle and sampler is None,  # upstream (False) never shuffles on a single GPU
                         pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
+                        worker_init_fn=seed_worker,
+                        generator=generator)
     return dataloader, dataset
+
+
+def seed_worker(worker_id):
+    # Each worker's torch seed is base_seed + worker_id, with base_seed drawn from the DataLoader's generator.
+    # Derive python/numpy seeds from it too: augmentation (mosaic, HSV, flips, mixup, ...) uses random / np.random
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):

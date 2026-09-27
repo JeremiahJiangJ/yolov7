@@ -20,7 +20,7 @@ import yaml
 
 from utils.google_utils import gsutil_getsize
 from utils.metrics import fitness
-from utils.torch_utils import init_torch_seeds, torch_load
+from utils.torch_utils import init_seeds, torch_load
 
 # Settings
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
@@ -34,13 +34,6 @@ def set_logging(rank=-1):
     logging.basicConfig(
         format="%(message)s",
         level=logging.INFO if rank in [-1, 0] else logging.WARN)
-
-
-def init_seeds(seed=0):
-    # Initialize random number generator (RNG) seeds
-    random.seed(seed)
-    np.random.seed(seed)
-    init_torch_seeds(seed)
 
 
 def get_latest_run(search_dir='.'):

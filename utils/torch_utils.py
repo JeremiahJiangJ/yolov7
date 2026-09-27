@@ -6,12 +6,14 @@ import math
 import os
 import pickle
 import platform
+import random
 import subprocess
 import time
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -46,12 +48,18 @@ def torch_load(f, **kwargs):
         return torch.load(f, weights_only=False, **kwargs)
 
 
-def init_torch_seeds(seed=0):
-    # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
+def init_seeds(seed=0, deterministic=False):
+    # Seed every RNG the main process uses. DataLoader workers are seeded separately (see utils.datasets.seed_worker).
+    # https://pytorch.org/docs/stable/notes/randomness.html
+    random.seed(seed)
+    np.random.seed(seed % 2 ** 32)
     torch.manual_seed(seed)
-    if seed == 0:  # slower, more reproducible
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:  # bit-exact GPU math; slower (no cuDNN autotuning, deterministic kernels)
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')  # deterministic cuBLAS; read when cuBLAS first initializes
         cudnn.benchmark, cudnn.deterministic = False, True
-    else:  # faster, less reproducible
+        torch.use_deterministic_algorithms(True, warn_only=True)  # warns (doesn't crash) on ops with no deterministic kernel
+    else:  # faster, not reproducible
         cudnn.benchmark, cudnn.deterministic = True, False
 
 

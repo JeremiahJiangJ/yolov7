@@ -366,4 +366,5 @@ def rebuild_loader(loader, close_mosaic=False, epoch=None):
     if epoch is not None and hasattr(loader.sampler, 'rewind'):
         loader.sampler.rewind(epoch)
     return type(loader)(ds, batch_size=loader.batch_size, num_workers=loader.num_workers, sampler=loader.sampler,
-                        pin_memory=loader.pin_memory, collate_fn=loader.collate_fn)
+                        pin_memory=loader.pin_memory, collate_fn=loader.collate_fn,
+                        worker_init_fn=loader.worker_init_fn, generator=loader.generator)

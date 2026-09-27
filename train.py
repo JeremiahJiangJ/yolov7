@@ -26,14 +26,14 @@ from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
-from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
+from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
-    torch_load
+    torch_load, init_seeds
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 from utils.mixed_data import create_mixed_dataloader, rebuild_loader, seed_everything, stable_hash
 
@@ -61,12 +61,7 @@ def train(hyp, opt, device, tb_writer=None):
     # Configure
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(opt.seed + 2 + rank)
-    if opt.deterministic:  # bit-exact GPU math; slower (no cuDNN autotuning, deterministic kernels)
-        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = False, True
-        torch.use_deterministic_algorithms(True, warn_only=True)  # warns (doesn't crash) on ops with no deterministic kernel
-    else:
-        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = True, False
+    init_seeds(opt.seed, opt.deterministic)
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
@@ -193,7 +188,8 @@ def train(hyp, opt, device, tb_writer=None):
                 pg0.append(v.rbr_dense.vector)
 
     if opt.adam:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        # weight_decay=0 here: pg0 (BN weights) and pg2 (biases) must not decay; AdamW would default them to 0.01
+        optimizer = optim.AdamW(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999), weight_decay=0.0)  # adjust beta1 to momentum
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
@@ -273,7 +269,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                 hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                                 world_size=opt.world_size, workers=opt.workers,
                                                 image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
-                                                shuffle=opt.shuffle)
+                                                shuffle=opt.shuffle, seed=opt.seed)
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -589,7 +585,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
-    parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
+    parser.add_argument('--adam', action='store_true', help='use torch.optim.AdamW() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
@@ -598,7 +594,8 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
-    parser.add_argument('--seed', type=int, default=0, help='global seed: sampling, augmentation, init')
+    parser.add_argument('--seed', type=int, default=None, help='global seed: sampling, augmentation, init '
+                        '(default 0); setting it also turns on --deterministic')
     parser.add_argument('--shuffle', action='store_true', help='shuffle training images each epoch (stock loader only; '
                         'upstream never shuffles on a single GPU)')
     parser.add_argument('--deterministic', action='store_true', help='deterministic cuDNN/CUDA kernels (slower)')
@@ -640,9 +637,10 @@ if __name__ == '__main__':
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
-
-    if opt.deterministic:  # must be set before cuBLAS initializes
-        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        if opt.seed is None:
+            opt.seed = 0
+        else:  # an explicit seed asks for a reproducible run
+            opt.deterministic = True
 
     # DDP mode
     opt.total_batch_size = opt.batch_size
