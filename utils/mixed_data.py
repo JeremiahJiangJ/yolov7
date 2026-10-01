@@ -318,7 +318,8 @@ def create_mixed_dataloader(data_dict, imgsz, batch_size, stride, opt, hyp=None,
             with torch_distributed_zero_first(rank):
                 dsets.append(LoadImagesAndLabels(p, imgsz, batch_size, augment=True, hyp=hyp, rect=False,
                                                  cache_images=bool(c), single_cls=opt.single_cls, stride=int(stride),
-                                                 pad=0.0, image_weights=False, prefix=f'{prefix}[{n}] '))
+                                                 pad=0.0, image_weights=False, prefix=f'{prefix}[{n}] ',
+                                                 native_scale=data_dict.get('native_scale', False)))
         dataset = MixedDataset(dsets, names, target_idx)
 
     if schedule is None:  # sampling: proportional -- no source weighting: every image exactly once per epoch,

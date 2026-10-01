@@ -269,7 +269,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                 hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                                 world_size=opt.world_size, workers=opt.workers,
                                                 image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
-                                                shuffle=opt.shuffle, seed=opt.seed)
+                                                shuffle=opt.shuffle, seed=opt.seed,
+                                                native_scale=data_dict.get('native_scale', False))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)

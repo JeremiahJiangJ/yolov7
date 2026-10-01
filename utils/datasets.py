@@ -63,7 +63,8 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False, seed=0):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False, seed=0,
+                      native_scale=False):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -75,7 +76,8 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
+                                      prefix=prefix,
+                                      native_scale=native_scale)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -367,8 +369,11 @@ def img2label_paths(img_paths):
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', native_scale=False):
         self.img_size = img_size
+        # native_scale: load images at their native size (never upscaled; only images larger than img_size are
+        # downscaled to fit), so object pixel size stays the same across sources with different image sizes
+        self.native_scale = native_scale
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -435,6 +440,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.batch = bi  # batch index of image
         self.n = n
         self.indices = range(n)
+        if native_scale:
+            assert not self.rect, 'native_scale does not support rectangular training (--rect)'
+            n_big = int((self.shapes.max(1) > img_size).sum())
+            logging.info(f'{prefix}native_scale: images loaded at native size'
+                         + (f'; {n_big}/{n} larger than {img_size} are downscaled to fit' if n_big else ''))
 
         # Rectangular Training
         if self.rect:
@@ -575,7 +585,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment and not self.native_scale)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
             labels = self.labels[index].copy()
@@ -687,6 +697,8 @@ def load_image(self, index):
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
+        if self.native_scale:
+            r = min(r, 1.0)  # never upscale; only shrink images that don't fit
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)

@@ -31,6 +31,12 @@ weight_schedule:
 #   omitted  -> total number of images across all sources
 epoch_size: target
 
+# Optional, default false. true: load every training image at its native size -- never upscaled; images larger
+# than --img-size are downscaled to fit -- so sensors with the same pixel scale keep the same object size in pixels.
+# Set --img-size to the target's native long side (e.g. 1280 for 1280x720). Smaller images are padded (grey) by
+# mosaic / letterbox. Also works with a plain `train:` list. Not compatible with --rect.
+native_scale: false
+
 val: /data/target/images/val   # target domain only
 nc: 1
 names: ['object']
