@@ -81,6 +81,37 @@ def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, sa
     return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32')
 
 
+def ap_per_area(area_int, match_iou, match_area, pred_area, conf, pred_cls, gt_area, gt_cls, iouv, v5_metric=False):
+    """AP per object-area interval: [0, a1), [a1, a2), ..., [an, inf), areas in original-image pixels^2.
+    COCO-style ignore rules, per interval and IoU threshold t: a prediction matched (IoU > t) to a label in the
+    interval is a TP; one matched to a label outside it is ignored; an unmatched prediction is a FP only if its own
+    area is in the interval. Labels outside the interval are not counted. Matching is test.py's (each prediction
+    against its best-IoU label).
+    Returns [(name, n_labels, P, R, mAP@.5, mAP@.5:.95)], P/R at IoU 0.5, all averaged over classes."""
+    edges = [0.] + [float(a) for a in area_int] + [np.inf]
+    assert all(b > a for a, b in zip(edges[:-1], edges[1:])), f'area intervals must be positive and increasing: {area_int}'
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        name = f'<{hi:g}' if lo == 0 else (f'>={lo:g}' if hi == np.inf else f'{lo:g}-{hi:g}')
+        g_in = (gt_area >= lo) & (gt_area < hi)
+        if not g_in.any():
+            rows.append((name, 0, np.nan, np.nan, np.nan, np.nan))
+            continue
+        m_in = (match_area >= lo) & (match_area < hi)  # NaN (unmatched) -> False
+        p_in = (pred_area >= lo) & (pred_area < hi)
+        aps = []
+        for j, t in enumerate(iouv):
+            matched = match_iou > t
+            tp = matched & m_in
+            keep = tp | (~matched & p_in)
+            p, r, ap, _, _ = ap_per_class(tp[keep, None], conf[keep], pred_cls[keep], gt_cls[g_in], v5_metric=v5_metric)
+            aps.append(ap[:, 0].mean())
+            if j == 0:
+                mp, mr = p.mean(), r.mean()
+        rows.append((name, int(g_in.sum()), mp, mr, aps[0], float(np.mean(aps))))
+    return rows
+
+
 def compute_ap(recall, precision, v5_metric=False):
     """ Compute the average precision, given the recall and precision curves
     # Arguments

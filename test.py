@@ -13,7 +13,7 @@ from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
-from utils.metrics import ap_per_class, ConfusionMatrix
+from utils.metrics import ap_per_class, ap_per_area, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
@@ -40,7 +40,8 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         area_int=None):  # e.g. [300, 650, 1200]: also report AP for areas <300, 300-650, 650-1200, >=1200 px^2
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -101,6 +102,7 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    area_stats, area_gt = [], []  # per prediction (match_iou, match_area, pred_area), per label (area, cls)
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -132,6 +134,10 @@ def test(data,
             tcls = labels[:, 0].tolist() if nl else []  # target class
             path = Path(paths[si])
             seen += 1
+            if area_int and nl:  # label areas in original-image pixels
+                tb = xywh2xyxy(labels[:, 1:5])
+                scale_coords(img[si].shape[1:], tb, shapes[si][0], shapes[si][1])
+                area_gt.append(torch.stack(((tb[:, 2] - tb[:, 0]) * (tb[:, 3] - tb[:, 1]), labels[:, 0]), 1).cpu())
 
             if len(pred) == 0:
                 if nl:
@@ -177,6 +183,8 @@ def test(data,
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+            match_iou = torch.zeros(pred.shape[0], device=device)  # IoU with the matched label (0: unmatched)
+            match_area = torch.full((pred.shape[0],), float('nan'), device=device)  # area of the matched label
             if nl:
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
@@ -205,11 +213,16 @@ def test(data,
                                 detected_set.add(d.item())
                                 detected.append(d)
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                match_iou[pi[j]] = ious[j]
+                                match_area[pi[j]] = (tbox[d, 2] - tbox[d, 0]) * (tbox[d, 3] - tbox[d, 1])
                                 if len(detected) == nl:  # all targets already located in image
                                     break
 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            if area_int:
+                pred_area = (predn[:, 2] - predn[:, 0]) * (predn[:, 3] - predn[:, 1])
+                area_stats.append(torch.stack((match_iou, match_area, pred_area, pred[:, 4], pred[:, 5]), 1).cpu())
 
         # Plot images
         if plots and batch_i < 3:
@@ -231,6 +244,20 @@ def test(data,
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+    # Print results per object-area interval
+    if area_int:
+        a = torch.cat(area_stats).numpy() if area_stats else np.zeros((0, 5))
+        g = torch.cat(area_gt).numpy() if area_gt else np.zeros((0, 2))
+        rows = ap_per_area(area_int, a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4], g[:, 0], g[:, 1],
+                           iouv.cpu().numpy(), v5_metric=v5_metric)
+        print(('%20s' + '%12s' * 6) % ('Area (px^2)', '', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95'))
+        for name, n, ap_p, ap_r, ap50_, ap_ in rows:
+            print(('%20s' + '%12s' + '%12i' + '%12.3g' * 4) % (name, '', n, ap_p, ap_r, ap50_, ap_))
+        if not training:
+            with open(save_dir / 'area_ap.csv', 'w') as f:
+                f.write('area,labels,P,R,mAP@.5,mAP@.5:.95\n')
+                f.writelines(f'{name},{n},{ap_p:.5g},{ap_r:.5g},{ap50_:.5g},{ap_:.5g}\n' for name, n, ap_p, ap_r, ap50_, ap_ in rows)
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
@@ -309,6 +336,9 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--area-int', type=float, nargs='+', default=None, metavar='AREA',
+                        help='also report AP per box-area interval (original-image px^2), e.g. 300 650 1200 '
+                             'reports <300, 300-650, 650-1200 and >=1200')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -330,7 +360,8 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
+             v5_metric=opt.v5_metric,
+             area_int=opt.area_int
              )
 
     elif opt.task == 'speed':  # speed benchmarks

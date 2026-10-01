@@ -464,7 +464,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                  wandb_logger=wandb_logger,
                                                  compute_loss=compute_loss,
                                                  is_coco=is_coco,
-                                                 v5_metric=opt.v5_metric)
+                                                 v5_metric=opt.v5_metric,
+                                                 area_int=opt.area_int)
 
             # Write
             with open(results_file, 'a') as f:
@@ -609,6 +610,8 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--area-int', type=float, nargs='+', default=None, metavar='AREA',
+                        help='also report val AP per box-area interval (original-image px^2), e.g. 300 650 1200')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -629,7 +632,7 @@ if __name__ == '__main__':
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.SafeLoader))  # replace
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
-        for k, v in {'seed': 0, 'deterministic': False, 'close_mosaic': 0, 'shuffle': False}.items():  # opt.yaml from older runs
+        for k, v in {'seed': 0, 'deterministic': False, 'close_mosaic': 0, 'shuffle': False, 'area_int': None}.items():  # opt.yaml from older runs
             setattr(opt, k, getattr(opt, k, v))
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
