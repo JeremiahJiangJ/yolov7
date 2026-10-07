@@ -25,7 +25,7 @@ import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader, DEFAULT_LABEL_FOLDER
+from utils.datasets import create_dataloader, build_dataloader, DEFAULT_LABEL_FOLDER
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
@@ -112,6 +112,7 @@ def train(hyp, opt, device, tb_writer=None):
         if any(x in k for x in freeze):
             print('freezing %s' % k)
             v.requires_grad = False
+    frozen = len(freeze) > 0  # see --unfreeze-epoch
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -307,6 +308,7 @@ def train(hyp, opt, device, tb_writer=None):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     area_results = []  # per object-area metrics, see --area-int
+    best_epoch = start_epoch - 1  # last epoch fitness improved, see --patience (restarts counting on --resume)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossOTA(model)  # init loss class
@@ -318,6 +320,23 @@ def train(hyp, opt, device, tb_writer=None):
     torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+
+        # Unfreeze frozen layers (optional)
+        if frozen and opt.unfreeze_epoch and epoch >= opt.unfreeze_epoch:
+            for v in model.parameters():
+                v.requires_grad = True  # already in the optimizer param groups
+            frozen = False
+            logger.info(f'Unfreezing all layers from epoch {epoch}')
+
+        # Turn off mosaic (and the mixup applied to mosaics) for the last epochs (optional)
+        if opt.close_mosaic and dataset.mosaic and epoch >= epochs - opt.close_mosaic:
+            logger.info(f'Closing mosaic for the last {epochs - epoch} epochs')
+            dataset.mosaic = False
+            # Workers hold their own copy of the dataset, so restart them with a new loader
+            pbar = dataloader = None  # drop the old loader (and the progress bar wrapping it) to stop its workers
+            dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=opt.world_size,
+                                          workers=opt.workers, image_weights=opt.image_weights, quad=opt.quad,
+                                          seed=data_seed)
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -385,6 +404,9 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Optimize
             if ni % accumulate == 0:
+                if opt.clip_grad > 0:
+                    scaler.unscale_(optimizer)  # clip the true gradients, not the AMP-scaled ones
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.clip_grad)
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
@@ -477,6 +499,7 @@ def train(hyp, opt, device, tb_writer=None):
             fi = area_fitness(results, area_results, opt.fitness_metric_weights, opt.fitness_area_weights)
             if fi > best_fitness:
                 best_fitness = fi
+                best_epoch = epoch
             wandb_logger.end_epoch(best_result=best_fitness == fi)
 
             # Save model
@@ -507,6 +530,19 @@ def train(hyp, opt, device, tb_writer=None):
                         wandb_logger.log_model(
                             last.parent, opt, epoch, fi, best_model=best_fitness == fi)
                 del ckpt
+
+        # Early stopping (optional), only rank 0 knows the fitness
+        if opt.patience and not opt.notest:
+            stop = int(rank in [-1, 0] and epoch - best_epoch >= opt.patience)
+            if rank != -1:  # every DDP rank must leave the loop together
+                stop_t = torch.tensor([stop], device=device)
+                dist.broadcast(stop_t, 0)
+                stop = int(stop_t.item())
+            if stop:
+                best = f'best epoch {best_epoch}' if best_epoch >= start_epoch else 'no improvement this run'
+                logger.info(f'Early stopping at epoch {epoch}: no fitness improvement for {opt.patience} epochs, '
+                            f'{best}')
+                break
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -607,6 +643,10 @@ if __name__ == '__main__':
                         help='fitness (best.pt, --evolve) weights for [P, R, mAP@.5, mAP@.5:.95], i.e. 0 0 1 0')
     parser.add_argument('--fitness-area-weights', nargs='+', type=float, default=None,
                         help='fitness weight per --area-int bin (one more than cut points), default: all objects')
+    parser.add_argument('--close-mosaic', type=int, default=0, help='turn off mosaic (and mixup) for the last N epochs')
+    parser.add_argument('--clip-grad', type=float, default=0.0, help='clip gradient norm to this value, i.e. 10.0')
+    parser.add_argument('--patience', type=int, default=0, help='stop after N epochs without fitness improvement')
+    parser.add_argument('--unfreeze-epoch', type=int, default=0, help='unfreeze --freeze layers from this epoch')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
                         help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()
@@ -622,6 +662,9 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
+    if opt.unfreeze_epoch:
+        assert opt.freeze != [0], '--unfreeze-epoch needs --freeze'
+        assert opt.local_rank == -1, '--unfreeze-epoch is not supported in DDP mode'
     #if opt.global_rank in [-1, 0]:
     #    check_git_status()
     #    check_requirements()

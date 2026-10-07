@@ -81,7 +81,14 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       prefix=prefix,
                                       cache_path=cache_path,
                                       label_folder_name=label_folder_name)
+    dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=world_size, workers=workers,
+                                  image_weights=image_weights, quad=quad, seed=seed)
+    return dataloader, dataset
 
+
+def build_dataloader(dataset, batch_size, rank=-1, world_size=1, workers=8, image_weights=False, quad=False,
+                     seed=None):
+    # DataLoader for an existing dataset, i.e. to restart workers after changing dataset attributes
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
     seed_kwargs = {}
@@ -102,7 +109,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         pin_memory=True,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                         **seed_kwargs)
-    return dataloader, dataset
+    return dataloader
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
