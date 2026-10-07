@@ -6,7 +6,7 @@
 # Usage: bash scripts/train_mixed_ladder.sh [extra train.py args, e.g. --area-int 300 650 1250]
 set -euo pipefail
 EPOCHS=${EPOCHS:-100}
-EPOCHS_TARGET=${EPOCHS_TARGET:-$EPOCHS}   # e.g. EPOCHS * (all images / target images) for an equal budget
+EPOCHS_TARGET=${EPOCHS_TARGET:-$EPOCHS}   # e.g. EPOCHS * (frames in all sources / target frames) for an equal budget
 COMMON=(--weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --hyp data/hyp.finetune.sgd.yaml
         --batch-size 32 --img-size 640 640 --seed 42 --device 0 --workers 8 --label-folder-name labels
         --fitness-metric-weights 0 0 1 0 --project runs/ladder --exist-ok)

@@ -1,8 +1,20 @@
 # Multi-source (weighted) training
 
 Train on several datasets ("sources") at once, with one **target** source (the deployment camera) and per-source
-sampling weights. Enabled by a `train_sources:` list in the data yaml; a plain `train:` / `val:` data yaml keeps the
-stock YOLOv7 pipeline unchanged.
+weights. Enabled by a `train_sources:` list in the data yaml; a plain `train:` / `val:` data yaml keeps the stock
+YOLOv7 pipeline unchanged.
+
+Terms used below and in the logs:
+
+- **sample**: one training input, an `--img-size` x `--img-size` crop (usually a mosaic). Every sample has the same
+  pixels and compute, and is built entirely from one source.
+- **training share** of a source: its share of the samples, i.e. of the training pixels and compute. **This is what
+  the weights set**, exactly.
+- **frame**: one image of a source. A sample is built from several frames: the sampled frame plus its mosaic, mixup and
+  paste-in partners from the same source (**frames loaded**; some may be only partly in view). Smaller frames fill a
+  mosaic with more of them, so a source's share of the frames can differ a lot from its training share.
+- **objects**: labelled boxes in the samples, i.e. the supervision. A source's share of the objects also depends on how
+  many objects its frames contain.
 
 Example configs (an experiment ladder, each step changes one thing):
 
@@ -42,7 +54,7 @@ Per-source keys:
 |---|---|---|
 | `name` | `source<i>` | used in logs, `weight_schedule`, `epoch_size`, `test.py --source` |
 | `path` | required | training images (dir, list file, or list of those) |
-| `weight` | required for `weighted` | relative sampling weight (normalised, any scale) |
+| `weight` | required for `weighted` | relative training share (normalised, any scale): 60 / 40 = 60% / 40% of the samples |
 | `target` | `false` | exactly one source: its `val` drives fitness / `best.pt` / `--patience`; autoanchor uses it |
 | `val` | none | target: required (or a top-level `val:`). Other sources: opt-in validation, reported only |
 | `resize` | top-level `resize`, else `fit` | `fit`: long side resized to `--img-size` (stock YOLOv7). `native`: never resized, objects keep their pixel size, `--img-size` is the training crop size. Number: fixed scale factor, for sources whose objects are at a different pixel scale |
@@ -54,14 +66,13 @@ Per-source keys:
 
 ## How it works
 
-- **Sampling.** Epoch *e* draws exactly `round(w_k(e) * epoch_size)` *sampled images* (one per training sample) from
-  source *k*. Each source is an endless stream of shuffled passes, so every image is sampled once before any repeats.
-  The mix is logged at the start and whenever it changes.
-- **Mosaic stays within a source.** Mosaic, mixup and paste-in partners come from the source of the sampled image, so
-  a 50% weight means 50% of the training *samples* are built entirely from that source. It does **not** mean 50% of
-  the images (or objects) the model sees: a sample is built from several images, and how many depends on the frame
-  size (fill mosaic, below). A source with small frames contributes several times more images per sample than one
-  with large frames. The exposure plan and the per-epoch data log show both shares.
+- **Sampling.** Epoch *e* has exactly `round(w_k(e) * epoch_size)` samples from source *k*, each built around one
+  sampled frame. Each source is an endless stream of shuffled passes over its frames, so every frame is sampled once
+  before any repeats. The mix is logged at the start and whenever it changes.
+- **Samples stay within a source.** Mosaic, mixup and paste-in partners come from the source of the sampled frame, so
+  a weight of 50% means 50% of the samples (training pixels and compute) come entirely from that source. It does
+  **not** mean 50% of the frames or objects: those also depend on frame size (fill mosaic, below) and object
+  density. The data plan and the per-epoch data log show all three shares.
 - **Native scale.** Images are never resized. Training samples are `--img-size` crops: a 4-tile mosaic where each
   frame is offset at random within its tile, or with probability `fg_crop_prob` placed so one of its objects is in
   view (the stock mosaic anchors each frame's corner at the mosaic centre, which with large frames almost never
@@ -125,38 +136,52 @@ every run reads the current label files; `--keep-cache` keeps them (also for `te
 out-of-memory killer) cannot be caught: delete the caches listed at startup by hand after one. A cache built for a
 different image list or label folder is rebuilt automatically, but edited labels with the same images are not detected.
 
-## Exposure plan and data log
+## Data plan and data log
 
-Training logs, and writes to `data_plan.txt`, what each source contributes over the whole run:
+Before training starts, the log (and `data_plan.txt`) shows what each source will contribute over the whole run:
 
-- `samples` / `share`: training samples sampled from the source (exact: the draws are fixed in advance)
-- `images/sample`: expected images used to build one sample (sampled image + mosaic / mixup / paste-in partners, from
-  the mosaic geometry at the source's frame size and the hyp probabilities; 1 during `--close-mosaic` epochs)
-- `images used` / `share`: images used in total, and their share: what the model actually sees
-- `uses per image`, `never used`: per image of the source (sampled images cycle through the source; partners are
-  drawn at random, so `never used` is an estimate)
+| Column | Meaning | Accuracy |
+|---|---|---|
+| `frames` | frames in the source | exact |
+| `training share`, `samples` | samples from the source: training pixels and compute; set by the weights | exact (the draws are fixed in advance) |
+| `frames/sample` | frames loaded per sample with mosaic on: the sampled frame + mosaic / mixup / paste-in partners (1 in `--close-mosaic` epochs) | expected value from the mosaic geometry at the source's frame size and the hyp probabilities; matches measurements within ~0.5 |
+| `frames loaded`, `share`, `loads/frame` | frames loaded over the run, their share, loads per frame of the source | from `frames/sample` |
+| `never loaded` | share of the source's frames never loaded | estimate (partners are drawn at random) |
+| `objects/sample`, `objects`, `share` | labelled objects in the samples: the supervision | measured on 64 samples per source built before training (with mosaic on, and separately for `--close-mosaic` epochs) |
+
+A `NOTE` names every source whose frame or object share differs from its training share by 1.5x or more, and a
+`WARNING` every source with frames that are never loaded.
 
 Check a config without training (`--hyp`, `--img-size` and `--close-mosaic` as for training; frame sizes are read
-from the images):
+from the images; `--measure 64` also builds samples to count objects, which reads all labels):
 
 ```
-python -m utils.mixed_data --data your.yaml --epochs 3 --img-size 1280 --close-mosaic 1
+python -m utils.mixed_data --data your.yaml --epochs 3 --img-size 1280 --close-mosaic 1 --measure 64
 ```
 ```
-3 epochs x 40 samples = 120 training samples, ~1519 images used (sampled images + mosaic / mixup / paste-in partners)
-  source             images    samples   share  images/sample  images used   share  uses per image  never used
-  camC                   24         72   60.0%            9.9          498   32.8%            20.8        0.0%
-  cam640                150         48   40.0%           31.4         1021   67.2%             6.8        0.1%
+3 epochs x 40 samples/epoch = 120 training samples (each one --img-size crop: equal pixels and compute)
+  source           frames  training share   samples  frames/sample  frames loaded   share  loads/frame  never loaded  objects/sample    objects   share
+  camC                 24           60.0%        72            9.9            498   32.8%         20.8          0.0%             6.2        348   40.5%
+  cam640              150           40.0%        48           31.4           1021   67.2%          6.8          0.1%            15.0        512   59.5%
+  objects/sample: measured on samples built with mosaic on (and separately for the --close-mosaic epochs, included in objects)
+  NOTE: frame / object shares differ from the training shares by 1.5x or more. Smaller frames fill a mosaic with more frames, and object density differs between sources: lower a source's weight if it should count less (the weights set training shares)
+  NOTE: camC: 60% of the training, 33% of the frames loaded, 40% of the objects
+  NOTE: cam640: 40% of the training, 67% of the frames loaded, 60% of the objects
 ```
 
-Here the target (1280x720) has 60% of the samples but only 33% of the images: the 640x480 source fills each mosaic
-with three times as many frames. Lower its weight if it should contribute less of what the model sees.
+Here the target (1280x720 frames) gets 60% of the training but only a third of the frames and 40% of the objects: at
+`--img-size 1280` the 640x480 source fills each mosaic with three times as many frames. Lower its weight if it should
+count less.
 
-Every epoch, training also logs what the data loader actually built (and appends it to `data_usage.txt`): samples,
-images and their shares, images and labels per sample, and labels shrunk below 2 px, per source. Measured
-images/sample agree with the plan (10.2-10.5 and 30.1-31.4 in the run above). The counts include batches prefetched
-for the next epoch (and batches discarded when `--close-mosaic` restarts the loader), so per-epoch shares are
-approximate; per-sample numbers are not affected. In DDP the log covers the rank 0 process only.
+Every epoch, training also logs what it used (and appends it to `data_usage.txt`):
+
+- `samples`, `training share`, `objects`, `share`, `objects/sample`: counted by the training loop on the batches it
+  consumed: exact
+- `frames/sample`, `frames loaded`, `share`: frames per sample counted by the data loader workers, times the samples
+- `objects shrunk < 2 px`: share of objects augmentation shrank below 2 px, which YOLOv7 drops (counted by the
+  workers)
+
+In DDP the log covers the rank 0 process only (each GPU gets an equal share of the same mix).
 
 ## Epoch size
 
@@ -164,10 +189,12 @@ With weighted sampling there is no natural "one pass over the data", so `epoch_s
 for the run, as the training loop needs constant batches per epoch):
 
 - **`target` (default): `--epochs` = passes over the target**, exactly as when training on the target alone, whatever
-  the weights and schedule. Each target image is seen `--epochs` times; the weights only decide how much other data is
-  added, i.e. how long training takes. (The epoch is the target size divided by its weight averaged over the run, so
-  with a schedule raising the target weight, early epochs hold fewer target images and late epochs more.)
-- `total`: all images of all sources per epoch, the same iterations per epoch as `2_default_pooled.yaml`, so the same
+  the weights and schedule: each target frame is sampled `--epochs` times. (With mosaic on, it is also loaded as a
+  partner in other target samples, as in stock YOLOv7; the plan's `loads/frame` counts both.) The weights only decide
+  how much other data is added, i.e. how long training takes. (The epoch is the target size divided by its weight
+  averaged over the run, so with a schedule raising the target weight, early epochs hold fewer target samples and
+  late epochs more.)
+- `total`: as many samples per epoch as frames in all sources, the same iterations per epoch as `2_default_pooled.yaml`, so the same
   `--epochs` is the same training budget (used in the ladder)
 - a source name: like `target`, anchored on that source instead
 - an int

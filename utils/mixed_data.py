@@ -32,6 +32,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from utils.datasets import STAT_SAMPLES, STAT_IMAGES, STAT_LABELS
 from utils.datasets import LoadImagesAndLabels, InfiniteDataLoader, DEFAULT_LABEL_FOLDER, parse_resize, \
     create_dataloader
 from utils.torch_utils import torch_distributed_zero_first
@@ -182,13 +183,13 @@ class MixedConfig:
         return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec, epochs)
 
     def resolve_epoch_size(self, sizes, schedule, epochs):
-        """Images per epoch, fixed for the whole run (the training loop needs constant batches per epoch).
-        epoch_size: <source name> (default: the target): sized so that over `epochs` epochs every image of that source
-          is seen `epochs` times, whatever the weights and schedule -- i.e. --epochs means passes over that source,
+        """Samples per epoch, fixed for the whole run (the training loop needs constant batches per epoch).
+        epoch_size: <source name> (default: the target): sized so that over `epochs` epochs every frame of that source
+          is sampled `epochs` times, whatever the weights and schedule -- i.e. --epochs means passes over that source,
           like training on it alone, and the other sources are added on top. Epoch = len(source) / its weight averaged
-          over the run, so with a schedule raising its weight it gets fewer images than that in early epochs, more late.
-        'total': all images of all sources (the epoch of a pooled stock YOLOv7 run, for equal-budget comparisons).
-        int: that many images."""
+          over the run, so with a schedule raising its weight it gets fewer samples than that early on, more late.
+        'total': as many samples as frames in all sources (the epoch of a pooled stock run, for equal budgets).
+        int: that many samples."""
         es = self.epoch_size
         if es is None or es == 'total':
             return int(sum(sizes))
@@ -352,43 +353,69 @@ class MixedSourceSampler(Sampler):
         return {'seed': self.seed, 'names': self.names, 'sizes': self.sizes, 'total': self.total,
                 'schedule': self.schedule.signature()}
 
-    def plan(self, epochs, images_per_sample=None, close_mosaic=0):
-        """Exposure plan of a run of `epochs` epochs. Per source: training samples (one per sampled image; exact, the
-        draws are fixed in advance) and their share; images used to build them (images_per_sample: expected per
-        sample with mosaic on, see utils.datasets.expected_images_per_sample(); 1 in the last close_mosaic epochs),
-        their share, uses per image, and the estimated share of images never used. Mosaic / mixup / paste-in partners
-        come from the same source as the sampled image, so a source with small frames (more mosaic cells) gets a
-        larger share of the images than of the samples. Without images_per_sample only sampled images are counted."""
+    def plan(self, epochs, frames_per_sample=None, close_mosaic=0, objects_per_sample=None):
+        """What each source contributes over a run of `epochs` epochs.
+        - training share: share of the training samples. Every sample is one --img-size crop, so this is also the
+          share of training pixels and compute. Exact (the draws are fixed in advance); this is what weights set.
+        - frames loaded: frames (images of the source) loaded to build its samples: the sampled frame plus its mosaic
+          / mixup / paste-in partners, all from the same source. frames_per_sample[k]: expected per sample while
+          mosaic is on (utils.datasets.expected_images_per_sample()); 1 in the last close_mosaic epochs. A loaded
+          frame may be only partly in view. Sources with smaller frames load more frames per sample.
+        - never loaded: estimated share of the source's frames not loaded at all (sampled frames cycle through the
+          source; partners are drawn at random)
+        - objects: labelled objects in its training samples, i.e. its share of the supervision.
+          objects_per_sample[k] = (with mosaic, after close_mosaic), measured (see measure_sources()).
+        Without frames_per_sample / objects_per_sample those columns are left out."""
         draws = self.consumed_before(epochs).astype(float)
-        k = len(self.sizes)
-        ips = np.ones(k) if images_per_sample is None else np.asarray(images_per_sample, dtype=float)
         n_clean = min(max(close_mosaic, 0), epochs)
-        clean = self.consumed_before(epochs) - self.consumed_before(epochs - n_clean)  # samples after close_mosaic
-        used = (draws - clean) * ips + clean  # images used, sampled images included
-        total_s, total_u = max(draws.sum(), 1), max(used.sum(), 1)
-        lines = [f'{epochs} epochs x {self.total} samples = {int(total_s)} training samples, '
-                 f'~{int(total_u)} images used (sampled images + mosaic / mixup / paste-in partners)']
-        lines.append(f"  {'source':<16}{'images':>9}{'samples':>11}{'share':>8}{'images/sample':>15}{'images used':>13}"
-                     f"{'share':>8}{'uses per image':>16}{'never used':>12}")
-        warnings = []
-        for n, d, u, x, size in zip(self.names, draws, used, ips, self.sizes):
+        clean = (self.consumed_before(epochs) - self.consumed_before(epochs - n_clean)).astype(float)
+        mos = draws - clean  # samples built with mosaic on
+        total = max(draws.sum(), 1)
+        lines = [f'{epochs} epochs x {self.total} samples/epoch = {int(total)} training samples '
+                 f'(each one --img-size crop: equal pixels and compute)']
+        head = f"  {'source':<14}{'frames':>9}{'training share':>16}{'samples':>10}"
+        if frames_per_sample is not None:
+            fps = np.asarray(frames_per_sample, dtype=float)
+            loaded = mos * fps + clean
+            head += f"{'frames/sample':>15}{'frames loaded':>15}{'share':>8}{'loads/frame':>13}{'never loaded':>14}"
+        if objects_per_sample is not None:
+            ops = np.asarray(objects_per_sample, dtype=float)  # (k, 2): with mosaic, after close_mosaic
+            objects = mos * ops[:, 0] + clean * ops[:, 1]
+            head += f"{'objects/sample':>16}{'objects':>11}{'share':>8}"
+        lines.append(head)
+        notes, warnings = [], []
+        for k, (n, d, size) in enumerate(zip(self.names, draws, self.sizes)):
             size = max(size, 1)
-            # sampled images cycle through the source (each drawn floor or ceil(d / size) times); partners are drawn
-            # uniformly at random, missing a given image with probability ~exp(-partners / size)
-            never = max(0.0, 1 - d / size) * math.exp(-(u - d) / size)
-            lines.append(f'  {n:<16}{size:>9}{int(d):>11}{d / total_s:>8.1%}{x:>15.1f}{int(u):>13}{u / total_u:>8.1%}'
-                         f'{u / size:>16.1f}{never:>12.1%}')
-            if d > 0 and never >= 0.01:
-                warnings.append(f'~{never:.0%} of {n} (~{int(never * size)} images) is never used in this run')
-        if images_per_sample is None:
-            lines.append('  (images/sample unknown: mosaic partners not counted)')
-        return '\n'.join(lines + [f'  WARNING: {w}' for w in warnings])
+            row = f'  {n:<14}{size:>9}{d / total:>16.1%}{int(d):>10}'
+            shares = []
+            if frames_per_sample is not None:
+                u = loaded[k]
+                never = max(0.0, 1 - d / size) * math.exp(-(u - d) / size)  # partners miss a frame w.p. ~exp(-p/n)
+                row += f'{fps[k]:>15.1f}{int(u):>15}{u / loaded.sum():>8.1%}{u / size:>13.1f}{never:>14.1%}'
+                shares.append(('frames loaded', u / loaded.sum()))
+                if d > 0 and never >= 0.01:
+                    warnings.append(f'~{never:.0%} of {n} (~{int(never * size)} frames) is never loaded in this run')
+            if objects_per_sample is not None:
+                row += f'{ops[k, 0]:>16.1f}{int(objects[k]):>11}{objects[k] / max(objects.sum(), 1):>8.1%}'
+                shares.append(('objects', objects[k] / max(objects.sum(), 1)))
+            lines.append(row)
+            if d > 0 and any(not 1 / 1.5 < x / (d / total) < 1.5 for _, x in shares):
+                notes.append(f'{n}: {d / total:.0%} of the training, ' + ', '.join(f'{x:.0%} of the {what}'
+                                                                                   for what, x in shares))
+        if objects_per_sample is not None:
+            lines.append('  objects/sample: measured on samples built with mosaic on (and separately for the '
+                         '--close-mosaic epochs, included in objects)')
+        if notes:
+            notes.insert(0, 'frame / object shares differ from the training shares by 1.5x or more. Smaller frames '
+                            'fill a mosaic with more frames, and object density differs between sources: lower a '
+                            "source's weight if it should count less (the weights set training shares)")
+        return '\n'.join(lines + [f'  NOTE: {x}' for x in notes] + [f'  WARNING: {w}' for w in warnings])
 
     def summary(self, epoch=0):
         count = self.counts(epoch)
-        rows = [f'{n:<16}{c / self.total:>7.1%}{size:>9} images{c:>9} samples/epoch{c / max(size, 1):>7.2f} passes/epoch'
-                for n, c, size in zip(self.names, count, self.sizes)]
-        return (f'{self.total} samples/epoch (sampled images; mosaic partners add more images, see the data plan)\n' +
+        rows = [f'{n:<16}{c / self.total:>7.1%} of training{c:>9} samples/epoch ({c / max(size, 1):.2f} x its {size} frames '
+                f'sampled)' for n, c, size in zip(self.names, count, self.sizes)]
+        return (f'{self.total} samples/epoch (shares of training; frames and objects per source: see the data plan)\n' +
                 '\n'.join('  ' + r for r in rows))
 
 
@@ -437,19 +464,56 @@ def usage_totals(dataset):
     return {n: d.stats_total().clone() for n, d in parts}
 
 
-def usage_report(now, before):
-    """What the data loader actually used between two usage_totals() snapshots, per source: training samples, images
-    used to build them (incl. mosaic / mixup / paste-in partners), labels per sample, and labels dropped because
-    augmentation shrank them below 2 px. Counts what was loaded, including batches prefetched for the next epoch."""
-    d = {n: (now[n] - before[n]).tolist() if n in before else now[n].tolist() for n in now}
-    ts, ti = max(sum(x[0] for x in d.values()), 1), max(sum(x[1] for x in d.values()), 1)
-    lines = [f"  {'source':<16}{'samples':>9}{'share':>8}{'images':>9}{'share':>8}{'images/sample':>15}"
-             f"{'labels/sample':>15}{'labels shrunk < 2px':>21}"]
-    for n, (samples, images, labels, small) in d.items():
-        lost = f'{small} ({small / max(labels + small, 1):.1%})'
-        lines.append(f'  {n:<16}{samples:>9}{samples / ts:>8.1%}{images:>9}{images / ti:>8.1%}'
-                     f'{images / max(samples, 1):>15.1f}{labels / max(samples, 1):>15.1f}{lost:>21}')
+def usage_report(seen, now, before):
+    """What training used from each source over an epoch.
+    seen: {source: (samples, objects)} counted by the training loop on the batches it consumed: exact.
+    now / before: usage_totals() snapshots of the data loader counters, for the per-sample ratios the training loop
+    cannot see: frames loaded per sample (sampled frame + mosaic / mixup / paste-in partners) and the share of objects
+    augmentation shrank below 2 px (dropped). These counters include batches prefetched across epoch boundaries,
+    which does not affect the ratios. Frames loaded = samples x frames per sample."""
+    c = {n: (now[n] - before[n]).tolist() if n in before else now[n].tolist() for n in now}
+    rows = []
+    for n, (samples, objects) in seen.items():
+        cs, cf, co, cx = c.get(n, [0, 0, 0, 0])
+        fps = cf / cs if cs else float('nan')
+        rows.append((n, samples, objects, fps, samples * fps if cs else 0, cx / max(co + cx, 1)))
+    ts, to, tf = (max(sum(r[i] for r in rows), 1) for i in (1, 2, 4))
+    lines = [f"  {'source':<14}{'samples':>9}{'training share':>16}{'objects':>9}{'share':>8}{'objects/sample':>16}"
+             f"{'frames/sample':>15}{'frames loaded':>15}{'share':>8}{'objects shrunk < 2 px':>23}"]
+    for n, samples, objects, fps, frames, lost in rows:
+        lines.append(f'  {n:<14}{samples:>9}{samples / ts:>16.1%}{objects:>9}{objects / to:>8.1%}'
+                     f'{objects / max(samples, 1):>16.1f}{fps:>15.1f}{int(frames):>15}{frames / tf:>8.1%}{lost:>23.1%}')
     return '\n'.join(lines)
+
+
+def measure_sources(datasets, n=64, seed=0):
+    """Objects (labels) per training sample of each source, measured on n samples built with mosaic on and n after
+    close_mosaic() (objects per sample depend on object density, frame size, zoom and fg_crop_prob, so they are
+    measured rather than predicted). Leaves the global RNGs, the datasets and their usage counters as they were.
+    Returns [(objects per sample with mosaic, after close_mosaic), ...]."""
+    state = random.getstate(), np.random.get_state()
+    out = []
+    try:
+        for k, d in enumerate(datasets):
+            res = []
+            for phase in ('mosaic', 'clean'):
+                saved, counters = (d.mosaic, d.hyp), d.stats[0].clone()
+                if phase == 'clean':
+                    d.close_mosaic()
+                objects = 0
+                for j in range(n):
+                    h = stable_hash(seed, 'measure', k, phase, j)
+                    random.seed(h)
+                    np.random.seed(h % 2 ** 32)
+                    objects += len(d[h % len(d)][1])
+                d.mosaic, d.hyp = saved
+                d.stats[0] = counters  # measuring is not training use
+                res.append(objects / n)
+            out.append(tuple(res))
+    finally:
+        random.setstate(state[0])
+        np.random.set_state(state[1])
+    return out
 
 
 def list_images(path):
@@ -491,6 +555,8 @@ if __name__ == '__main__':
     parser.add_argument('--hyp', default='data/hyp.scratch.tiny.yaml', help='hyp yaml (mosaic, mixup, paste_in)')
     parser.add_argument('--img-size', type=int, default=640, help='training --img-size')
     parser.add_argument('--close-mosaic', type=int, default=0, help='training --close-mosaic')
+    parser.add_argument('--measure', type=int, default=0,
+                        help='also measure objects per sample on this many sample batches per source (reads labels)')
     opt = parser.parse_args()
     with open(opt.data) as f:
         cfg = MixedConfig(yaml.safe_load(f))
@@ -523,4 +589,15 @@ if __name__ == '__main__':
     if len(schedule.points) > 1:
         print(f'weight schedule ({schedule.mode}): ' + '; '.join(
             f'epoch {e}: ' + ', '.join(f'{n} {x:.0%}' for n, x in zip(cfg.names, w)) for e, w in schedule.points))
-    print(sampler.plan(opt.epochs, ips, opt.close_mosaic))
+    objects = None
+    if opt.measure:  # build the datasets (scans labels; caches are deleted on exit) and measure objects per sample
+        from utils.datasets import LoadImagesAndLabels, delete_label_caches_at_exit
+        delete_label_caches_at_exit()
+        datasets = [LoadImagesAndLabels(src.path, opt.img_size, 16, augment=True, hyp=hyp, prefix=f'[{src.name}] ',
+                                        label_folder_name=src.label_folder, resize=src.resize,
+                                        fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells)
+                    for src in cfg.sources]
+        objects = measure_sources(datasets, opt.measure)
+    print(sampler.plan(opt.epochs, ips, opt.close_mosaic, objects))
+    if not opt.measure:
+        print('  (objects per source: add --measure 64 to build 64 samples per source and count their objects)')

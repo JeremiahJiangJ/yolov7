@@ -28,7 +28,7 @@ from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
-    usage_report
+    usage_report, measure_sources
 from utils.distill import Distiller
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
@@ -275,7 +275,9 @@ def train(hyp, opt, device, tb_writer=None):
                                                       start_epoch=start_epoch, seed=data_seed or 0, epochs=epochs)
         data_signature = dataloader.sampler.signature()
         if rank in [-1, 0]:  # how often each source / image is seen over the whole run
-            plan = dataloader.sampler.plan(epochs, [d.expected_images() for d in dataset.datasets], opt.close_mosaic)
+            objects = measure_sources(dataset.datasets, seed=data_seed or 0)  # objects per sample, measured
+            plan = dataloader.sampler.plan(epochs, [d.expected_images() for d in dataset.datasets], opt.close_mosaic,
+                                           objects)
             logger.info(colorstr('data plan: ') + plan)
             (save_dir / 'data_plan.txt').write_text(plan + '\n')
         if opt.resume and ckpt_data_signature not in (None, data_signature):
@@ -377,6 +379,12 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
     usage_before = usage_totals(dataset)  # data loader usage counters, reported every epoch
+    # source of each image path, to count the samples / objects per source the training loop consumes
+    usage_names = dataset.names if mixed else ['train']
+    source_of = {}
+    for k, d in enumerate(dataset.datasets if mixed else [dataset]):
+        for f in d.img_files:
+            source_of.setdefault(f, k)
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -414,6 +422,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         mkd = torch.zeros(3, device=device)  # mean distillation losses
+        seen = np.zeros((len(usage_names), 2), dtype=np.int64)  # samples, objects consumed per source this epoch
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
@@ -422,6 +431,10 @@ def train(hyp, opt, device, tb_writer=None):
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            if not opt.quad:  # per-source usage (quad batches merge images)
+                n_obj = np.bincount(targets[:, 0].long().numpy(), minlength=len(paths))
+                for j, f in enumerate(paths):
+                    seen[source_of.get(f, 0)] += (1, n_obj[j])
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -499,7 +512,8 @@ def train(hyp, opt, device, tb_writer=None):
 
         if rank in [-1, 0]:  # what the data loader actually used this epoch (this process's workers in DDP)
             usage_now = usage_totals(dataset)
-            usage = usage_report(usage_now, usage_before)
+            usage = usage_report({n: tuple(int(x) for x in seen[k]) for k, n in enumerate(usage_names)}, usage_now,
+                                 usage_before)
             usage_before = usage_now
             logger.info(colorstr('data used: ') + f'epoch {epoch}\n{usage}')
             with open(save_dir / 'data_usage.txt', 'a') as f:

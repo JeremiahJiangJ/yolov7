@@ -21,7 +21,7 @@ train_sources:
 #   points:
 #     - {progress: 0.6, weights: {camC: 60, camA: 25, camB: 15}}   # progress: fraction of --epochs
 
-# Images per epoch. total: all images of all sources, the same iterations per epoch as 2_default_pooled, so the
+# Samples per epoch. total: as many as frames in all sources, the same iterations per epoch as 2_default_pooled, so the
 # same --epochs means the same training budget in the ladder. Default (target): --epochs = passes over the target.
 # See README.md "Epoch size".
 epoch_size: total

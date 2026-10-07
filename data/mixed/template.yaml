@@ -3,10 +3,12 @@
 #
 # 1. Check the exposure plan (no training):
 #      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150 --img-size 1280 --close-mosaic 10 \
-#        --hyp data/hyp.finetune.sgd.yaml
-#    --epochs = how many times each camC image is sampled, as when fine-tuning camC alone. The weights decide how much
-#    camA / camB data is added on top (and so how long training takes). Check the plan's image share too: sources with
-#    smaller frames contribute more images per sample (mosaic), so their share of what the model sees is higher.
+#        --hyp data/hyp.finetune.sgd.yaml --measure 64
+#    --epochs = how many times each camC frame is sampled, as when fine-tuning camC alone. The weights set each source's
+#    training share (share of the training samples: pixels and compute); they decide how much camA / camB data is added
+#    on top, and so how long training takes. The plan also shows each source's share of the frames loaded and of the
+#    objects (add --measure 64): sources with smaller frames put more frames into each mosaic, and object density
+#    differs, so those shares can differ a lot from the training share. Adjust the weights if they do.
 #    Zoom range: set scale_min / scale_max in the hyp yaml (see data/mixed/README.md, "Scale augmentation").
 # 2. Train (crop size = deployment size, here 1280 for camera C):
 #      python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml \
@@ -29,6 +31,7 @@ mosaic_max_cells: 6     # max mosaic cells per axis for frames smaller than the 
 label_folder: labels    # /dir/images/x.jpg -> /dir/<label_folder>/x.txt
 
 # --- Sources -----------------------------------------------------------------------------------------------------------
+# weight: training share (relative, normalised): 30 / 40 / 30 = 30% / 40% / 30% of the training samples.
 train_sources:
   # Target: exactly one. Its val set drives best.pt / --patience / fitness; autoanchor uses its objects.
   - name: camC
@@ -70,5 +73,6 @@ weight_schedule:
 # --- Epoch size (optional) ----------------------------------------------------------------------------------------------
 # target (default): --epochs = passes over the target, whatever the weights and schedule (one epoch is on average one
 #   pass over camC plus the other sources' share).
-# total: all images of all sources per epoch (the budget of a pooled stock run, for equal-budget comparisons). Or an int.
+# total: as many samples per epoch as frames in all sources (the budget of a pooled stock run, for equal-budget
+#   comparisons). Or an int.
 epoch_size: target
