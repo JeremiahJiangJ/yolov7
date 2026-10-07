@@ -32,6 +32,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
 from utils.google_utils import attempt_download
 from utils.metrics import area_fitness, area_bins, DEFAULT_FITNESS_WEIGHTS
 from utils.loss import ComputeLoss, ComputeLossAuxOTA
+from utils.distill import Distiller
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
     torch_load
@@ -112,6 +113,11 @@ def train(hyp, opt, device, tb_writer=None):
         if any(x in k for x in freeze):
             print('freezing %s' % k)
             v.requires_grad = False
+
+    # Knowledge distillation from a larger model (optional; the main heads are distilled, not the auxiliary ones)
+    distiller = Distiller(opt.teacher, model, hyp, device, weight=opt.distill_weight) if opt.teacher else None
+    if distiller and not opt.resume:
+        distiller.sync_anchors(model)  # pair predictions anchor by anchor; autoanchor is skipped below
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -258,6 +264,10 @@ def train(hyp, opt, device, tb_writer=None):
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
+    if distiller:  # e.g. a P6 teacher (stride 64) needs input sizes that are multiples of 64
+        assert imgsz % distiller.stride == 0, f'--img-size {imgsz} must be a multiple of the teacher stride {distiller.stride}'
+        assert distiller.stride <= gs or not (opt.rect or opt.quad), \
+            f'--rect / --quad batches are not multiples of the teacher stride {distiller.stride}'
 
     # Process 0
     if rank in [-1, 0]:
@@ -279,7 +289,9 @@ def train(hyp, opt, device, tb_writer=None):
                     tb_writer.add_histogram('classes', c, 0)
 
             # Anchors
-            if not opt.noautoanchor:
+            if distiller:
+                logger.info('autoanchor: skipped, the student uses the teacher\'s anchors')
+            elif not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
@@ -338,6 +350,7 @@ def train(hyp, opt, device, tb_writer=None):
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(4, device=device)  # mean losses
+        mkd = torch.zeros(3, device=device)  # mean distillation losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
@@ -362,16 +375,21 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Multi-scale
             if opt.multi_scale:
-                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+                ms = max(gs, distiller.stride) if distiller else gs  # sizes the teacher can take too
+                sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + ms) // ms * ms  # ints: python>=3.12 rejects floats
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    ns = [math.ceil(x * sf / ms) * ms for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
+                if distiller:
+                    loss_kd, kd_items = distiller(imgs, pred)
+                    loss = loss + loss_kd
+                    mkd = (mkd * i + kd_items) / (i + 1)  # mean distillation losses (box, obj, cls)
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -409,6 +427,15 @@ def train(hyp, opt, device, tb_writer=None):
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
+
+        if distiller and rank in [-1, 0]:  # not part of results.txt (fixed columns), see TensorBoard train/distill_*
+            logger.info(f'distill loss (box, obj, cls): {", ".join(f"{x:.4g}" for x in mkd.tolist())} '
+                        f'(x {distiller.weight} in the total loss)')
+            for x, tag in zip(mkd.tolist(), ('train/distill_box', 'train/distill_obj', 'train/distill_cls')):
+                if tb_writer:
+                    tb_writer.add_scalar(tag, x, epoch)
+                if wandb_logger.wandb:
+                    wandb_logger.log({tag: x})
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
@@ -588,6 +615,10 @@ if __name__ == '__main__':
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--teacher', type=str, default='',
+                        help='distill from this larger model (weights .pt with the same classes), see utils/distill.py')
+    parser.add_argument('--distill-weight', type=float, default=1.0,
+                        help='weight of the distillation loss relative to the detection loss')
     parser.add_argument('--seed', type=int, nargs='?', const=42, default=None,
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
