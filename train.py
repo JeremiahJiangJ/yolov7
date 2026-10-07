@@ -629,6 +629,10 @@ if __name__ == '__main__':
     # Hyperparameters
     with open(opt.hyp) as f:
         hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
+    hyp_name = Path(opt.hyp).name
+    if ('adam' in hyp_name) != bool(opt.adam):
+        logger.warning(f"WARNING: --hyp {hyp_name} looks tuned for {'AdamW' if 'adam' in hyp_name else 'SGD'} "
+                       f"but training with {'AdamW' if opt.adam else 'SGD'}, check --adam")
 
     # Train
     logger.info(opt)
