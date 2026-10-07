@@ -267,6 +267,10 @@ def train(hyp, opt, device, tb_writer=None):
                                                       workers=opt.workers, quad=opt.quad, prefix=colorstr('train: '),
                                                       start_epoch=start_epoch, seed=data_seed or 0)
         data_signature = dataloader.sampler.signature()
+        if rank in [-1, 0]:  # how often each source / image is seen over the whole run
+            plan = dataloader.sampler.plan(epochs)
+            logger.info(colorstr('data plan: ') + plan)
+            (save_dir / 'data_plan.txt').write_text(plan + '\n')
         if opt.resume and ckpt_data_signature not in (None, data_signature):
             logger.warning('WARNING: the train_sources config differs from the one this run was started with, '
                            'resumed training will not draw the data the original run would have')
@@ -278,7 +282,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                 prefix=colorstr('train: '), cache_path=opt.train_cache_path,
                                                 label_folder_name=opt.label_folder_name, seed=data_seed,
                                                 resize=parse_resize(data_dict.get('resize', 'fit')),
-                                                fg_crop_prob=float(data_dict.get('fg_crop_prob', 0.5)))
+                                                fg_crop_prob=float(data_dict.get('fg_crop_prob', 0.5)),
+                                                mosaic_max_cells=int(data_dict.get('mosaic_max_cells', 6)))
         data_signature = None
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches

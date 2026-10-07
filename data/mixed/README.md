@@ -47,6 +47,7 @@ Per-source keys:
 | `val` | none | target: required (or a top-level `val:`). Other sources: opt-in validation, reported only |
 | `resize` | top-level `resize`, else `fit` | `fit`: long side resized to `--img-size` (stock YOLOv7). `native`: never resized, objects keep their pixel size, `--img-size` is the training crop size. Number: fixed scale factor, for sources whose objects are at a different pixel scale |
 | `fg_crop_prob` | top-level, else 0.5 | `native` / factor only: chance a mosaic tile or crop is placed around an object (else at random) |
+| `mosaic_max_cells` | top-level, else 6 | `native` / factor only: max mosaic cells per axis for frames smaller than the tiles (see below). Lower it if data loading is the bottleneck |
 | `label_folder` | top-level, else `--label-folder-name` | label folder next to `images` |
 | `cache_images` | target: `--cache-images`, others: off | cache this source's images in RAM |
 | `cache_path`, `val_cache_path` | from `--train-cache-path` / `--test-cache-path`, else next to the labels | this source's label cache file or directory (overrides the flags) |
@@ -63,6 +64,11 @@ Per-source keys:
   view (the stock mosaic anchors each frame's corner at the mosaic centre, which with large frames almost never
   shows objects near the frame centre). Validation uses full frames padded to a multiple of 32 (1280x720 ->
   1280x736), i.e. what `detect.py --img-size 1280` feeds the model. Autoanchor uses native object sizes.
+- **Fill mosaic.** Frames shorter than 1.5x `--img-size` along an axis (e.g. 640x480 frames at `--img-size 1280`)
+  would leave much of a 4-tile mosaic grey. Along that axis the mosaic canvas is instead cut into cells the size of
+  the frame, laid out from the random mosaic centre, so every cell is filled (up to `mosaic_max_cells` cells per axis,
+  i.e. up to its square of images loaded per sample). Measured on synthetic 640x480 frames at `--img-size 1280`: 54%
+  grey with 4 tiles, 6% with the fill mosaic (about 32 images loaded per sample, 1.5x the loading time).
 - **Reproducibility.** With `--seed`, the data of every epoch (order and augmentations) depends only on the seed,
   config and epoch: not on `--workers`, resume or loader rebuilds (`--close-mosaic`). A source's stream is the same
   whatever the other sources' weights are, so two weightings are compared on the same random draws. (Resumed runs
@@ -87,6 +93,24 @@ one cache per source, named after the source:
 every run reads the current label files; `--keep-cache` keeps them (also for `test.py`). A hard kill (SIGKILL,
 out-of-memory killer) cannot be caught: delete the caches listed at startup by hand after one. A cache built for a
 different image list or label folder is rebuilt automatically, but edited labels with the same images are not detected.
+
+## Exposure plan
+
+Training logs, and writes to `data_plan.txt`, how often each source is seen over the whole run: training samples,
+share, views per image and the share of images never drawn (exact: the draws are fixed in advance). Check a config
+without training:
+
+```
+python -m utils.mixed_data --data data/mixed/5_weighted_native.yaml --epochs 100
+```
+```
+100 epochs x 2857 images = 285700 training samples
+  source             images    samples   share   views per image  never seen
+  camC                 2000     200000   70.0%     100.0 (  100)          0%
+  camA                35000      28600   10.0%       0.8 (  0-1)         18%
+  camB                 7000      57100   20.0%       8.2 (  8-9)          0%
+  WARNING: 18% of camA (6400 images) is never seen in this run
+```
 
 ## Epoch size
 

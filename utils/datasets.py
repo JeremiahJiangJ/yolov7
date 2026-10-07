@@ -108,7 +108,8 @@ def delete_label_caches_at_exit():
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', cache_path=None,
-                      label_folder_name=DEFAULT_LABEL_FOLDER, seed=None, resize='fit', fg_crop_prob=0.5):
+                      label_folder_name=DEFAULT_LABEL_FOLDER, seed=None, resize='fit', fg_crop_prob=0.5,
+                      mosaic_max_cells=6):
     # seed: if not None, seed the sampler, dataloader generator and workers for reproducible data loading
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -125,7 +126,8 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       cache_path=cache_path,
                                       label_folder_name=label_folder_name,
                                       resize=resize,
-                                      fg_crop_prob=fg_crop_prob)
+                                      fg_crop_prob=fg_crop_prob,
+                                      mosaic_max_cells=mosaic_max_cells)
     dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=world_size, workers=workers,
                                   image_weights=image_weights, quad=quad, seed=seed)
     return dataloader, dataset
@@ -454,13 +456,16 @@ def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', cache_path=None,
-                 label_folder_name=DEFAULT_LABEL_FOLDER, resize='fit', fg_crop_prob=0.5):
+                 label_folder_name=DEFAULT_LABEL_FOLDER, resize='fit', fg_crop_prob=0.5, mosaic_max_cells=6):
         self.img_size = img_size
         self.label_folder_name = label_folder_name
         self.resize = parse_resize(resize)  # see parse_resize()
         self.scale = None if self.resize == 'fit' else 1.0 if self.resize == 'native' else self.resize
         # native / fixed scale training only: probability that a mosaic tile or crop is placed around an object
         self.fg_crop_prob = fg_crop_prob
+        # native / fixed scale mosaic: max cells per axis for images smaller than the tiles (images loaded per sample
+        # up to its square; 6 fills a 2560 canvas with 480 px tall frames, i.e. 640x480 at img_size 1280)
+        self.mosaic_max_cells = mosaic_max_cells
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -998,6 +1003,18 @@ def load_mosaic9(self, index):
     return img9, labels9
 
 
+def _mosaic_cuts(c, size, s, max_cells):
+    """Cell boundaries along one axis of a 2s mosaic canvas, through the mosaic centre c, and each cell's anchor (see
+    _place()). Images at least 1.5s long cover any of the 2 cells either side of the centre (the 4-tile layout).
+    Shorter images get a cut every `size` from the centre outwards ("fill" mosaic), so they fill their cells instead of
+    leaving the canvas grey; with more than max_cells cells, the cells grow to keep the count."""
+    if size >= 1.5 * s:
+        return [0, c, 2 * s], [True, False]  # towards the centre, like load_mosaic()
+    step = max(size, math.ceil(2 * s / (max(max_cells, 2) - 1)))
+    cuts = list(range(c, 0, -step))[::-1] + list(range(c + step, 2 * s, step))
+    return [0] + cuts + [2 * s], [None] * (len(cuts) + 1)
+
+
 def _place(self, boxes, size, region, view, anchor_high):
     """Offset (ox, oy) for an image of `size` (w, h) pasted onto a canvas region (x1, y1, x2, y2).
     Along each axis the image covers the whole region if it is large enough; otherwise it sticks to the high or low end
@@ -1054,21 +1071,27 @@ def _paste(self, canvas, index, region, view, anchor_high):
 
 
 def load_mosaic_native(self, index):
-    """4-mosaic for resize != 'fit' (objects keep their native / fixed-scale pixel size). load_mosaic() anchors each
+    """Mosaic for resize != 'fit' (objects keep their native / fixed-scale pixel size). load_mosaic() anchors each
     image's corner at the mosaic centre, which with images larger than the tiles only ever shows the region around one
     corner of each image (objects near the image centre are almost never seen). Here each image gets a random offset
     within the range that still covers its tile -- or, with probability fg_crop_prob, one that puts a random object in
-    view -- and the sampled image goes to a random tile."""
+    view -- and the sampled image goes to a random tile.
+    Images shorter than 1.5 x img_size along an axis (e.g. 640x480 frames with img_size 1280) would leave much of a
+    4-tile canvas grey, so along that axis the canvas is cut into cells the size of the image instead, laid out from
+    the random mosaic centre (see _mosaic_cuts()), up to mosaic_max_cells per axis."""
     s = self.img_size
-    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
-    indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-    random.shuffle(indices)
-    img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)  # base image with 4 tiles
+    img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)  # base image
     view = (s // 2, s // 2, s * 3 // 2, s * 3 // 2)  # canvas area the output is cut from (before translate / scale)
-    tiles = ((0, 0, xc, yc), (xc, 0, s * 2, yc), (0, yc, xc, s * 2), (xc, yc, s * 2, s * 2))
+    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    w, h = (self.shapes[index] * self.scale).astype(int)  # size of the sampled image as loaded
+    (xs, ax), (ys, ay) = (_mosaic_cuts(c, n, s, self.mosaic_max_cells) for c, n in ((xc, w), (yc, h)))
+    tiles = [(xs[i], ys[j], xs[i + 1], ys[j + 1]) for j in range(len(ys) - 1) for i in range(len(xs) - 1)]
+    anchors = [(ax[i], ay[j]) for j in range(len(ys) - 1) for i in range(len(xs) - 1)]
+    indices = [index] + random.choices(self.indices, k=len(tiles) - 1)  # additional image indices
+    random.shuffle(indices)
     labels4, segments4 = [], []
-    for i, index in enumerate(indices):
-        labels, segments, *_ = _paste(self, img4, index, tiles[i], view, (i in (0, 2), i in (0, 1)))
+    for tile, anchor, index in zip(tiles, anchors, indices):
+        labels, segments, *_ = _paste(self, img4, index, tile, view, anchor)
         labels4.append(labels)
         segments4.extend(segments)
 

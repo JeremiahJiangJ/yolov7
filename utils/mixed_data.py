@@ -59,6 +59,7 @@ class Source:
     val: object = None  # val images; for non-target sources this opts in to per-source validation
     resize: object = 'fit'  # see utils.datasets.parse_resize()
     fg_crop_prob: float = 0.5
+    mosaic_max_cells: int = 6
     cache_images: Optional[bool] = None  # None: target follows --cache-images, other sources are not cached
     label_folder: Optional[str] = None  # None: --label-folder-name
     cache_path: Optional[str] = None  # train labels cache file or dir; None: next to the labels
@@ -109,8 +110,8 @@ class WeightSchedule:
 class MixedConfig:
     """Parsed `train_sources` data yaml. Also points data_dict['train'] / ['val'] at the target source, for code that
     reads them (check_dataset, W&B)."""
-    KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'cache_images', 'label_folder',
-            'cache_path', 'val_cache_path'}
+    KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'mosaic_max_cells', 'cache_images',
+            'label_folder', 'cache_path', 'val_cache_path'}
 
     def __init__(self, data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
         srcs = data_dict['train_sources']
@@ -121,6 +122,7 @@ class MixedConfig:
         # top-level defaults for the per-source keys of the same name
         default_resize = data_dict.get('resize', 'fit')
         default_fg = float(data_dict.get('fg_crop_prob', 0.5))
+        default_cells = int(data_dict.get('mosaic_max_cells', 6))
         default_label_folder = data_dict.get('label_folder') or label_folder_name
         self.sources = []
         for i, s in enumerate(srcs):
@@ -133,7 +135,8 @@ class MixedConfig:
                 name=str(s.get('name', f'source{i}')), path=s['path'], weight=float(s.get('weight', 1)),
                 target=bool(s.get('target', False)), val=s.get('val'),
                 resize=parse_resize(s.get('resize', default_resize)),
-                fg_crop_prob=float(s.get('fg_crop_prob', default_fg)), cache_images=s.get('cache_images'),
+                fg_crop_prob=float(s.get('fg_crop_prob', default_fg)),
+                mosaic_max_cells=int(s.get('mosaic_max_cells', default_cells)), cache_images=s.get('cache_images'),
                 label_folder=s.get('label_folder') or default_label_folder, cache_path=s.get('cache_path'),
                 val_cache_path=s.get('val_cache_path')))
         self.names = [s.name for s in self.sources]
@@ -333,6 +336,24 @@ class MixedSourceSampler(Sampler):
         return {'seed': self.seed, 'names': self.names, 'sizes': self.sizes, 'total': self.total,
                 'schedule': self.schedule.signature()}
 
+    def plan(self, epochs):
+        """Exposure plan of a run of `epochs` epochs, exact (the draws are fixed in advance): per source the number of
+        training samples, its share, views per image and the share of its images never drawn."""
+        draws = self.consumed_before(epochs)
+        total = max(int(draws.sum()), 1)
+        lines = [f'{epochs} epochs x {self.total} images = {total} training samples']
+        lines.append(f"  {'source':<16}{'images':>9}{'samples':>11}{'share':>8}{'views per image':>18}{'never seen':>12}")
+        warnings = []
+        for n, d, size in zip(self.names, draws, self.sizes):
+            v = d / max(size, 1)
+            # each source is cycled through without replacement: every image is drawn floor(v) or ceil(v) times
+            rng = f'{math.floor(v)}' if v == math.floor(v) else f'{math.floor(v)}-{math.ceil(v)}'
+            unseen = max(0.0, 1 - v)
+            lines.append(f'  {n:<16}{size:>9}{int(d):>11}{d / total:>8.1%}{v:>10.1f} ({rng:>5}){unseen:>12.0%}')
+            if 0 < d < size:
+                warnings.append(f'{unseen:.0%} of {n} ({size - int(d)} images) is never seen in this run')
+        return '\n'.join(lines + [f'  WARNING: {w}' for w in warnings])
+
     def summary(self, epoch=0):
         count = self.counts(epoch)
         rows = [f'{n:<16}{c / self.total:>7.1%}{size:>9} images{c:>9}/epoch{c / max(size, 1):>7.2f} passes/epoch'
@@ -356,7 +377,8 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
                                                 cache_path=src.cache_path or source_cache_path(
                                                     getattr(opt, 'train_cache_path', None), src.name, 'train'),
                                                 label_folder_name=src.label_folder,
-                                                resize=src.resize, fg_crop_prob=src.fg_crop_prob))
+                                                resize=src.resize, fg_crop_prob=src.fg_crop_prob,
+                                                mosaic_max_cells=src.mosaic_max_cells))
     dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
     schedule = cfg.schedule(dataset.sizes)
     epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule)
@@ -378,6 +400,22 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
     return loader, dataset
 
 
+def list_images(path):
+    # Image files a LoadImagesAndLabels(path) would read (before dropping corrupt ones), without reading them
+    from utils.datasets import img_formats
+    files = []
+    for p in path if isinstance(path, list) else [path]:
+        p = Path(p)
+        if p.is_dir():
+            files += [str(x) for x in p.rglob('*.*')]
+        elif p.is_file():
+            parent = str(p.parent) + os.sep
+            files += [x.replace('./', parent) if x.startswith('./') else x for x in p.read_text().strip().splitlines()]
+        else:
+            raise FileNotFoundError(f'{p} does not exist')
+    return [f for f in files if f.split('.')[-1].lower() in img_formats]
+
+
 def create_val_dataloader(src, imgsz, batch_size, stride, opt, hyp=None, cache=False, world_size=1, workers=8,
                           prefix=''):
     # Validation loader of one source, at its own resize mode (native sources: full frames, padded to the stride)
@@ -386,3 +424,28 @@ def create_val_dataloader(src, imgsz, batch_size, stride, opt, hyp=None, cache=F
                              cache_path=src.val_cache_path or source_cache_path(getattr(opt, 'test_cache_path', None),
                                                                                 src.name, 'val'),
                              label_folder_name=src.label_folder, resize=src.resize)[0]
+
+
+if __name__ == '__main__':
+    # Dry run: exposure plan of a train_sources data yaml without training, e.g.
+    #   python -m utils.mixed_data --data data/mixed/5_weighted_native.yaml --epochs 100
+    import argparse
+    import yaml
+
+    parser = argparse.ArgumentParser(description='Print the per-source exposure plan of a train_sources data yaml')
+    parser.add_argument('--data', required=True, help='data yaml with train_sources')
+    parser.add_argument('--epochs', type=int, required=True)
+    parser.add_argument('--world-size', type=int, default=1, help='number of GPUs (DDP pads epochs to a multiple)')
+    opt = parser.parse_args()
+    with open(opt.data) as f:
+        cfg = MixedConfig(yaml.safe_load(f))
+    sizes = [len(list_images(src.path)) for src in cfg.sources]
+    schedule = cfg.schedule(sizes)
+    sampler = MixedSourceSampler(sizes, np.cumsum([0] + sizes[:-1]).tolist(), cfg.names, schedule,
+                                 cfg.resolve_epoch_size(sizes, schedule), rank=0 if opt.world_size > 1 else -1,
+                                 world_size=opt.world_size)
+    print(f'sampling {cfg.sampling}, target {cfg.target.name}')
+    if len(schedule.points) > 1:
+        print(f'weight schedule ({schedule.mode}): ' + '; '.join(
+            f'epoch {e}: ' + ', '.join(f'{n} {x:.0%}' for n, x in zip(cfg.names, w)) for e, w in schedule.points))
+    print(sampler.plan(opt.epochs))
