@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Train the data/mixed experiment ladder with identical settings, to measure each change's effect
 # (see data/mixed/README.md). Every config except 1 has the same images per epoch (total images over all sources),
-# so --epochs gives the same training budget; for 1 (target only) EPOCHS_TARGET is scaled to match.
+# (5_weighted_native uses epoch_size: total), so --epochs gives the same training budget; for 1 (target only)
+# EPOCHS_TARGET is scaled to match.
 # Usage: bash scripts/train_mixed_ladder.sh [extra train.py args, e.g. --area-int 300 650 1250]
 set -euo pipefail
 EPOCHS=${EPOCHS:-100}

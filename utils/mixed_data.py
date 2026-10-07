@@ -8,7 +8,8 @@
 # 4 mosaic tiles would be drawn uniformly from all images, pulling exposure back towards raw dataset sizes.)
 #
 # Sampling: epoch e draws exactly round(w_k(e) * epoch_size) images from source k, with weights w_k optionally
-# following a schedule. Each source is an endless stream of shuffled passes over its images, so every image is seen
+# following a schedule. By default the epoch size is set so that --epochs means passes over the target, as when
+# training on the target alone: weights only decide how much other data is added (see MixedConfig.resolve_epoch_size). Each source is an endless stream of shuffled passes over its images, so every image is seen
 # once before any repeats.
 #
 # Reproducibility: the draw for an epoch is a pure function of (seed, config, epoch): pass c over source k is a
@@ -78,17 +79,24 @@ class WeightSchedule:
         weight_schedule:
           mode: step      # step: switch at each point; linear: ramp from the previous point to this one
           points:
-            - {epoch: 100, weights: {target: 60, supplementary: 25, open_source: 10, synthetic: 5}}
+            - {progress: 0.6, weights: {target: 60, supplementary: 25, open_source: 10, synthetic: 5}}
 
-    Every point lists every source (0 switches one off), so nothing is dropped silently."""
+    A point is placed at `progress` (fraction of --epochs, so the schedule scales with the run length) or at an absolute
+    `epoch`. Every point lists every source (0 switches one off), so nothing is dropped silently."""
 
-    def __init__(self, names, base_weights, spec=None):
+    def __init__(self, names, base_weights, spec=None, epochs=None):
         spec = spec or {}
         self.mode = spec.get('mode', 'step')
         assert self.mode in ('step', 'linear'), f'weight_schedule mode must be step or linear, got {self.mode}'
         self.points = [(0, _normalize(base_weights, 'train_sources'))]
         for p in spec.get('points', []):
-            e, ws = int(p['epoch']), p['weights']
+            assert ('epoch' in p) != ('progress' in p), f'weight_schedule point needs epoch or progress: {p}'
+            if 'progress' in p:
+                assert epochs, 'weight_schedule progress points need the number of epochs'
+                e = int(round(float(p['progress']) * epochs))
+            else:
+                e = int(p['epoch'])
+            ws = p['weights']
             assert e > self.points[-1][0], 'weight_schedule points need strictly increasing epochs > 0'
             assert set(ws) == set(names), f'weight_schedule point at epoch {e} must list exactly {names}, got {list(ws)}'
             self.points.append((e, _normalize([ws[n] for n in names], f'weight_schedule epoch {e}')))
@@ -154,11 +162,13 @@ class MixedConfig:
                 logger.warning(f'sampling: proportional ignores {ignored}')
             self.schedule_spec, self.epoch_size = None, None
         else:
-            self.schedule_spec, self.epoch_size = data_dict.get('weight_schedule'), data_dict.get('epoch_size')
+            self.schedule_spec = data_dict.get('weight_schedule')
+            self.epoch_size = data_dict.get('epoch_size', 'target')
+            if self.epoch_size == 'target':
+                self.epoch_size = self.target.name
             if isinstance(self.epoch_size, str):
-                assert self.epoch_size in self.names, f'epoch_size "{self.epoch_size}" is not a source name'
-            elif self.epoch_size is not None:
-                assert int(self.epoch_size) > 0, 'epoch_size must be > 0'
+                assert self.epoch_size in self.names + ['total'], \
+                    f"epoch_size must be 'target', 'total', a source name or an int, got {self.epoch_size!r}"
 
         data_dict['train'], data_dict['val'] = self.target.path, self.target.val
 
@@ -166,22 +176,28 @@ class MixedConfig:
     def target(self):
         return self.sources[self.target_idx]
 
-    def schedule(self, sizes):
+    def schedule(self, sizes, epochs=None):
         if self.sampling == 'proportional':  # every image once per epoch, i.e. shares = dataset sizes
             return WeightSchedule(self.names, sizes)
-        return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec)
+        return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec, epochs)
 
-    def resolve_epoch_size(self, sizes, schedule):
-        """epoch_size: int; omitted (= total images); or a source name, meaning len(source) / its epoch-0 weight, i.e.
-        that source is seen once per epoch at the start. Fixed for the whole run (batches per epoch must not change)."""
+    def resolve_epoch_size(self, sizes, schedule, epochs):
+        """Images per epoch, fixed for the whole run (the training loop needs constant batches per epoch).
+        epoch_size: <source name> (default: the target): sized so that over `epochs` epochs every image of that source
+          is seen `epochs` times, whatever the weights and schedule -- i.e. --epochs means passes over that source,
+          like training on it alone, and the other sources are added on top. Epoch = len(source) / its weight averaged
+          over the run, so with a schedule raising its weight it gets fewer images than that in early epochs, more late.
+        'total': all images of all sources (the epoch of a pooled stock YOLOv7 run, for equal-budget comparisons).
+        int: that many images."""
         es = self.epoch_size
-        if es is None:
+        if es is None or es == 'total':
             return int(sum(sizes))
         if isinstance(es, str):
             k = self.names.index(es)
-            w0 = schedule(0)[k]
-            assert w0 > 0, f'epoch_size source "{es}" has weight 0 at epoch 0'
-            return int(round(sizes[k] / w0))
+            mean_w = float(np.mean([schedule(e)[k] for e in range(max(epochs, 1))]))
+            assert mean_w > 0, f'epoch_size source "{es}" has weight 0 throughout'
+            return max(int(round(sizes[k] / mean_w)), 1)
+        assert int(es) > 0, 'epoch_size must be > 0'
         return int(es)
 
 
@@ -365,7 +381,7 @@ class MixedSourceSampler(Sampler):
 # Loaders
 # ----------------------------------------------------------------------------------------------------------------------
 def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache=False, rank=-1, world_size=1,
-                            workers=8, quad=False, prefix='', start_epoch=0, seed=0):
+                            workers=8, quad=False, prefix='', start_epoch=0, seed=0, epochs=300):
     """Training loader for a MixedConfig (replaces create_dataloader() for training)."""
     datasets = []
     for k, src in enumerate(cfg.sources):
@@ -380,8 +396,8 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
                                                 resize=src.resize, fg_crop_prob=src.fg_crop_prob,
                                                 mosaic_max_cells=src.mosaic_max_cells))
     dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
-    schedule = cfg.schedule(dataset.sizes)
-    epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule)
+    schedule = cfg.schedule(dataset.sizes, epochs)
+    epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule, epochs)
     sampler = MixedSourceSampler(dataset.sizes, dataset.offsets, cfg.names, schedule, epoch_size, rank=rank,
                                  world_size=world_size, seed=seed, start_epoch=start_epoch)
     if rank in [-1, 0]:
@@ -440,9 +456,10 @@ if __name__ == '__main__':
     with open(opt.data) as f:
         cfg = MixedConfig(yaml.safe_load(f))
     sizes = [len(list_images(src.path)) for src in cfg.sources]
-    schedule = cfg.schedule(sizes)
+    schedule = cfg.schedule(sizes, opt.epochs)
     sampler = MixedSourceSampler(sizes, np.cumsum([0] + sizes[:-1]).tolist(), cfg.names, schedule,
-                                 cfg.resolve_epoch_size(sizes, schedule), rank=0 if opt.world_size > 1 else -1,
+                                 cfg.resolve_epoch_size(sizes, schedule, opt.epochs),
+                                 rank=0 if opt.world_size > 1 else -1,
                                  world_size=opt.world_size)
     print(f'sampling {cfg.sampling}, target {cfg.target.name}')
     if len(schedule.points) > 1:

@@ -265,7 +265,7 @@ def train(hyp, opt, device, tb_writer=None):
         dataloader, dataset = create_mixed_dataloader(mixed, imgsz, batch_size, gs, opt, hyp=hyp,
                                                       cache=opt.cache_images, rank=rank, world_size=opt.world_size,
                                                       workers=opt.workers, quad=opt.quad, prefix=colorstr('train: '),
-                                                      start_epoch=start_epoch, seed=data_seed or 0)
+                                                      start_epoch=start_epoch, seed=data_seed or 0, epochs=epochs)
         data_signature = dataloader.sampler.signature()
         if rank in [-1, 0]:  # how often each source / image is seen over the whole run
             plan = dataloader.sampler.plan(epochs)

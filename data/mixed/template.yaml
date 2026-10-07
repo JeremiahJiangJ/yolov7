@@ -2,13 +2,14 @@
 # Replace the paths, nc and names; everything else has a working default. See data/mixed/README.md.
 #
 # 1. Check the exposure plan (no training):
-#      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 100
-#    Aim for the views per camC image you would fine-tune camC alone for (~150-200 here); adjust --epochs / weights.
+#      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150
+#    --epochs = how many times each camC image is seen, as when fine-tuning camC alone. The weights decide how much
+#    camA / camB data is added on top (and so how long training takes); the plan shows it.
 # 2. Train (crop size = deployment size, here 1280 for camera C):
 #      python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml \
-#        --data data/mixed/template.yaml --hyp data/hyp.finetune.sgd.yaml --epochs 100 \
+#        --data data/mixed/template.yaml --hyp data/hyp.finetune.sgd.yaml --epochs 150 \
 #        --batch-size 16 --img-size 1280 1280 --seed 42 --device 0 --workers 8 \
-#        --fitness-metric-weights 0 0 1 0 --close-mosaic 5 --patience 20 \
+#        --fitness-metric-weights 0 0 1 0 --close-mosaic 10 --patience 30 \
 #        --train-cache-path ./cache/exp1 --test-cache-path ./cache/exp1 \
 #        --project runs/mixed --name camC_exp1
 # 3. Deploy at the native frame size: python detect.py --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280 ...
@@ -54,16 +55,17 @@ train_sources:
   #   label_folder: labels_synth
 
 # --- Weight schedule (optional) -----------------------------------------------------------------------------------------
-# The weights above apply from epoch 0. Front-loaded: broad mix first so the large sources are covered, then shift
+# The weights above apply from the start. Front-loaded: broad mix first so the large sources are covered, then shift
 # towards the target. Keep a floor on the other sources (here 30%) so they are not forgotten late in training.
+# progress: fraction of --epochs (the schedule scales with the run length); or use epoch: <n>.
 # Every point lists every source. mode: linear ramps from the previous point, step switches at the point.
 weight_schedule:
   mode: linear
   points:
-    - {epoch: 60, weights: {camC: 70, camA: 10, camB: 20}}
+    - {progress: 0.6, weights: {camC: 70, camA: 10, camB: 20}}
 
 # --- Epoch size (optional) ----------------------------------------------------------------------------------------------
-# Images per epoch, fixed for the run. camC: one pass over camC per epoch at its epoch-0 weight
-# (len(camC) / 0.3). Everything counted in epochs scales with it: --epochs, warmup, --close-mosaic, --patience,
-# the schedule points above. Omit for the total number of images over all sources, or give an int.
-epoch_size: camC
+# target (default): --epochs = passes over the target, whatever the weights and schedule (one epoch is on average one
+#   pass over camC plus the other sources' share).
+# total: all images of all sources per epoch (the budget of a pooled stock run, for equal-budget comparisons). Or an int.
+epoch_size: target

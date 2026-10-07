@@ -30,8 +30,8 @@ train_sources:
 weight_schedule:          # optional
   mode: step              # step | linear
   points:
-    - {epoch: 200, weights: {camC: 60, camA: 25, camB: 15}}
-epoch_size: camC          # optional: int | source name | omitted (= total images)
+    - {progress: 0.6, weights: {camC: 60, camA: 25, camB: 15}}   # or epoch: <n>
+epoch_size: target        # default: --epochs = passes over the target | total | <source name> | <int>
 nc: 1
 names: ['object']
 ```
@@ -114,23 +114,22 @@ python -m utils.mixed_data --data data/mixed/5_weighted_native.yaml --epochs 100
 
 ## Epoch size
 
-With weighted sampling there is no natural "one pass over the data", so the epoch length is set by `epoch_size`
-(fixed for the whole run):
+With weighted sampling there is no natural "one pass over the data", so `epoch_size` sets the epoch length (fixed
+for the run, as the training loop needs constant batches per epoch):
 
-- omitted: total images over all sources, the same number of iterations per epoch as `2_default_pooled.yaml`
-- a source name, e.g. `camC`: `len(camC) / weight(camC at epoch 0)`, i.e. one pass over that source per epoch at the
-  start (with 2k target images at weight 0.4: 5k images per epoch)
+- **`target` (default): `--epochs` = passes over the target**, exactly as when training on the target alone, whatever
+  the weights and schedule. Each target image is seen `--epochs` times; the weights only decide how much other data is
+  added, i.e. how long training takes. (The epoch is the target size divided by its weight averaged over the run, so
+  with a schedule raising the target weight, early epochs hold fewer target images and late epochs more.)
+- `total`: all images of all sources per epoch, the same iterations per epoch as `2_default_pooled.yaml`, so the same
+  `--epochs` is the same training budget (used in the ladder)
+- a source name: like `target`, anchored on that source instead
 - an int
 
-Everything YOLOv7 counts in epochs scales with it: `--epochs`, the LR schedule, `warmup_epochs` (at least 1000
-iterations), validation frequency, `--close-mosaic`, `--patience`, `weight_schedule` points and checkpoint saving.
-So:
-
-- **Comparing against stock training: keep the training budget (epochs x images per epoch) equal.** Omitting
-  `epoch_size` matches `2_default_pooled.yaml` at the same `--epochs`. Against `1_default_target.yaml` (epoch = one
-  pass over the target), adjust `--epochs` so `epochs x epoch_size` matches.
-- **With short epochs** (e.g. `epoch_size: camC`), scale the epoch-denominated settings with it, and expect
-  validation to take a larger share of the run time (it runs every epoch, once per source with a `val`).
+Everything YOLOv7 counts in epochs scales with the epoch length: the LR schedule, `warmup_epochs` (at least 1000
+iterations), validation frequency, `--close-mosaic`, `--patience` and checkpoint saving. Schedule points given as
+`progress` scale with `--epochs`; points given as `epoch` do not. Check a config with the dry run below: it shows
+the training samples and per-source views of the whole run.
 
 ## Validation and testing
 
