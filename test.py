@@ -10,7 +10,7 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader, parse_resize, DEFAULT_LABEL_FOLDER
+from utils.datasets import create_dataloader, parse_resize, delete_label_caches_at_exit, DEFAULT_LABEL_FOLDER
 from utils.mixed_data import MixedConfig, is_mixed
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
@@ -348,11 +348,14 @@ if __name__ == '__main__':
                         help='train_sources data yaml: name of the source whose val set to test (default: the target)')
     parser.add_argument('--resize', type=str, default=None,
                         help="override the data yaml resize: fit (resize to --img-size), native, or a scale factor")
+    parser.add_argument('--keep-cache', action='store_true', help='keep label caches after testing (default: delete)')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='labels cache: a .cache file or a directory; default: next to the labels')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
                         help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()
+    if not opt.keep_cache:
+        delete_label_caches_at_exit()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)

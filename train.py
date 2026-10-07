@@ -25,7 +25,8 @@ import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader, rebuild_loader, parse_resize, DEFAULT_LABEL_FOLDER
+from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
+    DEFAULT_LABEL_FOLDER
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
@@ -685,6 +686,8 @@ if __name__ == '__main__':
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
                         help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
+    parser.add_argument('--keep-cache', action='store_true',
+                        help='keep label caches after training (default: delete them when the run ends or is stopped)')
     parser.add_argument('--train-cache-path', type=str, default=None,
                         help='train labels cache: a .cache file or a directory (train_sources: one file per source, '
                              'see data/mixed/README.md); default: next to the labels')
@@ -717,6 +720,8 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
+    if not opt.keep_cache and opt.global_rank in [-1, 0]:
+        delete_label_caches_at_exit()  # stale caches (labels edited since) silently feed old labels to the next run
     if opt.train_cache_path and opt.train_cache_path == opt.test_cache_path and opt.train_cache_path.endswith('.cache'):
         logger.warning('WARNING: --train-cache-path and --test-cache-path are the same file: train and val labels would '
                        'overwrite each other\'s cache on every run. Use two files, or a directory for both')

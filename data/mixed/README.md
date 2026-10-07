@@ -83,8 +83,10 @@ one cache per source, named after the source:
 | `cache/exp1` (a directory, created if needed) | `cache/exp1/labels_<hash>.cache` | `cache/exp1/<source>.train.cache` (`.val.cache`) |
 | not given | next to the labels (upstream) | next to each source's labels |
 
-A cache built for a different image list or label folder is rebuilt automatically. Edited label files with the same
-images are not detected: delete the cache to rebuild it.
+**Caches are deleted when the run ends**, finished or stopped (error, Ctrl+C, SIGTERM / SIGHUP from a scheduler), so
+every run reads the current label files; `--keep-cache` keeps them (also for `test.py`). A hard kill (SIGKILL,
+out-of-memory killer) cannot be caught: delete the caches listed at startup by hand after one. A cache built for a
+different image list or label folder is rebuilt automatically, but edited labels with the same images are not detected.
 
 ## Epoch size
 

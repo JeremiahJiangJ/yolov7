@@ -1,5 +1,6 @@
 # Dataset utils and dataloaders
 
+import atexit
 import glob
 import hashlib
 import logging
@@ -7,6 +8,8 @@ import math
 import os
 import random
 import shutil
+import signal
+import sys
 import time
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -33,6 +36,7 @@ from utils.torch_utils import torch_distributed_zero_first, seed_worker, torch_l
 
 # Parameters
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
+_label_cache_files = set()  # label caches read or written by this process, see delete_label_caches_at_exit()
 DEFAULT_LABEL_FOLDER = 'labels_upright'  # folder holding labels, next to the 'images' folder
 img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
 vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
@@ -62,6 +66,44 @@ def exif_size(img):
         pass
 
     return s
+
+
+def delete_label_caches_at_exit():
+    """Delete every label cache this process reads or writes when it exits: normally, on an error, Ctrl+C, or
+    SIGTERM / SIGHUP (e.g. a job scheduler stopping the run). Directories left empty (a --train-cache-path folder) go
+    too. A hard kill (SIGKILL, out-of-memory killer, power loss) cannot be caught: the stale-cache check still
+    rebuilds caches made for other images, but not after label edits, so delete caches by hand after one."""
+    pid = os.getpid()
+
+    def cleanup():
+        if os.getpid() != pid:  # forked dataloader workers inherit atexit handlers
+            return
+        deleted = []
+        for f in sorted(_label_cache_files):
+            try:
+                f.unlink()
+                deleted.append(str(f))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f'WARNING: could not delete label cache {f}: {e}')
+            try:
+                f.parent.rmdir()  # only succeeds if empty
+            except OSError:
+                pass
+        if deleted:
+            print('Deleted label caches: ' + ', '.join(deleted))
+
+    def on_signal(signum, frame):
+        if os.getpid() == pid:
+            sys.exit(128 + signum)  # exits through the atexit handlers
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    atexit.register(cleanup)
+    for name in ('SIGTERM', 'SIGHUP'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), on_signal)
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
@@ -465,6 +507,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         else:
             cache_path = default_cache_path  # cached labels
         self.cache_file = cache_path
+        _label_cache_files.add(Path(cache_path).resolve())
         if cache_path.is_file():
             cache, exists = torch_load(cache_path), True  # load
             cached_files = set(cache) - {'hash', 'results', 'version', 'label_folder'}
