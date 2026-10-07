@@ -25,7 +25,7 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     prefix = colorstr('autoanchor: ')
     print(f'\n{prefix}Analyzing anchors... ', end='')
     m = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]  # Detect()
-    shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
+    shapes = dataset.loaded_shapes(imgsz)  # image sizes as loaded (resized to imgsz, or native / fixed scale)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
     wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
 
@@ -109,7 +109,7 @@ def kmean_anchors(path='./data/coco.yaml', n=9, img_size=640, thr=4.0, gen=1000,
         dataset = path  # dataset
 
     # Get label wh
-    shapes = img_size * dataset.shapes / dataset.shapes.max(1, keepdims=True)
+    shapes = dataset.loaded_shapes(img_size)  # image sizes as loaded (resized to img_size, or native / fixed scale)
     wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
 
     # Filter

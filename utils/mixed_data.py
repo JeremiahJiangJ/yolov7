@@ -1,0 +1,371 @@
+# Multi-source training data: weighted sampling over several datasets ("sources"), one of which is the target.
+#
+# Enabled by a `train_sources:` list in the data yaml (see data/mixed/README.md). A plain `train:` / `val:` data yaml
+# keeps the stock YOLOv7 pipeline.
+#
+# Each source is its own LoadImagesAndLabels, so mosaic / mixup / paste-in partners come from the SAME source as the
+# sampled image: every training sample is built from the source the sampler picked. (With one pooled dataset, 3 of the
+# 4 mosaic tiles would be drawn uniformly from all images, pulling exposure back towards raw dataset sizes.)
+#
+# Sampling: epoch e draws exactly round(w_k(e) * epoch_size) images from source k, with weights w_k optionally
+# following a schedule. Each source is an endless stream of shuffled passes over its images, so every image is seen
+# once before any repeats.
+#
+# Reproducibility: the draw for an epoch is a pure function of (seed, config, epoch): pass c over source k is a
+# permutation seeded by hash(seed, k, c), the sample at stream position (c, p) is augmented with RNG seed
+# hash(seed, k, 'aug', c, p), and each source's stream position at the start of epoch e is the sum of its earlier
+# quotas. Resume, loader rebuilds and the number of workers therefore cannot change what is trained on, and there is
+# no sampler state to checkpoint. A source's stream (order and augmentations) is also identical whatever the other
+# sources' weights are, so two weightings are compared on the same random draws.
+
+import hashlib
+import logging
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, Sampler
+
+from utils.datasets import LoadImagesAndLabels, InfiniteDataLoader, DEFAULT_LABEL_FOLDER, parse_resize, \
+    create_dataloader
+from utils.torch_utils import torch_distributed_zero_first
+
+logger = logging.getLogger(__name__)
+
+
+def is_mixed(data_dict):
+    return 'train_sources' in data_dict
+
+
+def stable_hash(*parts):
+    # 63-bit hash, identical across processes and machines (python's hash() is salted per process)
+    return int.from_bytes(hashlib.blake2b(repr(parts).encode(), digest_size=8).digest(), 'little') & (2 ** 63 - 1)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------------------------------------------------
+@dataclass
+class Source:
+    name: str
+    path: object  # train images: dir, list file or list of those
+    weight: float
+    target: bool = False
+    val: object = None  # val images; for non-target sources this opts in to per-source validation
+    resize: object = 'fit'  # see utils.datasets.parse_resize()
+    fg_crop_prob: float = 0.5
+    cache_images: Optional[bool] = None  # None: target follows --cache-images, other sources are not cached
+    label_folder: Optional[str] = None  # None: --label-folder-name
+    cache_path: Optional[str] = None  # train labels cache file or dir; None: next to the labels
+    val_cache_path: Optional[str] = None
+
+
+def _normalize(w, what):
+    w = np.asarray(w, dtype=np.float64)
+    assert np.isfinite(w).all() and (w >= 0).all() and w.sum() > 0, f'{what}: weights must be >= 0 and not all 0'
+    return w / w.sum()
+
+
+class WeightSchedule:
+    """Per-epoch source weights. The train_sources weights apply from epoch 0; weight_schedule points change them:
+
+        weight_schedule:
+          mode: step      # step: switch at each point; linear: ramp from the previous point to this one
+          points:
+            - {epoch: 100, weights: {target: 60, supplementary: 25, open_source: 10, synthetic: 5}}
+
+    Every point lists every source (0 switches one off), so nothing is dropped silently."""
+
+    def __init__(self, names, base_weights, spec=None):
+        spec = spec or {}
+        self.mode = spec.get('mode', 'step')
+        assert self.mode in ('step', 'linear'), f'weight_schedule mode must be step or linear, got {self.mode}'
+        self.points = [(0, _normalize(base_weights, 'train_sources'))]
+        for p in spec.get('points', []):
+            e, ws = int(p['epoch']), p['weights']
+            assert e > self.points[-1][0], 'weight_schedule points need strictly increasing epochs > 0'
+            assert set(ws) == set(names), f'weight_schedule point at epoch {e} must list exactly {names}, got {list(ws)}'
+            self.points.append((e, _normalize([ws[n] for n in names], f'weight_schedule epoch {e}')))
+
+    def __call__(self, epoch):
+        i = max(j for j, (e, _) in enumerate(self.points) if e <= epoch)
+        if self.mode == 'step' or i == len(self.points) - 1:
+            return self.points[i][1]
+        (e0, w0), (e1, w1) = self.points[i], self.points[i + 1]
+        return w0 + (w1 - w0) * (epoch - e0) / (e1 - e0)
+
+    def ever_positive(self):
+        return np.max([w for _, w in self.points], 0) > 0
+
+    def signature(self):
+        return self.mode, tuple((e, tuple(np.round(w, 12).tolist())) for e, w in self.points)
+
+
+class MixedConfig:
+    """Parsed `train_sources` data yaml. Also points data_dict['train'] / ['val'] at the target source, for code that
+    reads them (check_dataset, W&B)."""
+    KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'cache_images', 'label_folder',
+            'cache_path', 'val_cache_path'}
+
+    def __init__(self, data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
+        srcs = data_dict['train_sources']
+        assert isinstance(srcs, list) and srcs, 'train_sources must be a non-empty list'
+        self.sampling = data_dict.get('sampling', 'weighted')
+        assert self.sampling in ('weighted', 'proportional'), \
+            f"sampling must be 'weighted' or 'proportional', got {self.sampling!r}"
+        # top-level defaults for the per-source keys of the same name
+        default_resize = data_dict.get('resize', 'fit')
+        default_fg = float(data_dict.get('fg_crop_prob', 0.5))
+        default_label_folder = data_dict.get('label_folder') or label_folder_name
+        self.sources = []
+        for i, s in enumerate(srcs):
+            unknown = set(s) - self.KEYS
+            assert not unknown, f'train_sources[{i}]: unknown keys {sorted(unknown)}, expected {sorted(self.KEYS)}'
+            assert 'path' in s, f'train_sources[{i}] needs a path'
+            if self.sampling == 'weighted':
+                assert 'weight' in s, f"train_sources[{i}] needs a weight (or use sampling: proportional)"
+            self.sources.append(Source(
+                name=str(s.get('name', f'source{i}')), path=s['path'], weight=float(s.get('weight', 1)),
+                target=bool(s.get('target', False)), val=s.get('val'),
+                resize=parse_resize(s.get('resize', default_resize)),
+                fg_crop_prob=float(s.get('fg_crop_prob', default_fg)), cache_images=s.get('cache_images'),
+                label_folder=s.get('label_folder') or default_label_folder, cache_path=s.get('cache_path'),
+                val_cache_path=s.get('val_cache_path')))
+        self.names = [s.name for s in self.sources]
+        assert len(set(self.names)) == len(self.names), f'train_sources names must be unique, got {self.names}'
+        targets = [i for i, s in enumerate(self.sources) if s.target]
+        assert len(targets) == 1, f'exactly one train_source needs target: true, got {[self.names[i] for i in targets]}'
+        self.target_idx = targets[0]
+        if self.target.val is None:  # allow a top-level val: for the target
+            self.target.val = data_dict.get('val')
+        assert self.target.val, f'target source "{self.target.name}" needs a val path'
+
+        if self.sampling == 'proportional':
+            ignored = [k for k in ('weight_schedule', 'epoch_size') if k in data_dict]
+            if ignored:
+                logger.warning(f'sampling: proportional ignores {ignored}')
+            self.schedule_spec, self.epoch_size = None, None
+        else:
+            self.schedule_spec, self.epoch_size = data_dict.get('weight_schedule'), data_dict.get('epoch_size')
+            if isinstance(self.epoch_size, str):
+                assert self.epoch_size in self.names, f'epoch_size "{self.epoch_size}" is not a source name'
+            elif self.epoch_size is not None:
+                assert int(self.epoch_size) > 0, 'epoch_size must be > 0'
+
+        data_dict['train'], data_dict['val'] = self.target.path, self.target.val
+
+    @property
+    def target(self):
+        return self.sources[self.target_idx]
+
+    def schedule(self, sizes):
+        if self.sampling == 'proportional':  # every image once per epoch, i.e. shares = dataset sizes
+            return WeightSchedule(self.names, sizes)
+        return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec)
+
+    def resolve_epoch_size(self, sizes, schedule):
+        """epoch_size: int; omitted (= total images); or a source name, meaning len(source) / its epoch-0 weight, i.e.
+        that source is seen once per epoch at the start. Fixed for the whole run (batches per epoch must not change)."""
+        es = self.epoch_size
+        if es is None:
+            return int(sum(sizes))
+        if isinstance(es, str):
+            k = self.names.index(es)
+            w0 = schedule(0)[k]
+            assert w0 > 0, f'epoch_size source "{es}" has weight 0 at epoch 0'
+            return int(round(sizes[k] / w0))
+        return int(es)
+
+
+def largest_remainder(weights, total):
+    # Integer counts summing exactly to `total`, as close as possible to weights * total
+    raw = np.asarray(weights) * total
+    counts = np.floor(raw).astype(int)
+    for k in np.argsort(-(raw - counts), kind='stable')[:total - counts.sum()]:
+        counts[k] += 1
+    return counts
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------------------------------------------------------------------
+class MixedDataset(Dataset):
+    """Per-source LoadImagesAndLabels behind one index space. Indexed with (index, aug_seed) from MixedSourceSampler."""
+
+    def __init__(self, datasets, names, target_idx):
+        self.datasets, self.names, self.target_idx = datasets, names, target_idx
+        self.sizes = [len(d) for d in datasets]
+        self.offsets = np.cumsum([0] + self.sizes[:-1]).tolist()
+        # Read by train.py: the class range check and class weights cover every source
+        self.labels = [l for d in datasets for l in d.labels]
+        self.shapes = np.concatenate([d.shapes for d in datasets], 0)
+        self.img_files = [f for d in datasets for f in d.img_files]
+        self.n = len(self.labels)
+
+    def __len__(self):
+        return self.n
+
+    @property
+    def target_dataset(self):  # autoanchor runs on the target only
+        return self.datasets[self.target_idx]
+
+    def _get(self, index):
+        k = int(np.searchsorted(self.offsets, index, side='right') - 1)
+        return self.datasets[k][index - self.offsets[k]]
+
+    def __getitem__(self, item):
+        if not isinstance(item, (tuple, list)):
+            return self._get(item)
+        index, aug_seed = item
+        in_main_process = torch.utils.data.get_worker_info() is None  # --workers 0
+        if in_main_process:  # keep the training loop's RNG streams independent of the data
+            state = random.getstate(), np.random.get_state()
+        # Everything random about the sample (mosaic partners, crops, flips, HSV, mixup) follows from aug_seed
+        random.seed(aug_seed)
+        np.random.seed(aug_seed % 2 ** 32)
+        try:
+            return self._get(index)
+        finally:
+            if in_main_process:
+                random.setstate(state[0])
+                np.random.set_state(state[1])
+
+    @property
+    def mosaic(self):
+        return any(d.mosaic for d in self.datasets)
+
+    def close_mosaic(self):  # see LoadImagesAndLabels.close_mosaic(); rebuild the loader afterwards
+        for d in self.datasets:
+            d.close_mosaic()
+
+    collate_fn = staticmethod(LoadImagesAndLabels.collate_fn)
+    collate_fn4 = staticmethod(LoadImagesAndLabels.collate_fn4)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Sampler
+# ----------------------------------------------------------------------------------------------------------------------
+class MixedSourceSampler(Sampler):
+    """Per-epoch source quotas (optionally scheduled), DDP-aware. Stateless apart from the epoch counter: the draw for
+    epoch e is computed from (seed, config, e). __iter__ is called once per epoch on every rank (InfiniteDataLoader),
+    and advances the counter; rebuild_loader() and resume set it with rewind() / start_epoch."""
+
+    def __init__(self, sizes, offsets, names, schedule, epoch_size, rank=-1, world_size=1, seed=0, start_epoch=0):
+        self.sizes, self.offsets, self.names = list(sizes), list(offsets), list(names)
+        self.schedule, self.seed = schedule, int(seed)
+        for n, size, used in zip(self.names, self.sizes, schedule.ever_positive()):
+            if used and size == 0:
+                raise ValueError(f'source "{n}" has a positive weight but no images')
+        self.rank, self.world_size = max(rank, 0), (world_size if rank != -1 else 1)
+        self.num_samples = int(math.ceil(epoch_size / self.world_size))  # per rank
+        self.total = self.num_samples * self.world_size  # padded to divide evenly between ranks
+        self.next_epoch = start_epoch
+        self._counts, self._perms, self._logged = {}, {}, None
+
+    def counts(self, epoch):
+        if epoch not in self._counts:
+            self._counts[epoch] = largest_remainder(self.schedule(epoch), self.total)
+        return self._counts[epoch]
+
+    def consumed_before(self, epoch):
+        # images drawn from each source in epochs [0, epoch)
+        return sum((self.counts(e) for e in range(epoch)), np.zeros(len(self.sizes), dtype=np.int64))
+
+    def _perm(self, k, cycle):
+        if (k, cycle) not in self._perms:
+            if len(self._perms) > 4 * len(self.sizes):
+                self._perms.clear()
+            g = torch.Generator().manual_seed(stable_hash(self.seed, self.names[k], 'perm', cycle))
+            self._perms[(k, cycle)] = torch.randperm(self.sizes[k], generator=g).tolist()
+        return self._perms[(k, cycle)]
+
+    def _take(self, k, start, count):
+        # `count` (index, aug_seed) pairs from source k's stream, from stream position `start`
+        out = []
+        for pos in range(start, start + count):
+            c, p = divmod(pos, self.sizes[k])
+            out.append((self._perm(k, c)[p] + self.offsets[k], stable_hash(self.seed, self.names[k], 'aug', c, p)))
+        return out
+
+    def draw(self, epoch):
+        # the ordered (index, aug_seed) list of `epoch`, for all ranks
+        start, count = self.consumed_before(epoch), self.counts(epoch)
+        items = [x for k in range(len(self.sizes)) if count[k] for x in self._take(k, int(start[k]), int(count[k]))]
+        g = torch.Generator().manual_seed(stable_hash(self.seed, 'mix', epoch))
+        return [items[i] for i in torch.randperm(len(items), generator=g).tolist()]
+
+    def __iter__(self):
+        epoch = self.next_epoch
+        self.next_epoch += 1
+        count = tuple(self.counts(epoch))
+        if self.rank == 0 and count != self._logged:  # log mix changes (runs slightly ahead because of prefetching)
+            self._logged = count
+            logger.info(f'mixed sources from epoch {epoch}: {self.summary(epoch)}')
+        return iter(self.draw(epoch)[self.rank:self.total:self.world_size])
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):  # called by train.py in DDP mode; epochs are tracked internally
+        pass
+
+    def rewind(self, epoch):  # the next __iter__ draws `epoch`
+        self.next_epoch = epoch
+
+    def signature(self):  # stored in checkpoints: a different value on --resume means the data config changed
+        return {'seed': self.seed, 'names': self.names, 'sizes': self.sizes, 'total': self.total,
+                'schedule': self.schedule.signature()}
+
+    def summary(self, epoch=0):
+        count = self.counts(epoch)
+        rows = [f'{n:<16}{c / self.total:>7.1%}{size:>9} images{c:>9}/epoch{c / max(size, 1):>7.2f} passes/epoch'
+                for n, c, size in zip(self.names, count, self.sizes)]
+        return f'{self.total} images/epoch\n' + '\n'.join('  ' + r for r in rows)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Loaders
+# ----------------------------------------------------------------------------------------------------------------------
+def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache=False, rank=-1, world_size=1,
+                            workers=8, quad=False, prefix='', start_epoch=0, seed=0):
+    """Training loader for a MixedConfig (replaces create_dataloader() for training)."""
+    datasets = []
+    for k, src in enumerate(cfg.sources):
+        cache_images = src.cache_images if src.cache_images is not None else (cache if k == cfg.target_idx else False)
+        with torch_distributed_zero_first(rank):
+            datasets.append(LoadImagesAndLabels(src.path, imgsz, batch_size, augment=True, hyp=hyp, rect=False,
+                                                cache_images=cache_images, single_cls=opt.single_cls,
+                                                stride=int(stride), prefix=f'{prefix}[{src.name}] ',
+                                                cache_path=src.cache_path, label_folder_name=src.label_folder,
+                                                resize=src.resize, fg_crop_prob=src.fg_crop_prob))
+    dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
+    schedule = cfg.schedule(dataset.sizes)
+    epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule)
+    sampler = MixedSourceSampler(dataset.sizes, dataset.offsets, cfg.names, schedule, epoch_size, rank=rank,
+                                 world_size=world_size, seed=seed, start_epoch=start_epoch)
+    if rank in [-1, 0]:
+        s = f'sampling {cfg.sampling}, seed {sampler.seed}'
+        if cfg.sampling == 'weighted' and len(schedule.points) > 1:
+            s += f', weight schedule ({schedule.mode}) from epochs {[e for e, _ in schedule.points]}'
+        s += f'\n  target: {cfg.target.name}'
+        s += '\n  resize: ' + ', '.join(f'{x.name}={x.resize}' for x in cfg.sources)
+        s += '\n  cached: ' + (', '.join(n for n, d in zip(cfg.names, datasets) if d.imgs[0] is not None) or 'none')
+        logger.info(f'{prefix}mixed sources: {s}')  # the sampler logs the per-source mix
+
+    batch_size = min(batch_size, len(sampler))
+    nw = min([(os.cpu_count() or 1) // world_size, batch_size if batch_size > 1 else 0, workers])
+    loader = InfiniteDataLoader(dataset, batch_size=batch_size, num_workers=nw, sampler=sampler, pin_memory=True,
+                                collate_fn=MixedDataset.collate_fn4 if quad else MixedDataset.collate_fn)
+    return loader, dataset
+
+
+def create_val_dataloader(src, imgsz, batch_size, stride, opt, hyp=None, cache=False, world_size=1, workers=8,
+                          prefix=''):
+    # Validation loader of one source, at its own resize mode (native sources: full frames, padded to the stride)
+    return create_dataloader(src.val, imgsz, batch_size, stride, opt, hyp=hyp, cache=cache, rect=True, rank=-1,
+                             world_size=world_size, workers=workers, pad=0.5, prefix=prefix,
+                             cache_path=src.val_cache_path, label_folder_name=src.label_folder, resize=src.resize)[0]

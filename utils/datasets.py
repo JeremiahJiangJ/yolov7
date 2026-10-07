@@ -1,6 +1,7 @@
 # Dataset utils and dataloaders
 
 import glob
+import hashlib
 import logging
 import math
 import os
@@ -65,7 +66,7 @@ def exif_size(img):
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', cache_path=None,
-                      label_folder_name=DEFAULT_LABEL_FOLDER, seed=None):
+                      label_folder_name=DEFAULT_LABEL_FOLDER, seed=None, resize='fit', fg_crop_prob=0.5):
     # seed: if not None, seed the sampler, dataloader generator and workers for reproducible data loading
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -80,7 +81,9 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       image_weights=image_weights,
                                       prefix=prefix,
                                       cache_path=cache_path,
-                                      label_folder_name=label_folder_name)
+                                      label_folder_name=label_folder_name,
+                                      resize=resize,
+                                      fg_crop_prob=fg_crop_prob)
     dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=world_size, workers=workers,
                                   image_weights=image_weights, quad=quad, seed=seed)
     return dataloader, dataset
@@ -110,6 +113,26 @@ def build_dataloader(dataset, batch_size, rank=-1, world_size=1, workers=8, imag
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                         **seed_kwargs)
     return dataloader
+
+
+def shutdown_loader(loader):
+    # InfiniteDataLoader keeps a live iterator (and its worker processes) for its whole life: stop it explicitly
+    it = getattr(loader, 'iterator', None)
+    if it is not None and hasattr(it, '_shutdown_workers'):
+        it._shutdown_workers()
+
+
+def rebuild_loader(loader, epoch=None):
+    """New loader with fresh workers around the same dataset and sampler. Workers hold their own copy of the dataset,
+    so this is needed for dataset changes made in the main process (e.g. dataset.close_mosaic()) to take effect.
+    epoch: the epoch about to start; a sampler with rewind() (MixedSourceSampler) then redraws it from the start,
+    so batches prefetched by the old loader are neither skipped nor repeated."""
+    shutdown_loader(loader)
+    if epoch is not None and hasattr(loader.sampler, 'rewind'):
+        loader.sampler.rewind(epoch)
+    return type(loader)(loader.dataset, batch_size=loader.batch_size, num_workers=loader.num_workers,
+                        sampler=loader.sampler, pin_memory=loader.pin_memory, collate_fn=loader.collate_fn,
+                        worker_init_fn=loader.worker_init_fn, generator=loader.generator)
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
@@ -365,6 +388,21 @@ class LoadStreams:  # multiple IP or RTSP cameras
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
+def parse_resize(resize):
+    """How images are scaled when loaded:
+        'fit'    (default, upstream YOLOv7) long side resized to img_size
+        'native' never resized, objects keep their pixel size; img_size is only the training crop size
+        <float>  fixed scale factor, e.g. 0.5, to bring a source's object sizes in line with another's"""
+    if resize in (None, 'fit', 'native'):
+        return resize or 'fit'
+    try:
+        f = float(resize)
+    except (TypeError, ValueError):
+        f = 0
+    assert f > 0, f"resize must be 'fit', 'native' or a positive scale factor, got {resize!r}"
+    return 'native' if f == 1 else f
+
+
 def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
     # Define label paths as a function of image paths, i.e. /dir/images/x.jpg -> /dir/<label_folder_name>/x.txt
     sa, sb = os.sep + 'images' + os.sep, os.sep + label_folder_name + os.sep  # /images/, /labels/ substrings
@@ -374,9 +412,13 @@ def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', cache_path=None,
-                 label_folder_name=DEFAULT_LABEL_FOLDER):
+                 label_folder_name=DEFAULT_LABEL_FOLDER, resize='fit', fg_crop_prob=0.5):
         self.img_size = img_size
         self.label_folder_name = label_folder_name
+        self.resize = parse_resize(resize)  # see parse_resize()
+        self.scale = None if self.resize == 'fit' else 1.0 if self.resize == 'native' else self.resize
+        # native / fixed scale training only: probability that a mosaic tile or crop is placed around an object
+        self.fg_crop_prob = fg_crop_prob
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -411,6 +453,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Check cache
         self.label_files = img2label_paths(self.img_files, label_folder_name)  # labels
         default_cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        if isinstance(path, list) and len(path) > 1:  # pooled list: never reuse or overwrite the first source's cache
+            h = hashlib.md5(str(sorted(str(Path(x).resolve()) for x in path)).encode()).hexdigest()[:8]
+            default_cache_path = default_cache_path.with_name(f'{default_cache_path.stem}_pooled_{h}.cache')
         if cache_path:  # user-specified cache file (or directory to put the default-named cache file in)
             cache_path = Path(cache_path)
             if cache_path.is_dir():
@@ -419,9 +464,14 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             cache_path = default_cache_path  # cached labels
         if cache_path.is_file():
             cache, exists = torch_load(cache_path), True  # load
+            cached_files = set(cache) - {'hash', 'results', 'version', 'label_folder'}
             if cache.get('label_folder', label_folder_name) != label_folder_name:  # built from other labels
                 logging.info(f"{prefix}Cache {cache_path} was built from '{cache['label_folder']}' labels, "
                              f"re-caching for '{label_folder_name}'")
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+            elif cache['results'][-1] != len(self.img_files) or not cached_files <= set(self.img_files):
+                # built for a different image set (corrupt images are left out of a cache, hence <=)
+                logging.info(f'{prefix}Cache {cache_path} does not match the images, re-caching')
                 cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
             #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
             #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
@@ -468,16 +518,21 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             ar = ar[irect]
 
             # Set training image shapes
-            shapes = [[1, 1]] * nb
-            for i in range(nb):
-                ari = ar[bi == i]
-                mini, maxi = ari.min(), ari.max()
-                if maxi < 1:
-                    shapes[i] = [maxi, 1]
-                elif mini > 1:
-                    shapes[i] = [1, 1 / mini]
+            if self.resize == 'fit':
+                shapes = [[1, 1]] * nb
+                for i in range(nb):
+                    ari = ar[bi == i]
+                    mini, maxi = ari.min(), ari.max()
+                    if maxi < 1:
+                        shapes[i] = [maxi, 1]
+                    elif mini > 1:
+                        shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
+                self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
+            else:  # no resizing: pad each batch to its largest image, rounded up to the stride (pad is not used, so
+                # e.g. 1280x720 frames give 1280x736, the same input detect.py builds at --img-size 1280)
+                hw = (self.shapes * self.scale).astype(int)[:, ::-1]
+                self.batch_shapes = np.array([np.ceil(hw[bi == i].max(0) / stride) for i in range(nb)]).astype(int) * stride
 
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
@@ -500,6 +555,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
             pbar.close()
+
+    def close_mosaic(self):
+        # Late-training "clean images": no mosaic, mixup or paste-in (paste-in runs outside the mosaic branch).
+        # hyp is copied so the training hyp dict is untouched. Only reaches new workers, see rebuild_loader()
+        self.mosaic = False
+        self.hyp = {**self.hyp, 'mixup': 0.0, 'paste_in': 0.0}
+
+    def loaded_shapes(self, img_size=None):
+        # (w, h) of the images as loaded, before augmentation (for autoanchor)
+        if self.resize == 'fit':
+            return (img_size or self.img_size) * self.shapes / self.shapes.max(1, keepdims=True)
+        return self.shapes * self.scale
 
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -589,6 +656,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
+
+        elif self.augment and not self.rect and self.resize != 'fit':
+            # Native / fixed scale training without mosaic: an img_size crop of the frame, not a downscaled frame
+            img, labels, (h0, w0), (h, w), pad = load_crop(self, index)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)
 
         else:
             # Load image
@@ -707,7 +779,7 @@ def load_image(self, index):
         img = cv2.imread(path)  # BGR
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
-        r = self.img_size / max(h0, w0)  # resize image to img_size
+        r = self.img_size / max(h0, w0) if self.resize == 'fit' else self.scale  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
@@ -743,6 +815,8 @@ def hist_equalize(img, clahe=True, bgr=False):
 
 def load_mosaic(self, index):
     # loads images in a 4-mosaic
+    if self.resize != 'fit':
+        return load_mosaic_native(self, index)
 
     labels4, segments4 = [], []
     s = self.img_size
@@ -801,6 +875,8 @@ def load_mosaic(self, index):
 
 
 def load_mosaic9(self, index):
+    if self.resize != 'fit':  # the 9-tile layout assumes images no larger than img_size
+        return load_mosaic_native(self, index)
     # loads images in a 9-mosaic
 
     labels9, segments9 = [], []
@@ -874,6 +950,101 @@ def load_mosaic9(self, index):
                                        border=self.mosaic_border)  # border to remove
 
     return img9, labels9
+
+
+def _place(self, boxes, size, region, view, anchor_high):
+    """Offset (ox, oy) for an image of `size` (w, h) pasted onto a canvas region (x1, y1, x2, y2).
+    Along each axis the image covers the whole region if it is large enough; otherwise it sticks to the high or low end
+    (anchor_high True / False, i.e. towards the mosaic centre) or, if None, lands at a random position.
+    With probability fg_crop_prob a random box is placed entirely inside `view` (the part of the region that can end
+    up in the training sample) where possible; otherwise the offset is random within its range."""
+    ranges = []
+    for a in (0, 1):
+        t1, t2, n = region[a], region[a + 2], size[a]
+        if n >= t2 - t1:
+            ranges.append((t2 - n, t1))
+        elif anchor_high[a] is None:
+            ranges.append((t1, t2 - n))
+        else:
+            o = t2 - n if anchor_high[a] else t1
+            ranges.append((o, o))
+    o = [random.randint(lo, hi) for lo, hi in ranges]
+    if boxes is not None and len(boxes) and random.random() < self.fg_crop_prob:
+        b = boxes[random.randrange(len(boxes))]
+        for a in (0, 1):
+            v1, v2 = max(region[a], view[a]), min(region[a + 2], view[a + 2])
+            lo, hi = math.ceil(max(ranges[a][0], v1 - b[a])), math.floor(min(ranges[a][1], v2 - b[a + 2]))
+            if lo <= hi:
+                o[a] = random.randint(lo, hi)
+    return o
+
+
+def _paste(self, canvas, index, region, view, anchor_high):
+    # Load image `index` at its native / fixed scale and paste it into `region` of `canvas` (see _place()).
+    # Returns its labels (pixel xyxy) and segments in canvas coordinates, clipped to the pasted area; objects with
+    # less than 10% of their area left are dropped (the same rule random_perspective() applies)
+    img, (h0, w0), (h, w) = load_image(self, index)
+    labels, segments = self.labels[index].copy(), self.segments[index].copy()
+    boxes = xywhn2xyxy(labels[:, 1:], w, h) if labels.size else None
+    ox, oy = _place(self, boxes, (w, h), region, view, anchor_high)
+    x1, y1 = max(region[0], ox), max(region[1], oy)
+    x2, y2 = min(region[2], ox + w), min(region[3], oy + h)
+    if x2 > x1 and y2 > y1:
+        canvas[y1:y2, x1:x2] = img[y1 - oy:y2 - oy, x1 - ox:x2 - ox]
+    if labels.size:
+        b = boxes + [ox, oy, ox, oy]
+        area0 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        b[:, [0, 2]] = b[:, [0, 2]].clip(x1, max(x1, x2))
+        b[:, [1, 3]] = b[:, [1, 3]].clip(y1, max(y1, y2))
+        keep = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) > 0.1 * area0
+        labels[:, 1:] = b
+        if len(segments) == len(labels):
+            segments = [np.stack([x[:, 0].clip(x1, x2), x[:, 1].clip(y1, y2)], 1)
+                        for x, k in zip((xyn2xy(x, w, h, ox, oy) for x in segments), keep) if k]
+        else:
+            segments = []
+        labels = labels[keep]
+    return labels, segments, (h0, w0), (h, w), (ox, oy)
+
+
+def load_mosaic_native(self, index):
+    """4-mosaic for resize != 'fit' (objects keep their native / fixed-scale pixel size). load_mosaic() anchors each
+    image's corner at the mosaic centre, which with images larger than the tiles only ever shows the region around one
+    corner of each image (objects near the image centre are almost never seen). Here each image gets a random offset
+    within the range that still covers its tile -- or, with probability fg_crop_prob, one that puts a random object in
+    view -- and the sampled image goes to a random tile."""
+    s = self.img_size
+    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+    random.shuffle(indices)
+    img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)  # base image with 4 tiles
+    view = (s // 2, s // 2, s * 3 // 2, s * 3 // 2)  # canvas area the output is cut from (before translate / scale)
+    tiles = ((0, 0, xc, yc), (xc, 0, s * 2, yc), (0, yc, xc, s * 2), (xc, yc, s * 2, s * 2))
+    labels4, segments4 = [], []
+    for i, index in enumerate(indices):
+        labels, segments, *_ = _paste(self, img4, index, tiles[i], view, (i in (0, 2), i in (0, 1)))
+        labels4.append(labels)
+        segments4.extend(segments)
+
+    labels4 = np.concatenate(labels4, 0)
+    img4, labels4, segments4 = copy_paste(img4, labels4, segments4, probability=self.hyp['copy_paste'])
+    img4, labels4 = random_perspective(img4, labels4, segments4,
+                                       degrees=self.hyp['degrees'],
+                                       translate=self.hyp['translate'],
+                                       scale=self.hyp['scale'],
+                                       shear=self.hyp['shear'],
+                                       perspective=self.hyp['perspective'],
+                                       border=self.mosaic_border)  # border to remove
+    return img4, labels4
+
+
+def load_crop(self, index):
+    # Native / fixed scale training without mosaic: an img_size x img_size crop of the image (grey-padded where the
+    # image is smaller), placed around a random object with probability fg_crop_prob, else at random
+    s = self.img_size
+    img = np.full((s, s, 3), 114, dtype=np.uint8)
+    labels, _, hw0, hw, pad = _paste(self, img, index, (0, 0, s, s), (0, 0, s, s), (None, None))
+    return img, labels, hw0, hw, pad
 
 
 def load_samples(self, index):

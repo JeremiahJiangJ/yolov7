@@ -10,7 +10,8 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader, DEFAULT_LABEL_FOLDER
+from utils.datasets import create_dataloader, parse_resize, DEFAULT_LABEL_FOLDER
+from utils.mixed_data import MixedConfig, is_mixed
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ap_per_area, ConfusionMatrix
@@ -74,6 +75,7 @@ def test(data,
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
             data = yaml.load(f, Loader=yaml.SafeLoader)
+    mixed = MixedConfig(data, opt.label_folder_name) if not training and is_mixed(data) else None
     check_dataset(data)  # check
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
@@ -88,9 +90,16 @@ def test(data,
         if device.type != 'cpu':
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '), cache_path=opt.test_cache_path,
-                                       label_folder_name=opt.label_folder_name)[0]
+        if mixed:  # train_sources data yaml: a source's val set (default: the target's), at its own resize mode
+            src = mixed.target if opt.source is None else mixed.sources[mixed.names.index(opt.source)]
+            assert src.val, f'source "{src.name}" has no val path'
+            path, resize, label_folder, prefix = src.val, src.resize, src.label_folder, f'val[{src.name}]: '
+        else:
+            path, resize, label_folder, prefix = data[task], data.get('resize', 'fit'), opt.label_folder_name, f'{task}: '
+        resize = parse_resize(opt.resize or resize)
+        dataloader = create_dataloader(path, imgsz, batch_size, gs, opt, pad=0.5, rect=True,
+                                       prefix=colorstr(prefix), cache_path=opt.test_cache_path,
+                                       label_folder_name=label_folder, resize=resize)[0]
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
@@ -335,6 +344,10 @@ if __name__ == '__main__':
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
                         help='object area cut points in px^2 of the original image for per-area metrics, '
                              'i.e. 300 650 1250 -> <300, 300<=A<650, 650<=A<1250, >=1250')
+    parser.add_argument('--source', type=str, default=None,
+                        help='train_sources data yaml: name of the source whose val set to test (default: the target)')
+    parser.add_argument('--resize', type=str, default=None,
+                        help="override the data yaml resize: fit (resize to --img-size), native, or a scale factor")
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,

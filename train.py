@@ -25,7 +25,8 @@ import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader, build_dataloader, DEFAULT_LABEL_FOLDER
+from utils.datasets import create_dataloader, rebuild_loader, parse_resize, DEFAULT_LABEL_FOLDER
+from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
@@ -70,6 +71,14 @@ def train(hyp, opt, device, tb_writer=None):
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
+    # Multi-source training (`train_sources:` in the data yaml, see data/mixed/README.md); None: stock YOLOv7 data
+    mixed = MixedConfig(data_dict, opt.label_folder_name) if is_mixed(data_dict) else None
+    if mixed:
+        assert not opt.image_weights, '--image-weights is not supported with train_sources'
+        assert not opt.rect, '--rect is not supported with train_sources'
+        if opt.train_cache_path or opt.test_cache_path:
+            logger.warning('--train-cache-path / --test-cache-path are ignored with train_sources, '
+                           'use cache_path / val_cache_path per source')
 
     # Logging- Doing this before checking the dataset. Might update data_dict
     loggers = {'wandb': None}  # loggers dict
@@ -209,6 +218,7 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
+    ckpt_data_signature = None
     if pretrained:
         # Optimizer
         if ckpt['optimizer'] is not None:
@@ -223,6 +233,9 @@ def train(hyp, opt, device, tb_writer=None):
         # Results
         if ckpt.get('training_results') is not None:
             results_file.write_text(ckpt['training_results'])  # write results.txt
+
+        # Multi-source data config the run was started with (compared once the sampler exists)
+        ckpt_data_signature = ckpt.get('data_signature')
 
         # Epochs
         start_epoch = ckpt['epoch'] + 1
@@ -250,24 +263,47 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
-                                            cache_path=opt.train_cache_path, label_folder_name=opt.label_folder_name,
-                                            seed=data_seed)
+    if mixed:
+        dataloader, dataset = create_mixed_dataloader(mixed, imgsz, batch_size, gs, opt, hyp=hyp,
+                                                      cache=opt.cache_images, rank=rank, world_size=opt.world_size,
+                                                      workers=opt.workers, quad=opt.quad, prefix=colorstr('train: '),
+                                                      start_epoch=start_epoch, seed=data_seed or 0)
+        data_signature = dataloader.sampler.signature()
+        if opt.resume and ckpt_data_signature not in (None, data_signature):
+            logger.warning('WARNING: the train_sources config differs from the one this run was started with, '
+                           'resumed training will not draw the data the original run would have')
+    else:
+        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect,
+                                                rank=rank, world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad,
+                                                prefix=colorstr('train: '), cache_path=opt.train_cache_path,
+                                                label_folder_name=opt.label_folder_name, seed=data_seed,
+                                                resize=parse_resize(data_dict.get('resize', 'fit')),
+                                                fg_crop_prob=float(data_dict.get('fg_crop_prob', 0.5)))
+        data_signature = None
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
     # Process 0
+    source_val = []  # [(name, loader)] of non-target sources with a val path: reported, never used for fitness
     if rank in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                       world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '),
-                                       cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
-                                       seed=data_seed)[0]
+        if mixed:  # target validation drives fitness / best.pt
+            testloader = create_val_dataloader(mixed.target, imgsz_test, batch_size * 2, gs, opt, hyp=hyp,
+                                               cache=opt.cache_images and not opt.notest, world_size=opt.world_size,
+                                               workers=opt.workers, prefix=colorstr(f'val[{mixed.target.name}]: '))
+            source_val = [(src.name, create_val_dataloader(src, imgsz_test, batch_size * 2, gs, opt, hyp=hyp,
+                                                           world_size=opt.world_size, workers=opt.workers,
+                                                           prefix=colorstr(f'val[{src.name}]: ')))
+                          for src in mixed.sources if not src.target and src.val]
+        else:
+            testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
+                                           hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+                                           world_size=opt.world_size, workers=opt.workers,
+                                           pad=0.5, prefix=colorstr('val: '),
+                                           cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
+                                           seed=data_seed, resize=parse_resize(data_dict.get('resize', 'fit')))[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -281,7 +317,8 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Anchors
             if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+                check_anchors(dataset.target_dataset if mixed else dataset, model=model, thr=hyp['anchor_t'],
+                              imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
@@ -328,15 +365,12 @@ def train(hyp, opt, device, tb_writer=None):
             frozen = False
             logger.info(f'Unfreezing all layers from epoch {epoch}')
 
-        # Turn off mosaic (and the mixup applied to mosaics) for the last epochs (optional)
+        # Turn off mosaic, mixup and paste-in for the last epochs (optional)
         if opt.close_mosaic and dataset.mosaic and epoch >= epochs - opt.close_mosaic:
             logger.info(f'Closing mosaic for the last {epochs - epoch} epochs')
-            dataset.mosaic = False
-            # Workers hold their own copy of the dataset, so restart them with a new loader
-            pbar = dataloader = None  # drop the old loader (and the progress bar wrapping it) to stop its workers
-            dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=opt.world_size,
-                                          workers=opt.workers, image_weights=opt.image_weights, quad=opt.quad,
-                                          seed=data_seed)
+            dataset.close_mosaic()
+            pbar = None
+            dataloader = rebuild_loader(dataloader, epoch=epoch)  # workers hold their own copy of the dataset
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -460,6 +494,22 @@ def train(hyp, opt, device, tb_writer=None):
                                                  is_coco=is_coco,
                                                  v5_metric=opt.v5_metric,
                                                  area_int=opt.area_int)
+                # Other sources' val sets (opt-in): forgetting / retention monitoring, not used for fitness
+                for name, loader in source_val:
+                    logger.info(colorstr(f'val[{name}]: ') + 'not used for fitness')
+                    r_src = test.test(data_dict, batch_size=batch_size * 2, imgsz=imgsz_test, model=ema.ema,
+                                      single_cls=opt.single_cls, dataloader=loader, save_dir=save_dir, verbose=False,
+                                      plots=False, v5_metric=opt.v5_metric)[0]
+                    with open(save_dir / 'source_results.txt', 'a') as f:
+                        if f.tell() == 0:
+                            f.write(('%10s' * 2 + '%12s' * 4 + '\n') % ('epoch', 'source', 'P', 'R', 'mAP@.5',
+                                                                        'mAP@.5:.95'))
+                        f.write(('%10s' * 2 + '%12.4g' * 4 + '\n') % (f'{epoch}/{epochs - 1}', name, *r_src[:4]))
+                    for x, tag in zip(r_src[:4], ('precision', 'recall', 'mAP_0.5', 'mAP_0.5:0.95')):
+                        if tb_writer:
+                            tb_writer.add_scalar(f'metrics_source/{name}/{tag}', x, epoch)
+                        if wandb_logger.wandb:
+                            wandb_logger.log({f'metrics_source/{name}/{tag}': x})
 
             # Write
             with open(results_file, 'a') as f:
@@ -511,6 +561,7 @@ def train(hyp, opt, device, tb_writer=None):
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
+                        'data_signature': data_signature,
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
 
                 # Save last, best and delete
