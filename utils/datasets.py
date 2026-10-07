@@ -453,13 +453,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Check cache
         self.label_files = img2label_paths(self.img_files, label_folder_name)  # labels
         default_cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
-        if isinstance(path, list) and len(path) > 1:  # pooled list: never reuse or overwrite the first source's cache
-            h = hashlib.md5(str(sorted(str(Path(x).resolve()) for x in path)).encode()).hexdigest()[:8]
+        paths = path if isinstance(path, list) else [path]
+        h = hashlib.md5(str(sorted(str(Path(x).resolve()) for x in paths)).encode()).hexdigest()[:8]  # image set id
+        if len(paths) > 1:  # pooled list: never reuse or overwrite the first source's cache
             default_cache_path = default_cache_path.with_name(f'{default_cache_path.stem}_pooled_{h}.cache')
-        if cache_path:  # user-specified cache file (or directory to put the default-named cache file in)
+        if cache_path:  # user-specified cache file, or directory shared by any number of datasets
             cache_path = Path(cache_path)
             if cache_path.is_dir():
-                cache_path = cache_path / default_cache_path.name
+                stem = default_cache_path.stem if len(paths) > 1 else f'{default_cache_path.stem}_{h}'
+                cache_path = cache_path / f'{stem}.cache'
         else:
             cache_path = default_cache_path  # cached labels
         if cache_path.is_file():
