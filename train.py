@@ -25,14 +25,15 @@ import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, DEFAULT_LABEL_FOLDER
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
-from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
+from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
+    set_deterministic, torch_load
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,12 @@ def train(hyp, opt, device, tb_writer=None):
     # Configure
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(2 + rank)
+    if opt.seed is not None:
+        init_seeds(opt.seed + max(rank, 0), deterministic=True)  # same seed on every rank would repeat augmentations
+    else:
+        init_seeds(2 + rank, deterministic=opt.deterministic)
+    # Seed for the dataloaders (sampler, generator, workers); None keeps the original unseeded loaders
+    data_seed = opt.seed if opt.seed is not None else (0 if opt.deterministic else None)
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
@@ -68,7 +74,7 @@ def train(hyp, opt, device, tb_writer=None):
     loggers = {'wandb': None}  # loggers dict
     if rank in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
-        run_id = torch.load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
+        run_id = torch_load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
         wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
         loggers['wandb'] = wandb_logger.wandb
         data_dict = wandb_logger.data_dict
@@ -84,7 +90,7 @@ def train(hyp, opt, device, tb_writer=None):
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        ckpt = torch_load(weights, map_location=device)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
@@ -178,7 +184,7 @@ def train(hyp, opt, device, tb_writer=None):
                 pg0.append(v.rbr_dense.vector)
 
     if opt.adam:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        optimizer = optim.AdamW(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999), weight_decay=0.0)  # adjust beta1 to momentum
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
@@ -245,7 +251,9 @@ def train(hyp, opt, device, tb_writer=None):
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
+                                            cache_path=opt.train_cache_path, label_folder_name=opt.label_folder_name,
+                                            seed=data_seed)
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -255,7 +263,9 @@ def train(hyp, opt, device, tb_writer=None):
         testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+                                       pad=0.5, prefix=colorstr('val: '),
+                                       cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
+                                       seed=data_seed)[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -545,7 +555,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
-    parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
+    parser.add_argument('--adam', action='store_true', help='use torch.optim.AdamW() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
@@ -562,7 +572,21 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--seed', type=int, nargs='?', const=42, default=None,
+                        help='global training seed, implies --deterministic (bare --seed uses 42)')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='follow PyTorch reproducibility guidelines (cudnn.benchmark off, deterministic algorithms)')
+    parser.add_argument('--train-cache-path', type=str, default=None,
+                        help='train labels .cache file (or directory to save it in), default: next to the labels')
+    parser.add_argument('--test-cache-path', type=str, default=None,
+                        help='val labels .cache file (or directory to save it in), default: next to the labels')
+    parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
+                        help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()
+    if opt.seed is not None:
+        opt.deterministic = True
+    if opt.deterministic:
+        set_deterministic()  # as early as possible, before CUDA/cuBLAS initialise
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
@@ -579,7 +603,8 @@ if __name__ == '__main__':
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
         apriori = opt.global_rank, opt.local_rank
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
-            opt = argparse.Namespace(**yaml.load(f, Loader=yaml.SafeLoader))  # replace
+            # replace, keeping defaults for options newer than the checkpoint's opt.yaml
+            opt = argparse.Namespace(**{**vars(parser.parse_args([])), **yaml.load(f, Loader=yaml.SafeLoader)})
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
@@ -678,7 +703,7 @@ if __name__ == '__main__':
                 # Mutate
                 mp, s = 0.8, 0.2  # mutation probability, sigma
                 npr = np.random
-                npr.seed(int(time.time()))
+                npr.seed(int(time.time()) if opt.seed is None else opt.seed + _)  # reproducible evolution with --seed
                 g = np.array([x[0] for x in meta.values()])  # gains 0-1
                 ng = len(meta)
                 v = np.ones(ng)

@@ -28,10 +28,11 @@ from torchvision.ops import roi_pool, roi_align, ps_roi_pool, ps_roi_align
 
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
     resample_segments, clean_str
-from utils.torch_utils import torch_distributed_zero_first
+from utils.torch_utils import torch_distributed_zero_first, seed_worker, torch_load
 
 # Parameters
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
+DEFAULT_LABEL_FOLDER = 'labels_upright'  # folder holding labels, next to the 'images' folder
 img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
 vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 logger = logging.getLogger(__name__)
@@ -63,7 +64,9 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', cache_path=None,
+                      label_folder_name=DEFAULT_LABEL_FOLDER, seed=None):
+    # seed: if not None, seed the sampler, dataloader generator and workers for reproducible data loading
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -75,11 +78,21 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
+                                      prefix=prefix,
+                                      cache_path=cache_path,
+                                      label_folder_name=label_folder_name)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    seed_kwargs = {}
+    if seed is not None:
+        # https://pytorch.org/docs/stable/notes/randomness.html#dataloader
+        generator = torch.Generator()
+        generator.manual_seed(seed + max(rank, 0))  # per-rank stream, like init_seeds
+        seed_kwargs = dict(worker_init_fn=seed_worker, generator=generator)
+    # The DistributedSampler seed must match across ranks so they draw disjoint shards of the same permutation
+    sampler_kwargs = {} if seed is None else dict(seed=seed)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, **sampler_kwargs) if rank != -1 else None
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
@@ -87,7 +100,8 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
+                        **seed_kwargs)
     return dataloader, dataset
 
 
@@ -344,16 +358,18 @@ class LoadStreams:  # multiple IP or RTSP cameras
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
-def img2label_paths(img_paths):
-    # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
+    # Define label paths as a function of image paths, i.e. /dir/images/x.jpg -> /dir/<label_folder_name>/x.txt
+    sa, sb = os.sep + 'images' + os.sep, os.sep + label_folder_name + os.sep  # /images/, /labels/ substrings
     return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', cache_path=None,
+                 label_folder_name=DEFAULT_LABEL_FOLDER):
         self.img_size = img_size
+        self.label_folder_name = label_folder_name
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -386,10 +402,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
+        self.label_files = img2label_paths(self.img_files, label_folder_name)  # labels
+        default_cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        if cache_path:  # user-specified cache file (or directory to put the default-named cache file in)
+            cache_path = Path(cache_path)
+            if cache_path.is_dir():
+                cache_path = cache_path / default_cache_path.name
+        else:
+            cache_path = default_cache_path  # cached labels
         if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
+            cache, exists = torch_load(cache_path), True  # load
+            if cache.get('label_folder', label_folder_name) != label_folder_name:  # built from other labels
+                logging.info(f"{prefix}Cache {cache_path} was built from '{cache['label_folder']}' labels, "
+                             f"re-caching for '{label_folder_name}'")
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
             #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
             #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
@@ -405,11 +431,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Read cache
         cache.pop('hash')  # remove hash
         cache.pop('version')  # remove version
+        cache.pop('label_folder', None)  # absent in caches made before --label-folder-name existed
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
+        self.label_files = img2label_paths(cache.keys(), label_folder_name)  # update
         if single_cls:
             for x in self.labels:
                 x[:, 0] = 0
@@ -518,6 +545,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, i + 1
         x['version'] = 0.1  # cache version
+        x['label_folder'] = self.label_folder_name
+        path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(x, path)  # save for next time
         logging.info(f'{prefix}New cache created: {path}')
         return x
@@ -1283,7 +1312,7 @@ def extract_boxes(path='../coco/'):  # from utils.datasets import *; extract_box
                     b = x[1:] * [w, h, w, h]  # box
                     # b[2:] = b[2:].max()  # rectangle to square
                     b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(int)
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)

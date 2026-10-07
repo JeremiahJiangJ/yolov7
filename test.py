@@ -10,7 +10,7 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, DEFAULT_LABEL_FOLDER
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
@@ -88,7 +88,8 @@ def test(data,
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '))[0]
+                                       prefix=colorstr(f'{task}: '), cache_path=opt.test_cache_path,
+                                       label_folder_name=opt.label_folder_name)[0]
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
@@ -309,6 +310,10 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--test-cache-path', type=str, default=None,
+                        help='labels .cache file (or directory to save it in), default: next to the labels')
+    parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
+                        help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file

@@ -1,16 +1,19 @@
 # YOLOR PyTorch utils
 
 import datetime
+import inspect
 import logging
 import math
 import os
 import platform
+import random
 import subprocess
 import time
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -36,13 +39,50 @@ def torch_distributed_zero_first(local_rank: int):
         torch.distributed.barrier()
 
 
-def init_torch_seeds(seed=0):
+def init_torch_seeds(seed=0, deterministic=False):
     # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
     torch.manual_seed(seed)
-    if seed == 0:  # slower, more reproducible
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        set_deterministic()
+    elif seed == 0:  # slower, more reproducible
         cudnn.benchmark, cudnn.deterministic = False, True
     else:  # faster, less reproducible
         cudnn.benchmark, cudnn.deterministic = True, False
+
+
+def set_deterministic():
+    # Follow https://pytorch.org/docs/stable/notes/randomness.html as far as the installed torch version allows
+    # cuBLAS needs this set before its first use for deterministic results on CUDA >= 10.2
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    cudnn.benchmark, cudnn.deterministic = False, True
+    try:
+        # warn_only (torch>=1.11): ops without a deterministic implementation (e.g. some CUDA backward passes) warn
+        # instead of raising, so training still runs while everything that can be deterministic is
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except (AttributeError, TypeError):
+        # Older torch can only raise on non-deterministic ops, which would abort YOLO training; cudnn flags only
+        logger.warning('torch.use_deterministic_algorithms(warn_only=True) needs torch>=1.11, '
+                       'only cudnn determinism is enabled')
+
+
+def seed_worker(worker_id):
+    # DataLoader worker_init_fn: seed numpy and random from the per-worker torch seed
+    # https://pytorch.org/docs/stable/notes/randomness.html#dataloader
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+_TORCH_LOAD_HAS_WEIGHTS_ONLY = 'weights_only' in inspect.signature(torch.load).parameters
+
+
+def torch_load(f, map_location=None, **kwargs):
+    # torch.load that works across versions. torch>=2.6 defaults to weights_only=True, which refuses the pickled
+    # nn.Module checkpoints and label caches this repo saves; older versions do not accept the argument at all
+    if _TORCH_LOAD_HAS_WEIGHTS_ONLY:
+        kwargs.setdefault('weights_only', False)
+    return torch.load(f, map_location=map_location, **kwargs)
 
 
 def date_modified(path=__file__):

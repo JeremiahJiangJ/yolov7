@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent.parent))  # add utils/ to path
 from utils.datasets import LoadImagesAndLabels
-from utils.datasets import img2label_paths
+from utils.datasets import img2label_paths, DEFAULT_LABEL_FOLDER
 from utils.general import colorstr, xywh2xyxy, check_dataset
 
 try:
@@ -117,7 +117,8 @@ class WandbLogger():
         check_dataset(self.data_dict)
         config_path = self.log_dataset_artifact(opt.data,
                                                 opt.single_cls,
-                                                'YOLOR' if opt.project == 'runs/train' else Path(opt.project).stem)
+                                                'YOLOR' if opt.project == 'runs/train' else Path(opt.project).stem,
+                                                label_folder_name=getattr(opt, 'label_folder_name', DEFAULT_LABEL_FOLDER))
         print("Created dataset config file ", config_path)
         with open(config_path) as f:
             wandb_data_dict = yaml.load(f, Loader=yaml.SafeLoader)
@@ -190,15 +191,16 @@ class WandbLogger():
                            aliases=['latest', 'epoch ' + str(self.current_epoch), 'best' if best_model else ''])
         print("Saving model artifact on epoch ", epoch + 1)
 
-    def log_dataset_artifact(self, data_file, single_cls, project, overwrite_config=False):
+    def log_dataset_artifact(self, data_file, single_cls, project, overwrite_config=False,
+                             label_folder_name=DEFAULT_LABEL_FOLDER):
         with open(data_file) as f:
             data = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
         nc, names = (1, ['item']) if single_cls else (int(data['nc']), data['names'])
         names = {k: v for k, v in enumerate(names)}  # to index dictionary
         self.train_artifact = self.create_dataset_table(LoadImagesAndLabels(
-            data['train']), names, name='train') if data.get('train') else None
+            data['train'], label_folder_name=label_folder_name), names, name='train') if data.get('train') else None
         self.val_artifact = self.create_dataset_table(LoadImagesAndLabels(
-            data['val']), names, name='val') if data.get('val') else None
+            data['val'], label_folder_name=label_folder_name), names, name='val') if data.get('val') else None
         if data.get('train'):
             data['train'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'train')
         if data.get('val'):
@@ -233,11 +235,11 @@ class WandbLogger():
         for img_file in img_files:
             if Path(img_file).is_dir():
                 artifact.add_dir(img_file, name='data/images')
-                labels_path = 'labels'.join(dataset.path.rsplit('images', 1))
+                labels_path = dataset.label_folder_name.join(dataset.path.rsplit('images', 1))
                 artifact.add_dir(labels_path, name='data/labels')
             else:
                 artifact.add_file(img_file, name='data/images/' + Path(img_file).name)
-                label_file = Path(img2label_paths([img_file])[0])
+                label_file = Path(img2label_paths([img_file], dataset.label_folder_name)[0])
                 artifact.add_file(str(label_file),
                                   name='data/labels/' + label_file.name) if label_file.exists() else None
         table = wandb.Table(columns=["id", "train_image", "Classes", "name"])
