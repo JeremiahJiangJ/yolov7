@@ -21,6 +21,8 @@ hsv_v: 0.4  # image HSV-Value augmentation (fraction)
 degrees: 0.0  # image rotation (+/- deg)
 translate: 0.1  # image translation (+/- fraction)
 scale: 0.5  # image scale (+/- gain)
+# scale_min: 0.8  # native scale: zoom range, log-uniform, replaces scale (see data/mixed/README.md)
+# scale_max: 2.0  # e.g. the largest zoom the deployment camera uses
 shear: 0.0  # image shear (+/- deg)
 perspective: 0.0  # image perspective (+/- fraction), range 0-0.001
 flipud: 0.0  # image flip up-down (probability)

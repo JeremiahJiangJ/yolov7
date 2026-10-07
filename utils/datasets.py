@@ -447,6 +447,23 @@ def parse_resize(resize):
     return 'native' if f == 1 else f
 
 
+def scale_range(hyp):
+    """Optional hyp keys scale_min / scale_max: zoom range of the scale augmentation, sampled log-uniformly (zooming in
+    and out equally likely), instead of the stock uniform(1 - scale, 1.1 + scale). Both or neither must be set."""
+    if not hyp or ('scale_min' not in hyp and 'scale_max' not in hyp):
+        return None
+    assert 'scale_min' in hyp and 'scale_max' in hyp, 'hyp needs both scale_min and scale_max, or neither'
+    lo, hi = float(hyp['scale_min']), float(hyp['scale_max'])
+    assert 0 < lo <= hi, f'need 0 < scale_min <= scale_max, got {lo}, {hi}'
+    return lo, hi
+
+
+# LoadImagesAndLabels.stats columns: training samples built, images used (incl. mosaic / mixup / paste-in partners),
+# labels in the returned samples, labels dropped because augmentation shrank them below 2 px
+STAT_SAMPLES, STAT_IMAGES, STAT_LABELS, STAT_TOO_SMALL = range(4)
+STAT_ROWS = 129  # one per dataloader worker (+ main process), so concurrent workers never write the same counter
+
+
 def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
     # Define label paths as a function of image paths, i.e. /dir/images/x.jpg -> /dir/<label_folder_name>/x.txt
     sa, sb = os.sep + 'images' + os.sep, os.sep + label_folder_name + os.sep  # /images/, /labels/ substrings
@@ -466,6 +483,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # native / fixed scale mosaic: max cells per axis for images smaller than the tiles (images loaded per sample
         # up to its square; 6 fills a 2560 canvas with 480 px tall frames, i.e. 640x480 at img_size 1280)
         self.mosaic_max_cells = mosaic_max_cells
+        # Usage counters in shared memory (dataloader workers update them, the training loop reads them)
+        self.stats = torch.zeros(STAT_ROWS, 4, dtype=torch.int64).share_memory_()
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -534,7 +553,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if exists:
             d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
             tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
+        if nf == 0:  # usually the wrong label folder
+            raise FileNotFoundError(
+                f"{prefix}No label files found for {n} images: looked for e.g. {self.label_files[0]} (label folder "
+                f"'{label_folder_name}'). Set --label-folder-name, or label_folder: in a train_sources data yaml.")
 
         # Read cache
         cache.pop('hash')  # remove hash
@@ -606,6 +628,19 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
             pbar.close()
+            self.stats.zero_()  # caching is not training use
+
+    def expected_images(self):
+        # see expected_images_per_sample(); frames at their median size as loaded
+        wh = np.median(self.loaded_shapes(), 0) if self.resize != 'fit' else None
+        return expected_images_per_sample(self.hyp, self.resize, self.img_size, wh, self.mosaic_max_cells, self.mosaic)
+
+    def stats_row(self):
+        info = torch.utils.data.get_worker_info()
+        return self.stats[0 if info is None else 1 + info.id % (STAT_ROWS - 1)]
+
+    def stats_total(self):
+        return self.stats.sum(0)
 
     def close_mosaic(self):
         # Late-training "clean images": no mosaic, mixup or paste-in (paste-in runs outside the mosaic branch).
@@ -734,7 +769,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                                                  translate=hyp['translate'],
                                                  scale=hyp['scale'],
                                                  shear=hyp['shear'],
-                                                 perspective=hyp['perspective'])
+                                                 perspective=hyp['perspective'],
+                                                 scale_range=scale_range(hyp), stats=self.stats_row())
             
             
             #img, labels = self.albumentations(img, labels)
@@ -759,6 +795,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 labels = pastein(img, labels, sample_labels, sample_images, sample_masks)
 
         nL = len(labels)  # number of labels
+        row = self.stats_row()
+        row[STAT_SAMPLES] += 1
+        row[STAT_LABELS] += nL
         if nL:
             labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
             labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
@@ -824,6 +863,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
+    if hasattr(self, 'stats'):
+        self.stats_row()[STAT_IMAGES] += 1
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
@@ -920,7 +961,8 @@ def load_mosaic(self, index):
                                        scale=self.hyp['scale'],
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
+                                       border=self.mosaic_border,  # border to remove
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
 
     return img4, labels4
 
@@ -998,21 +1040,54 @@ def load_mosaic9(self, index):
                                        scale=self.hyp['scale'],
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
+                                       border=self.mosaic_border,  # border to remove
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
 
     return img9, labels9
 
 
 def _mosaic_cuts(c, size, s, max_cells):
     """Cell boundaries along one axis of a 2s mosaic canvas, through the mosaic centre c, and each cell's anchor (see
-    _place()). Images at least 1.5s long cover any of the 2 cells either side of the centre (the 4-tile layout).
+    _place()). Images at least s (img_size) long get the 4-tile layout: 2 cells either side of the centre, the image
+    against the centre; a cell longer than the image leaves grey only beyond s from the centre, outside the nominal view.
     Shorter images get a cut every `size` from the centre outwards ("fill" mosaic), so they fill their cells instead of
-    leaving the canvas grey; with more than max_cells cells, the cells grow to keep the count."""
-    if size >= 1.5 * s:
+    leaving much of the view grey; with more than max_cells cells, the cells grow to keep the count."""
+    if size >= s:
         return [0, c, 2 * s], [True, False]  # towards the centre, like load_mosaic()
     step = max(size, math.ceil(2 * s / (max(max_cells, 2) - 1)))
     cuts = list(range(c, 0, -step))[::-1] + list(range(c + step, 2 * s, step))
     return [0] + cuts + [2 * s], [None] * (len(cuts) + 1)
+
+
+def _mosaic_reach(hyp, s):
+    """Furthest any part of a 2s mosaic canvas can be from its centre and still end up in the s x s training sample:
+    s / (2 * smallest zoom) + translation. None if the whole canvas can (or rotation / shear / perspective is on)."""
+    if hyp['degrees'] or hyp['shear'] or hyp['perspective']:
+        return None
+    sr = scale_range(hyp)
+    reach = s * (0.5 / (sr[0] if sr else 1 - hyp['scale']) + hyp['translate']) + 1
+    return reach if reach < s else None
+
+
+def _visible(cells, s, reach):
+    # which cells [a, b) of an axis of the 2s canvas intersect [s - reach, s + reach]
+    return [reach is None or (b > s - reach and a < s + reach) for a, b in zip(cells[:-1], cells[1:])]
+
+
+def expected_images_per_sample(hyp, resize, img_size, frame_wh, max_cells=6, mosaic=True):
+    """Expected images used to build one training sample: the sampled image plus its mosaic partners (4 tiles; 9 for
+    20% of stock mosaics; the fill-mosaic cell count of _mosaic_cuts() for native / fixed-scale frames of size
+    frame_wh = (w, h) as loaded), a second mosaic for mixup and 4 images for paste-in, each at its hyp probability.
+    1 once mosaic, mixup and paste-in are off (close_mosaic())."""
+    p_mosaic = hyp['mosaic'] if mosaic else 0.0
+    if resize == 'fit':
+        tiles = 0.8 * 4 + 0.2 * 9
+    else:  # cells that can end up in the sample (only those are loaded), per axis; the centre is uniform per axis
+        s, reach = img_size, _mosaic_reach(hyp, img_size)
+        centres = np.linspace(s / 2, s * 3 / 2, 101).astype(int)
+        tiles = np.prod([np.mean([sum(_visible(_mosaic_cuts(c, int(round(n)), s, max_cells)[0], s, reach))
+                                  for c in centres]) for n in frame_wh])
+    return p_mosaic * tiles * (1 + hyp['mixup']) + (1 - p_mosaic) + 4 * hyp['paste_in']
 
 
 def _place(self, boxes, size, region, view, anchor_high):
@@ -1076,19 +1151,25 @@ def load_mosaic_native(self, index):
     corner of each image (objects near the image centre are almost never seen). Here each image gets a random offset
     within the range that still covers its tile -- or, with probability fg_crop_prob, one that puts a random object in
     view -- and the sampled image goes to a random tile.
-    Images shorter than 1.5 x img_size along an axis (e.g. 640x480 frames with img_size 1280) would leave much of a
-    4-tile canvas grey, so along that axis the canvas is cut into cells the size of the image instead, laid out from
-    the random mosaic centre (see _mosaic_cuts()), up to mosaic_max_cells per axis."""
+    Images shorter than img_size along an axis (e.g. 640x480 frames, or the 720 px height of 1280x720 frames, with
+    img_size 1280) would leave much of a 4-tile canvas grey, so along that axis the canvas is cut into cells the size of
+    the image instead, laid out from the random mosaic centre (see _mosaic_cuts()), up to mosaic_max_cells per axis."""
     s = self.img_size
     img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)  # base image
     view = (s // 2, s // 2, s * 3 // 2, s * 3 // 2)  # canvas area the output is cut from (before translate / scale)
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
     w, h = (self.shapes[index] * self.scale).astype(int)  # size of the sampled image as loaded
     (xs, ax), (ys, ay) = (_mosaic_cuts(c, n, s, self.mosaic_max_cells) for c, n in ((xc, w), (yc, h)))
-    tiles = [(xs[i], ys[j], xs[i + 1], ys[j + 1]) for j in range(len(ys) - 1) for i in range(len(xs) - 1)]
-    anchors = [(ax[i], ay[j]) for j in range(len(ys) - 1) for i in range(len(xs) - 1)]
-    indices = [index] + random.choices(self.indices, k=len(tiles) - 1)  # additional image indices
-    random.shuffle(indices)
+    # Only cells that can end up in the sample are loaded (the rest stays grey, never shown)
+    reach = _mosaic_reach(self.hyp, s)
+    vx, vy = _visible(xs, s, reach), _visible(ys, s, reach)
+    cells = [(i, j) for j in range(len(ys) - 1) for i in range(len(xs) - 1) if vx[i] and vy[j]]
+    tiles = [(xs[i], ys[j], xs[i + 1], ys[j + 1]) for i, j in cells]
+    anchors = [(ax[i], ay[j]) for i, j in cells]
+    # The sampled image goes to a random cell overlapping the nominal view (so it is seen); partners fill the rest
+    central = [k for k, t in enumerate(tiles) if t[2] > view[0] and t[0] < view[2] and t[3] > view[1] and t[1] < view[3]]
+    indices = random.choices(self.indices, k=len(tiles) - 1)  # additional image indices
+    indices.insert(random.choice(central), index)
     labels4, segments4 = [], []
     for tile, anchor, index in zip(tiles, anchors, indices):
         labels, segments, *_ = _paste(self, img4, index, tile, view, anchor)
@@ -1103,7 +1184,8 @@ def load_mosaic_native(self, index):
                                        scale=self.hyp['scale'],
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
+                                       border=self.mosaic_border,  # border to remove
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
     return img4, labels4
 
 
@@ -1291,7 +1373,9 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 
 
 def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
-                       border=(0, 0)):
+                       border=(0, 0), scale_range=None, stats=None):
+    # scale_range: (min, max) zoom sampled log-uniformly instead of the stock uniform(1 - scale, 1.1 + scale)
+    # stats: dataset stats row (see LoadImagesAndLabels.stats); counts labels dropped for being shrunk below 2 px
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
 
@@ -1312,7 +1396,10 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     R = np.eye(3)
     a = random.uniform(-degrees, degrees)
     # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1.1 + scale)
+    if scale_range:
+        s = 2 ** random.uniform(math.log2(scale_range[0]), math.log2(scale_range[1]))
+    else:
+        s = random.uniform(1 - scale, 1.1 + scale)
     # s = 2 ** random.uniform(-scale, scale)
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 
@@ -1373,6 +1460,10 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
 
         # filter candidates
         i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        if stats is not None:  # in view, but scaled below the 2 px minimum: label silently lost to augmentation
+            w1, h1 = (targets[:, 3] - targets[:, 1]) * s, (targets[:, 4] - targets[:, 2]) * s
+            in_view = (new[:, 2] > new[:, 0]) & (new[:, 3] > new[:, 1])
+            stats[STAT_TOO_SMALL] += int((~i & in_view & ((w1 <= 2) | (h1 <= 2))).sum())
         targets = targets[i]
         targets[:, 1:5] = new[i]
 

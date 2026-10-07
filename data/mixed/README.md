@@ -54,21 +54,52 @@ Per-source keys:
 
 ## How it works
 
-- **Sampling.** Epoch *e* draws exactly `round(w_k(e) * epoch_size)` images from source *k*. Each source is an endless
-  stream of shuffled passes, so every image is seen once before any repeats. The mix is logged at the start and
-  whenever it changes (images/epoch and passes/epoch per source).
-- **Mosaic stays within a source.** Mosaic, mixup and paste-in partners come from the source of the sampled image,
-  so a 50% weight really means 50% of the training images.
+- **Sampling.** Epoch *e* draws exactly `round(w_k(e) * epoch_size)` *sampled images* (one per training sample) from
+  source *k*. Each source is an endless stream of shuffled passes, so every image is sampled once before any repeats.
+  The mix is logged at the start and whenever it changes.
+- **Mosaic stays within a source.** Mosaic, mixup and paste-in partners come from the source of the sampled image, so
+  a 50% weight means 50% of the training *samples* are built entirely from that source. It does **not** mean 50% of
+  the images (or objects) the model sees: a sample is built from several images, and how many depends on the frame
+  size (fill mosaic, below). A source with small frames contributes several times more images per sample than one
+  with large frames. The exposure plan and the per-epoch data log show both shares.
 - **Native scale.** Images are never resized. Training samples are `--img-size` crops: a 4-tile mosaic where each
   frame is offset at random within its tile, or with probability `fg_crop_prob` placed so one of its objects is in
   view (the stock mosaic anchors each frame's corner at the mosaic centre, which with large frames almost never
   shows objects near the frame centre). Validation uses full frames padded to a multiple of 32 (1280x720 ->
   1280x736), i.e. what `detect.py --img-size 1280` feeds the model. Autoanchor uses native object sizes.
-- **Fill mosaic.** Frames shorter than 1.5x `--img-size` along an axis (e.g. 640x480 frames at `--img-size 1280`)
-  would leave much of a 4-tile mosaic grey. Along that axis the mosaic canvas is instead cut into cells the size of
-  the frame, laid out from the random mosaic centre, so every cell is filled (up to `mosaic_max_cells` cells per axis,
-  i.e. up to its square of images loaded per sample). Measured on synthetic 640x480 frames at `--img-size 1280`: 54%
-  grey with 4 tiles, 6% with the fill mosaic (about 32 images loaded per sample, 1.5x the loading time).
+- **Fill mosaic.** Along an axis where frames are shorter than `--img-size` (640x480 frames at 1280 on both axes; the
+  720 px height of 1280x720 frames at 1280), a 4-tile mosaic would leave much of the sample grey. Along that axis the
+  mosaic canvas is instead cut into cells the size of the frame, laid out from the random mosaic centre (up to
+  `mosaic_max_cells` cells per axis). Only cells that can end up in the sample are loaded: with no rotation / shear /
+  perspective, the sample reaches at most `img_size * (0.5 / smallest zoom + translate)` from the canvas centre. The
+  sampled image always goes to a cell overlapping the centre of the view, so it is seen.
+
+  Measured on synthetic JPEG frames (one CPU core, data loading only; `hyp.scratch.tiny.yaml`; zoom = scale
+  augmentation, see below):
+
+  | Frames | `--img-size` | Zoom | Images per sample | ms per sample | Empty samples | Grey |
+  |---|---|---|---|---|---|---|
+  | 1280x720 | 640 | stock 0.5-1.6 | 4.4 | 26 | 9% | 0% |
+  | 1280x720 | 1280 | stock 0.5-1.6 | 10.0 | 81 | 5% | 2% |
+  | 1280x720 | 1280 | 0.8-2.0 | 7.6 | 70 | 15% | 0% |
+  | 640x480 | 640 | stock 0.5-1.6 | 7.7 | 22 | 4% | 2% |
+  | 640x480 | 1280 | stock 0.5-1.6 | 32.0 | 104 | 0% | 6% |
+  | 640x480 | 1280 | 0.8-2.0 | 18.8 | 73 | 0% | 6% |
+
+  For comparison, the stock 4-tile mosaic on images resized to `--img-size` uses ~5.5 images per sample. Zooming in
+  shows less of the scene per sample, hence more empty samples with zoom up to 2x (raise `fg_crop_prob` if that
+  matters). If data loading cannot keep up with the GPU, use more `--workers` or a lower `mosaic_max_cells`.
+- **Scale augmentation.** The stock zoom is `uniform(1 - scale, 1.1 + scale)`, i.e. 0.5-1.6x with `scale: 0.5`, which
+  can shrink objects of a few pixels to almost nothing. At native scale, set the zoom range explicitly in the hyp yaml:
+
+  ```yaml
+  scale_min: 0.8   # little zoom-out: small objects stay visible
+  scale_max: 2.0   # the largest zoom the deployment camera uses
+  ```
+
+  The zoom is then sampled log-uniformly (zooming in and out by the same factor equally likely). Without these keys
+  the stock behaviour is unchanged. Labels that augmentation shrinks below 2 px are dropped by YOLOv7: the per-epoch
+  data log counts them per source (`labels shrunk < 2px`).
 - **Reproducibility.** With `--seed`, the data of every epoch (order and augmentations) depends only on the seed,
   config and epoch: not on `--workers`, resume or loader rebuilds (`--close-mosaic`). A source's stream is the same
   whatever the other sources' weights are, so two weightings are compared on the same random draws. (Resumed runs
@@ -94,23 +125,38 @@ every run reads the current label files; `--keep-cache` keeps them (also for `te
 out-of-memory killer) cannot be caught: delete the caches listed at startup by hand after one. A cache built for a
 different image list or label folder is rebuilt automatically, but edited labels with the same images are not detected.
 
-## Exposure plan
+## Exposure plan and data log
 
-Training logs, and writes to `data_plan.txt`, how often each source is seen over the whole run: training samples,
-share, views per image and the share of images never drawn (exact: the draws are fixed in advance). Check a config
-without training:
+Training logs, and writes to `data_plan.txt`, what each source contributes over the whole run:
+
+- `samples` / `share`: training samples sampled from the source (exact: the draws are fixed in advance)
+- `images/sample`: expected images used to build one sample (sampled image + mosaic / mixup / paste-in partners, from
+  the mosaic geometry at the source's frame size and the hyp probabilities; 1 during `--close-mosaic` epochs)
+- `images used` / `share`: images used in total, and their share: what the model actually sees
+- `uses per image`, `never used`: per image of the source (sampled images cycle through the source; partners are
+  drawn at random, so `never used` is an estimate)
+
+Check a config without training (`--hyp`, `--img-size` and `--close-mosaic` as for training; frame sizes are read
+from the images):
 
 ```
-python -m utils.mixed_data --data data/mixed/5_weighted_native.yaml --epochs 100
+python -m utils.mixed_data --data your.yaml --epochs 3 --img-size 1280 --close-mosaic 1
 ```
 ```
-100 epochs x 2857 images = 285700 training samples
-  source             images    samples   share   views per image  never seen
-  camC                 2000     200000   70.0%     100.0 (  100)          0%
-  camA                35000      28600   10.0%       0.8 (  0-1)         18%
-  camB                 7000      57100   20.0%       8.2 (  8-9)          0%
-  WARNING: 18% of camA (6400 images) is never seen in this run
+3 epochs x 40 samples = 120 training samples, ~1519 images used (sampled images + mosaic / mixup / paste-in partners)
+  source             images    samples   share  images/sample  images used   share  uses per image  never used
+  camC                   24         72   60.0%            9.9          498   32.8%            20.8        0.0%
+  cam640                150         48   40.0%           31.4         1021   67.2%             6.8        0.1%
 ```
+
+Here the target (1280x720) has 60% of the samples but only 33% of the images: the 640x480 source fills each mosaic
+with three times as many frames. Lower its weight if it should contribute less of what the model sees.
+
+Every epoch, training also logs what the data loader actually built (and appends it to `data_usage.txt`): samples,
+images and their shares, images and labels per sample, and labels shrunk below 2 px, per source. Measured
+images/sample agree with the plan (10.2-10.5 and 30.1-31.4 in the run above). The counts include batches prefetched
+for the next epoch (and batches discarded when `--close-mosaic` restarts the loader), so per-epoch shares are
+approximate; per-sample numbers are not affected. In DDP the log covers the rank 0 process only.
 
 ## Epoch size
 

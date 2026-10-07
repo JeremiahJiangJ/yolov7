@@ -27,7 +27,8 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
-from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader
+from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
+    usage_report
 from utils.distill import Distiller
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
@@ -274,7 +275,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                       start_epoch=start_epoch, seed=data_seed or 0, epochs=epochs)
         data_signature = dataloader.sampler.signature()
         if rank in [-1, 0]:  # how often each source / image is seen over the whole run
-            plan = dataloader.sampler.plan(epochs)
+            plan = dataloader.sampler.plan(epochs, [d.expected_images() for d in dataset.datasets], opt.close_mosaic)
             logger.info(colorstr('data plan: ') + plan)
             (save_dir / 'data_plan.txt').write_text(plan + '\n')
         if opt.resume and ckpt_data_signature not in (None, data_signature):
@@ -375,6 +376,7 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    usage_before = usage_totals(dataset)  # data loader usage counters, reported every epoch
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -494,6 +496,14 @@ def train(hyp, opt, device, tb_writer=None):
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
+
+        if rank in [-1, 0]:  # what the data loader actually used this epoch (this process's workers in DDP)
+            usage_now = usage_totals(dataset)
+            usage = usage_report(usage_now, usage_before)
+            usage_before = usage_now
+            logger.info(colorstr('data used: ') + f'epoch {epoch}\n{usage}')
+            with open(save_dir / 'data_usage.txt', 'a') as f:
+                f.write(f'epoch {epoch}/{epochs - 1}\n{usage}\n')
 
         if distiller and rank in [-1, 0]:  # not part of results.txt (fixed columns), see TensorBoard train/distill_*
             logger.info(f'distill loss (box, obj, cls): {", ".join(f"{x:.4g}" for x in mkd.tolist())} '

@@ -352,29 +352,44 @@ class MixedSourceSampler(Sampler):
         return {'seed': self.seed, 'names': self.names, 'sizes': self.sizes, 'total': self.total,
                 'schedule': self.schedule.signature()}
 
-    def plan(self, epochs):
-        """Exposure plan of a run of `epochs` epochs, exact (the draws are fixed in advance): per source the number of
-        training samples, its share, views per image and the share of its images never drawn."""
-        draws = self.consumed_before(epochs)
-        total = max(int(draws.sum()), 1)
-        lines = [f'{epochs} epochs x {self.total} images = {total} training samples']
-        lines.append(f"  {'source':<16}{'images':>9}{'samples':>11}{'share':>8}{'views per image':>18}{'never seen':>12}")
+    def plan(self, epochs, images_per_sample=None, close_mosaic=0):
+        """Exposure plan of a run of `epochs` epochs. Per source: training samples (one per sampled image; exact, the
+        draws are fixed in advance) and their share; images used to build them (images_per_sample: expected per
+        sample with mosaic on, see utils.datasets.expected_images_per_sample(); 1 in the last close_mosaic epochs),
+        their share, uses per image, and the estimated share of images never used. Mosaic / mixup / paste-in partners
+        come from the same source as the sampled image, so a source with small frames (more mosaic cells) gets a
+        larger share of the images than of the samples. Without images_per_sample only sampled images are counted."""
+        draws = self.consumed_before(epochs).astype(float)
+        k = len(self.sizes)
+        ips = np.ones(k) if images_per_sample is None else np.asarray(images_per_sample, dtype=float)
+        n_clean = min(max(close_mosaic, 0), epochs)
+        clean = self.consumed_before(epochs) - self.consumed_before(epochs - n_clean)  # samples after close_mosaic
+        used = (draws - clean) * ips + clean  # images used, sampled images included
+        total_s, total_u = max(draws.sum(), 1), max(used.sum(), 1)
+        lines = [f'{epochs} epochs x {self.total} samples = {int(total_s)} training samples, '
+                 f'~{int(total_u)} images used (sampled images + mosaic / mixup / paste-in partners)']
+        lines.append(f"  {'source':<16}{'images':>9}{'samples':>11}{'share':>8}{'images/sample':>15}{'images used':>13}"
+                     f"{'share':>8}{'uses per image':>16}{'never used':>12}")
         warnings = []
-        for n, d, size in zip(self.names, draws, self.sizes):
-            v = d / max(size, 1)
-            # each source is cycled through without replacement: every image is drawn floor(v) or ceil(v) times
-            rng = f'{math.floor(v)}' if v == math.floor(v) else f'{math.floor(v)}-{math.ceil(v)}'
-            unseen = max(0.0, 1 - v)
-            lines.append(f'  {n:<16}{size:>9}{int(d):>11}{d / total:>8.1%}{v:>10.1f} ({rng:>5}){unseen:>12.0%}')
-            if 0 < d < size:
-                warnings.append(f'{unseen:.0%} of {n} ({size - int(d)} images) is never seen in this run')
+        for n, d, u, x, size in zip(self.names, draws, used, ips, self.sizes):
+            size = max(size, 1)
+            # sampled images cycle through the source (each drawn floor or ceil(d / size) times); partners are drawn
+            # uniformly at random, missing a given image with probability ~exp(-partners / size)
+            never = max(0.0, 1 - d / size) * math.exp(-(u - d) / size)
+            lines.append(f'  {n:<16}{size:>9}{int(d):>11}{d / total_s:>8.1%}{x:>15.1f}{int(u):>13}{u / total_u:>8.1%}'
+                         f'{u / size:>16.1f}{never:>12.1%}')
+            if d > 0 and never >= 0.01:
+                warnings.append(f'~{never:.0%} of {n} (~{int(never * size)} images) is never used in this run')
+        if images_per_sample is None:
+            lines.append('  (images/sample unknown: mosaic partners not counted)')
         return '\n'.join(lines + [f'  WARNING: {w}' for w in warnings])
 
     def summary(self, epoch=0):
         count = self.counts(epoch)
-        rows = [f'{n:<16}{c / self.total:>7.1%}{size:>9} images{c:>9}/epoch{c / max(size, 1):>7.2f} passes/epoch'
+        rows = [f'{n:<16}{c / self.total:>7.1%}{size:>9} images{c:>9} samples/epoch{c / max(size, 1):>7.2f} passes/epoch'
                 for n, c, size in zip(self.names, count, self.sizes)]
-        return f'{self.total} images/epoch\n' + '\n'.join('  ' + r for r in rows)
+        return (f'{self.total} samples/epoch (sampled images; mosaic partners add more images, see the data plan)\n' +
+                '\n'.join('  ' + r for r in rows))
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -416,6 +431,27 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
     return loader, dataset
 
 
+def usage_totals(dataset):
+    # cumulative usage counters per source (see LoadImagesAndLabels.stats), summed over this process's workers
+    parts = zip(dataset.names, dataset.datasets) if isinstance(dataset, MixedDataset) else [('train', dataset)]
+    return {n: d.stats_total().clone() for n, d in parts}
+
+
+def usage_report(now, before):
+    """What the data loader actually used between two usage_totals() snapshots, per source: training samples, images
+    used to build them (incl. mosaic / mixup / paste-in partners), labels per sample, and labels dropped because
+    augmentation shrank them below 2 px. Counts what was loaded, including batches prefetched for the next epoch."""
+    d = {n: (now[n] - before[n]).tolist() if n in before else now[n].tolist() for n in now}
+    ts, ti = max(sum(x[0] for x in d.values()), 1), max(sum(x[1] for x in d.values()), 1)
+    lines = [f"  {'source':<16}{'samples':>9}{'share':>8}{'images':>9}{'share':>8}{'images/sample':>15}"
+             f"{'labels/sample':>15}{'labels shrunk < 2px':>21}"]
+    for n, (samples, images, labels, small) in d.items():
+        lost = f'{small} ({small / max(labels + small, 1):.1%})'
+        lines.append(f'  {n:<16}{samples:>9}{samples / ts:>8.1%}{images:>9}{images / ti:>8.1%}'
+                     f'{images / max(samples, 1):>15.1f}{labels / max(samples, 1):>15.1f}{lost:>21}')
+    return '\n'.join(lines)
+
+
 def list_images(path):
     # Image files a LoadImagesAndLabels(path) would read (before dropping corrupt ones), without reading them
     from utils.datasets import img_formats
@@ -452,10 +488,32 @@ if __name__ == '__main__':
     parser.add_argument('--data', required=True, help='data yaml with train_sources')
     parser.add_argument('--epochs', type=int, required=True)
     parser.add_argument('--world-size', type=int, default=1, help='number of GPUs (DDP pads epochs to a multiple)')
+    parser.add_argument('--hyp', default='data/hyp.scratch.tiny.yaml', help='hyp yaml (mosaic, mixup, paste_in)')
+    parser.add_argument('--img-size', type=int, default=640, help='training --img-size')
+    parser.add_argument('--close-mosaic', type=int, default=0, help='training --close-mosaic')
     opt = parser.parse_args()
     with open(opt.data) as f:
         cfg = MixedConfig(yaml.safe_load(f))
-    sizes = [len(list_images(src.path)) for src in cfg.sources]
+    with open(opt.hyp) as f:
+        hyp = yaml.safe_load(f)
+    from PIL import Image
+    from utils.datasets import expected_images_per_sample
+    files = [list_images(src.path) for src in cfg.sources]
+    sizes = [len(f) for f in files]
+    ips = []
+    for src, f in zip(cfg.sources, files):  # frame size from up to 20 images (headers only)
+        wh = []
+        for x in f[:20]:
+            try:
+                with Image.open(x) as im:
+                    wh.append(im.size)
+            except OSError:
+                pass
+        if not wh and src.resize != 'fit':
+            print(f'WARNING: could not read images of {src.name} to get its frame size, assuming img_size frames')
+        wh = np.median(wh, 0) if wh else np.array([opt.img_size, opt.img_size])
+        scale = 1.0 if src.resize in ('fit', 'native') else src.resize
+        ips.append(expected_images_per_sample(hyp, src.resize, opt.img_size, wh * scale, src.mosaic_max_cells))
     schedule = cfg.schedule(sizes, opt.epochs)
     sampler = MixedSourceSampler(sizes, np.cumsum([0] + sizes[:-1]).tolist(), cfg.names, schedule,
                                  cfg.resolve_epoch_size(sizes, schedule, opt.epochs),
@@ -465,4 +523,4 @@ if __name__ == '__main__':
     if len(schedule.points) > 1:
         print(f'weight schedule ({schedule.mode}): ' + '; '.join(
             f'epoch {e}: ' + ', '.join(f'{n} {x:.0%}' for n, x in zip(cfg.names, w)) for e, w in schedule.points))
-    print(sampler.plan(opt.epochs))
+    print(sampler.plan(opt.epochs, ips, opt.close_mosaic))

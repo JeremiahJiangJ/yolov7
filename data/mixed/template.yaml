@@ -2,9 +2,12 @@
 # Replace the paths, nc and names; everything else has a working default. See data/mixed/README.md.
 #
 # 1. Check the exposure plan (no training):
-#      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150
-#    --epochs = how many times each camC image is seen, as when fine-tuning camC alone. The weights decide how much
-#    camA / camB data is added on top (and so how long training takes); the plan shows it.
+#      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150 --img-size 1280 --close-mosaic 10 \
+#        --hyp data/hyp.finetune.sgd.yaml
+#    --epochs = how many times each camC image is sampled, as when fine-tuning camC alone. The weights decide how much
+#    camA / camB data is added on top (and so how long training takes). Check the plan's image share too: sources with
+#    smaller frames contribute more images per sample (mosaic), so their share of what the model sees is higher.
+#    Zoom range: set scale_min / scale_max in the hyp yaml (see data/mixed/README.md, "Scale augmentation").
 # 2. Train (crop size = deployment size, here 1280 for camera C):
 #      python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml \
 #        --data data/mixed/template.yaml --hyp data/hyp.finetune.sgd.yaml --epochs 150 \
