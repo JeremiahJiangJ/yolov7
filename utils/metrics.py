@@ -12,10 +12,62 @@ from . import general
 trapezoid = getattr(np, 'trapezoid', None) or np.trapz
 
 
-def fitness(x):
+DEFAULT_FITNESS_WEIGHTS = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
+
+
+def fitness(x, w=None):
     # Model fitness as a weighted combination of metrics
-    w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
+    w = DEFAULT_FITNESS_WEIGHTS if w is None else w  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
     return (x[:, :4] * w).sum(1)
+
+
+def area_fitness(results, area_results, w=None, area_w=None):
+    # Fitness from per-area metrics, weighted by area_w (one weight per area bin). Bins without labels have no
+    # defined AP and are dropped, renormalising the remaining weights. Falls back to fitness(results) if unusable
+    if area_w is not None and area_results:
+        fi = [(wb, fitness(np.array([[b['p'], b['r'], b['map50'], b['map']]]), w)) for wb, b in
+              zip(area_w, area_results) if b['nt'] > 0]
+        total = sum(wb for wb, _ in fi)
+        if total > 0:
+            return sum(wb * f for wb, f in fi) / total
+    return fitness(np.array(results).reshape(1, -1), w)
+
+
+def area_bins(area_int):
+    # Area cut points [a, b, ...] -> [(lo, hi, name), ...] covering [0, inf), i.e. <a, a-b, ..., >=last
+    edges = [0.0] + sorted({float(a) for a in area_int}) + [float("inf")]
+    bins = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        name = f'<{hi:g}' if lo == 0 else f'>={lo:g}' if hi == float('inf') else f'{lo:g}-{hi:g}'
+        bins.append((lo, hi, name))
+    return bins
+
+
+def ap_per_area(tp, conf, pred_cls, target_cls, pred_area, target_area, area_int, v5_metric=False):
+    """ P, R, mAP@0.5 and mAP@0.5:0.95 per object-area bin, COCO style.
+    # Arguments
+        tp, conf, pred_cls, target_cls:  as ap_per_class()
+        pred_area:  area of the matched target for matched predictions, own area for unmatched ones (nparray)
+        target_area:  target areas (nparray), in the same units as area_int (px^2 of the original image)
+        area_int:  area cut points
+    A target belongs to the bin of its area. A matched prediction belongs to the bin of its target, so it is ignored
+    by the other bins, and an unmatched prediction (false positive) to the bin of its own area.
+    # Returns
+        list of dicts with keys name, nt (number of targets), p, r, map50, map (nan for bins without targets)
+    """
+    results = []
+    for lo, hi, name in area_bins(area_int):
+        ti = (target_area >= lo) & (target_area < hi)
+        pi = (pred_area >= lo) & (pred_area < hi)
+        res = dict(name=name, nt=int(ti.sum()), p=np.nan, r=np.nan, map50=np.nan, map=np.nan)
+        if ti.any():
+            if pi.any():
+                p, r, ap, _, _ = ap_per_class(tp[pi], conf[pi], pred_cls[pi], target_cls[ti], v5_metric=v5_metric)
+                res.update(p=p.mean(), r=r.mean(), map50=ap[:, 0].mean(), map=ap.mean())
+            else:  # labels but no predictions: everything missed
+                res.update(p=0.0, r=0.0, map50=0.0, map=0.0)
+        results.append(res)
+    return results
 
 
 def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, save_dir='.', names=()):

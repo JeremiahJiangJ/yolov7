@@ -39,31 +39,33 @@ def torch_distributed_zero_first(local_rank: int):
         torch.distributed.barrier()
 
 
-def init_torch_seeds(seed=0, deterministic=False):
+def init_torch_seeds(seed=0, deterministic=False, warn_only=False):
     # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)  # seeds the RNG of all devices (CPU and CUDA)
     if deterministic:
-        set_deterministic()
+        set_deterministic(warn_only)
     elif seed == 0:  # slower, more reproducible
         cudnn.benchmark, cudnn.deterministic = False, True
     else:  # faster, less reproducible
         cudnn.benchmark, cudnn.deterministic = True, False
 
 
-def set_deterministic():
-    # Follow https://pytorch.org/docs/stable/notes/randomness.html as far as the installed torch version allows
-    # cuBLAS needs this set before its first use for deterministic results on CUDA >= 10.2
+def set_deterministic(warn_only=False):
+    # Follow https://pytorch.org/docs/stable/notes/randomness.html as far as the installed torch version allows.
+    # warn_only=False raises on ops without a deterministic implementation. warn_only=True only warns (once) and
+    # runs their non-deterministic implementation, so results can still differ between runs
+    # cuBLAS needs this set before its first use, else deterministic mode raises on CUDA >= 10.2
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     cudnn.benchmark, cudnn.deterministic = False, True
-    try:
-        # warn_only (torch>=1.11): ops without a deterministic implementation (e.g. some CUDA backward passes) warn
-        # instead of raising, so training still runs while everything that can be deterministic is
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except (AttributeError, TypeError):
-        # Older torch can only raise on non-deterministic ops, which would abort YOLO training; cudnn flags only
-        logger.warning('torch.use_deterministic_algorithms(warn_only=True) needs torch>=1.11, '
-                       'only cudnn determinism is enabled')
+    if not hasattr(torch, 'use_deterministic_algorithms'):  # torch<1.8
+        logger.warning('torch.use_deterministic_algorithms() needs torch>=1.8, only cudnn determinism is enabled')
+    elif not warn_only:
+        torch.use_deterministic_algorithms(True)
+    else:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:  # torch<1.11 has no warn_only
+            logger.warning('--deterministic-warn-only needs torch>=1.11, only cudnn determinism is enabled')
 
 
 def seed_worker(worker_id):

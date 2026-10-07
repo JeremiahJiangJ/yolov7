@@ -36,11 +36,11 @@ def set_logging(rank=-1):
         level=logging.INFO if rank in [-1, 0] else logging.WARN)
 
 
-def init_seeds(seed=0, deterministic=False):
+def init_seeds(seed=0, deterministic=False, warn_only=False):
     # Initialize random number generator (RNG) seeds
     random.seed(seed)
     np.random.seed(seed)
-    init_torch_seeds(seed, deterministic=deterministic)
+    init_torch_seeds(seed, deterministic=deterministic, warn_only=warn_only)
 
 
 def get_latest_run(search_dir='.'):
@@ -813,7 +813,7 @@ def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_op
     print(f"Optimizer stripped from {f},{(' saved as %s,' % s) if s else ''} {mb:.1f}MB")
 
 
-def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket=''):
+def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket='', fitness_weights=None):
     # Print mutation results to evolve.txt (for use with train.py --evolve)
     a = '%10s' * len(hyp) % tuple(hyp.keys())  # hyperparam keys
     b = '%10.3g' * len(hyp) % tuple(hyp.values())  # hyperparam values
@@ -828,7 +828,7 @@ def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket=''):
     with open('evolve.txt', 'a') as f:  # append result
         f.write(c + b + '\n')
     x = np.unique(np.loadtxt('evolve.txt', ndmin=2), axis=0)  # load unique rows
-    x = x[np.argsort(-fitness(x))]  # sort
+    x = x[np.argsort(-fitness(x, fitness_weights))]  # sort
     np.savetxt('evolve.txt', x, '%10.3g')  # save sort by fitness
 
     # Save yaml

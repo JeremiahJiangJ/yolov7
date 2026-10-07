@@ -30,6 +30,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
+from utils.metrics import area_fitness, area_bins, DEFAULT_FITNESS_WEIGHTS
 from utils.loss import ComputeLoss, ComputeLossAuxOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
@@ -61,9 +62,10 @@ def train(hyp, opt, device, tb_writer=None):
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
     if opt.seed is not None:
-        init_seeds(opt.seed + max(rank, 0), deterministic=True)  # same seed on every rank would repeat augmentations
+        # same seed on every rank would repeat augmentations
+        init_seeds(opt.seed + max(rank, 0), deterministic=True, warn_only=opt.deterministic_warn_only)
     else:
-        init_seeds(2 + rank, deterministic=opt.deterministic)
+        init_seeds(2 + rank, deterministic=opt.deterministic, warn_only=opt.deterministic_warn_only)
     # Seed for the dataloaders (sampler, generator, workers); None keeps the original unseeded loaders
     data_seed = opt.seed if opt.seed is not None else (0 if opt.deterministic else None)
     with open(opt.data) as f:
@@ -305,6 +307,7 @@ def train(hyp, opt, device, tb_writer=None):
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    area_results = []  # per object-area metrics, see --area-int
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossAuxOTA(model)  # init loss class
@@ -419,7 +422,7 @@ def train(hyp, opt, device, tb_writer=None):
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, times = test.test(data_dict,
+                results, maps, times, area_results = test.test(data_dict,
                                                  batch_size=batch_size * 2,
                                                  imgsz=imgsz_test,
                                                  model=ema.ema,
@@ -431,7 +434,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                  wandb_logger=wandb_logger,
                                                  compute_loss=compute_loss,
                                                  is_coco=is_coco,
-                                                 v5_metric=opt.v5_metric)
+                                                 v5_metric=opt.v5_metric,
+                                                 area_int=opt.area_int)
 
             # Write
             with open(results_file, 'a') as f:
@@ -449,9 +453,26 @@ def train(hyp, opt, device, tb_writer=None):
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
                 if wandb_logger.wandb:
                     wandb_logger.log({tag: x})  # W&B
+            if area_results:
+                for b in area_results:
+                    for k, name in ('p', 'precision'), ('r', 'recall'), ('map50', 'mAP_0.5'), ('map', 'mAP_0.5:0.95'):
+                        if b['nt']:  # no metrics for bins without labels
+                            tag = f"metrics_area/{b['name']}/{name}"
+                            if tb_writer:
+                                tb_writer.add_scalar(tag, b[k], epoch)
+                            if wandb_logger.wandb:
+                                wandb_logger.log({tag: b[k]})
+                with open(save_dir / 'area_results.txt', 'a') as f:  # not results*.txt, see plot_results()
+                    if f.tell() == 0:
+                        f.write(('%10s' * 2 + '%12s' * 5 + '\n') % ('epoch', 'area', 'labels', 'P', 'R', 'mAP@.5',
+                                                                    'mAP@.5:.95'))
+                    for b in area_results:
+                        f.write(('%10s' * 2 + '%12i' + '%12.4g' * 4 + '\n') % (
+                            f'{epoch}/{epochs - 1}', b['name'], b['nt'], b['p'], b['r'], b['map50'], b['map']))
 
             # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            # weighted combination of [P, R, mAP@.5, mAP@.5-.95], per area bin if --fitness-area-weights
+            fi = area_fitness(results, area_results, opt.fitness_metric_weights, opt.fitness_area_weights)
             if fi > best_fitness:
                 best_fitness = fi
             wandb_logger.end_epoch(best_result=best_fitness == fi)
@@ -499,7 +520,7 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
             for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                results, _, _ = test.test(opt.data,
+                results, _, _, _ = test.test(opt.data,
                                           batch_size=batch_size * 2,
                                           imgsz=imgsz_test,
                                           conf_thres=0.001,
@@ -572,17 +593,32 @@ if __name__ == '__main__':
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
                         help='follow PyTorch reproducibility guidelines (cudnn.benchmark off, deterministic algorithms)')
+    parser.add_argument('--deterministic-warn-only', action='store_true',
+                        help='with --deterministic/--seed, warn instead of raising on ops without a deterministic '
+                             'implementation (training runs, but is not guaranteed reproducible)')
     parser.add_argument('--train-cache-path', type=str, default=None,
                         help='train labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='val labels .cache file (or directory to save it in), default: next to the labels')
+    parser.add_argument('--area-int', nargs='+', type=float, default=None,
+                        help='object area cut points in px^2 of the original image for per-area val metrics, '
+                             'i.e. 300 650 1250 -> <300, 300-650, 650-1250, >=1250')
+    parser.add_argument('--fitness-metric-weights', nargs=4, type=float, default=DEFAULT_FITNESS_WEIGHTS,
+                        help='fitness (best.pt, --evolve) weights for [P, R, mAP@.5, mAP@.5:.95], i.e. 0 0 1 0')
+    parser.add_argument('--fitness-area-weights', nargs='+', type=float, default=None,
+                        help='fitness weight per --area-int bin (one more than cut points), default: all objects')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
                         help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()
+    if opt.fitness_area_weights is not None:
+        assert opt.area_int, '--fitness-area-weights needs --area-int'
+        assert len(opt.fitness_area_weights) == len(area_bins(opt.area_int)), \
+            f'--fitness-area-weights needs {len(area_bins(opt.area_int))} values, one per --area-int bin'
+        assert not opt.evolve, '--fitness-area-weights is not supported with --evolve'
     if opt.seed is not None:
         opt.deterministic = True
     if opt.deterministic:
-        set_deterministic()  # as early as possible, before CUDA/cuBLAS initialise
+        set_deterministic(opt.deterministic_warn_only)  # as early as possible, before CUDA/cuBLAS initialise
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
@@ -690,8 +726,8 @@ if __name__ == '__main__':
                 parent = 'single'  # parent selection method: 'single' or 'weighted'
                 x = np.loadtxt('evolve.txt', ndmin=2)
                 n = min(5, len(x))  # number of previous results to consider
-                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min()  # weights
+                x = x[np.argsort(-fitness(x, opt.fitness_metric_weights))][:n]  # top n mutations
+                w = fitness(x, opt.fitness_metric_weights) - fitness(x, opt.fitness_metric_weights).min()  # weights
                 if parent == 'single' or len(x) == 1:
                     # x = x[random.randint(0, n - 1)]  # random selection
                     x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
@@ -720,7 +756,7 @@ if __name__ == '__main__':
             results = train(hyp.copy(), opt, device)
 
             # Write mutation results
-            print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
+            print_mutation(hyp.copy(), results, yaml_file, opt.bucket, fitness_weights=opt.fitness_metric_weights)
 
         # Plot results
         plot_evolution(yaml_file)

@@ -13,7 +13,7 @@ from models.experimental import attempt_load
 from utils.datasets import create_dataloader, DEFAULT_LABEL_FOLDER
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
-from utils.metrics import ap_per_class, ConfusionMatrix
+from utils.metrics import ap_per_class, ap_per_area, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
@@ -40,7 +40,8 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         area_int=None):  # area cut points (px^2 of the original image) for per-area metrics
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -134,9 +135,17 @@ def test(data,
             path = Path(paths[si])
             seen += 1
 
+            # Target boxes and areas in native space
+            tarea = torch.zeros(0, device=device)
+            if nl:
+                tbox = xywh2xyxy(labels[:, 1:5])
+                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
+                tarea = ((tbox[:, 2] - tbox[:, 0]) * (tbox[:, 3] - tbox[:, 1])).float()
+
             if len(pred) == 0:
                 if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls,
+                                  torch.Tensor(), tarea.cpu()))
                 continue
 
             # Predictions
@@ -178,13 +187,12 @@ def test(data,
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+            # Area deciding the area bin of each prediction: its own until matched, then its target's
+            parea = ((predn[:, 2] - predn[:, 0]) * (predn[:, 3] - predn[:, 1])).float()  # fp16 overflows > 65504
             if nl:
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
 
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
                 if plots:
                     confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
 
@@ -206,11 +214,12 @@ def test(data,
                                 detected_set.add(d.item())
                                 detected.append(d)
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                parea[pi[j]] = tarea[d]
                                 if len(detected) == nl:  # all targets already located in image
                                     break
 
             # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls, parea.cpu(), tarea.cpu()))
 
         # Plot images
         if plots and batch_i < 3:
@@ -221,13 +230,17 @@ def test(data,
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    area_results = []
     if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
+        p, r, ap, f1, ap_class = ap_per_class(*stats[:4], plot=plots, v5_metric=v5_metric, save_dir=save_dir,
+                                              names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
+    if area_int and len(stats):
+        area_results = ap_per_area(*stats, area_int=area_int, v5_metric=v5_metric)
 
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
@@ -237,6 +250,15 @@ def test(data,
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+
+    # Print results per object area (px^2 of the original image)
+    if area_results:
+        print(('%20s' + '%12s' * 5) % ('Area', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95'))
+        for b in area_results:
+            if b['nt']:
+                print(('%20s' + '%12i' + '%12.3g' * 4) % (b['name'], b['nt'], b['p'], b['r'], b['map50'], b['map']))
+            else:
+                print(('%20s' + '%12i' + '%12s' * 4) % (b['name'], 0, '-', '-', '-', '-'))
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
@@ -285,7 +307,7 @@ def test(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t, area_results
 
 
 if __name__ == '__main__':
@@ -310,6 +332,9 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--area-int', nargs='+', type=float, default=None,
+                        help='object area cut points in px^2 of the original image for per-area metrics, '
+                             'i.e. 300 650 1250 -> <300, 300-650, 650-1250, >=1250')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
@@ -335,7 +360,8 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
+             v5_metric=opt.v5_metric,
+             area_int=opt.area_int
              )
 
     elif opt.task == 'speed':  # speed benchmarks
@@ -350,7 +376,7 @@ if __name__ == '__main__':
             y = []  # y axis
             for i in x:  # img-size
                 print(f'\nRunning {f} point {i}...')
-                r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
+                r, _, t, _ = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
                                plots=False, v5_metric=opt.v5_metric)
                 y.append(r + t)  # results and times
             np.savetxt(f, y, fmt='%10.4g')  # save
