@@ -1,0 +1,12 @@
+# As 3_proportional_fit, but at native scale: images are never resized, so objects keep their pixel size;
+# --img-size becomes the training crop size and validation runs on full frames (padded to a multiple of 32).
+# Compare with 3_proportional_fit to see what native scale changes.
+sampling: proportional
+resize: native
+fg_crop_prob: 0.5   # chance a mosaic tile / crop is placed around an object (else at random)
+train_sources:
+  - {name: camC, path: /data/camC/images/train, val: /data/camC/images/val, target: true}
+  - {name: camA, path: /data/camA/images/train}
+  - {name: camB, path: /data/camB/images/train}
+nc: 1
+names: ['object']

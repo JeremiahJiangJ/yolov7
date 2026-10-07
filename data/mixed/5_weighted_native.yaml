@@ -1,0 +1,29 @@
+# As 4_proportional_native, plus source weighting. Compare with 4 to see what weighting changes.
+sampling: weighted
+resize: native        # default for every source, override per source
+fg_crop_prob: 0.5
+label_folder: labels  # default for every source (otherwise --label-folder-name), override per source
+
+train_sources:
+  # Exactly one target: its val set drives fitness / best.pt / --patience, autoanchor runs on it.
+  - {name: camC, path: /data/camC/images/train, val: /data/camC/images/val, target: true, weight: 50}
+  # Other sources. A val path opts in to per-source validation: reported every epoch (source_results.txt,
+  # TensorBoard metrics_source/), never used for fitness. Leave it out to validate on the target only.
+  - {name: camA, path: /data/camA/images/train, val: /data/camA/images/val, weight: 30}
+  - {name: camB, path: /data/camB/images/train, weight: 20}
+  # Sources whose objects are at a different pixel scale take their own resize, e.g.:
+  # - {name: synthetic, path: /data/synth/images/train, weight: 10, resize: 0.5, label_folder: labels}
+
+# Optional. Weights above apply from epoch 0; each point changes them from its epoch on (step) or ramps to them
+# (linear). Keep a floor on the other sources (here 40%) so the model does not forget them late in training.
+# weight_schedule:
+#   mode: step
+#   points:
+#     - {epoch: 200, weights: {camC: 60, camA: 25, camB: 15}}
+
+# Images per epoch, fixed for the run. Omitted: total images over all sources (same iterations per epoch as
+# 2_default_pooled, so the same --epochs means the same training budget). See README.md "Epoch size".
+# epoch_size: camC   # or an int
+
+nc: 1
+names: ['object']

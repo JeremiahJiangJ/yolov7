@@ -1,0 +1,14 @@
+# Multi-source machinery WITHOUT weighting: every image once per epoch (same source shares as 2_default_pooled),
+# images still resized to --img-size (resize: fit). Differences from 2_default_pooled:
+#   - mosaic / mixup partners come from the same source as the sampled image
+#   - samples are shuffled every epoch and reproducible with --seed (stock YOLOv7 does not shuffle on a single GPU)
+#   - autoanchor runs on the target only
+# Compare with 2_default_pooled to see what the machinery alone changes.
+sampling: proportional
+resize: fit
+train_sources:
+  - {name: camC, path: /data/camC/images/train, val: /data/camC/images/val, target: true}
+  - {name: camA, path: /data/camA/images/train}
+  - {name: camB, path: /data/camB/images/train}
+nc: 1
+names: ['object']

@@ -1,0 +1,6 @@
+# Stock YOLOv7 data loading (no train_sources): fine-tune on the target camera only.
+# Baseline 1 of the experiment ladder, see README.md.
+train: /data/camC/images/train
+val: /data/camC/images/val
+nc: 1
+names: ['object']
