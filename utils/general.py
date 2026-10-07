@@ -36,11 +36,11 @@ def set_logging(rank=-1):
         level=logging.INFO if rank in [-1, 0] else logging.WARN)
 
 
-def init_seeds(seed=0, deterministic=False, warn_only=False):
+def init_seeds(seed=0, deterministic=False):
     # Initialize random number generator (RNG) seeds
     random.seed(seed)
     np.random.seed(seed)
-    init_torch_seeds(seed, deterministic=deterministic, warn_only=warn_only)
+    init_torch_seeds(seed, deterministic=deterministic)
 
 
 def get_latest_run(search_dir='.'):

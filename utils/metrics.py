@@ -34,11 +34,11 @@ def area_fitness(results, area_results, w=None, area_w=None):
 
 
 def area_bins(area_int):
-    # Area cut points [a, b, ...] -> [(lo, hi, name), ...] covering [0, inf), i.e. <a, a-b, ..., >=last
+    # Area cut points [a, b, ...] -> [(lo, hi, name), ...] covering [0, inf), each bin lo <= area < hi
     edges = [0.0] + sorted({float(a) for a in area_int}) + [float("inf")]
     bins = []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        name = f'<{hi:g}' if lo == 0 else f'>={lo:g}' if hi == float('inf') else f'{lo:g}-{hi:g}'
+        name = f'<{hi:g}' if lo == 0 else f'>={lo:g}' if hi == float('inf') else f'{lo:g}<=A<{hi:g}'
         bins.append((lo, hi, name))
     return bins
 

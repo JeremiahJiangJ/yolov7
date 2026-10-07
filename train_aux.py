@@ -34,7 +34,7 @@ from utils.metrics import area_fitness, area_bins, DEFAULT_FITNESS_WEIGHTS
 from utils.loss import ComputeLoss, ComputeLossAuxOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
-    set_deterministic, torch_load
+    torch_load
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
@@ -62,10 +62,9 @@ def train(hyp, opt, device, tb_writer=None):
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
     if opt.seed is not None:
-        # same seed on every rank would repeat augmentations
-        init_seeds(opt.seed + max(rank, 0), deterministic=True, warn_only=opt.deterministic_warn_only)
+        init_seeds(opt.seed + max(rank, 0), deterministic=True)  # same seed on every rank would repeat augmentations
     else:
-        init_seeds(2 + rank, deterministic=opt.deterministic, warn_only=opt.deterministic_warn_only)
+        init_seeds(2 + rank, deterministic=opt.deterministic)
     # Seed for the dataloaders (sampler, generator, workers); None keeps the original unseeded loaders
     data_seed = opt.seed if opt.seed is not None else (0 if opt.deterministic else None)
     with open(opt.data) as f:
@@ -592,17 +591,14 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, nargs='?', const=42, default=None,
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
-                        help='follow PyTorch reproducibility guidelines (cudnn.benchmark off, deterministic algorithms)')
-    parser.add_argument('--deterministic-warn-only', action='store_true',
-                        help='with --deterministic/--seed, warn instead of raising on ops without a deterministic '
-                             'implementation (training runs, but is not guaranteed reproducible)')
+                        help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
     parser.add_argument('--train-cache-path', type=str, default=None,
                         help='train labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='val labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
                         help='object area cut points in px^2 of the original image for per-area val metrics, '
-                             'i.e. 300 650 1250 -> <300, 300-650, 650-1250, >=1250')
+                             'i.e. 300 650 1250 -> <300, 300<=A<650, 650<=A<1250, >=1250')
     parser.add_argument('--fitness-metric-weights', nargs=4, type=float, default=DEFAULT_FITNESS_WEIGHTS,
                         help='fitness (best.pt, --evolve) weights for [P, R, mAP@.5, mAP@.5:.95], i.e. 0 0 1 0')
     parser.add_argument('--fitness-area-weights', nargs='+', type=float, default=None,
@@ -617,8 +613,6 @@ if __name__ == '__main__':
         assert not opt.evolve, '--fitness-area-weights is not supported with --evolve'
     if opt.seed is not None:
         opt.deterministic = True
-    if opt.deterministic:
-        set_deterministic(opt.deterministic_warn_only)  # as early as possible, before CUDA/cuBLAS initialise
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1

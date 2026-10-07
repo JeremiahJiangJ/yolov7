@@ -334,7 +334,7 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
                         help='object area cut points in px^2 of the original image for per-area metrics, '
-                             'i.e. 300 650 1250 -> <300, 300-650, 650-1250, >=1250')
+                             'i.e. 300 650 1250 -> <300, 300<=A<650, 650<=A<1250, >=1250')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='labels .cache file (or directory to save it in), default: next to the labels')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
