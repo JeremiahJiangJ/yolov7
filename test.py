@@ -349,7 +349,7 @@ if __name__ == '__main__':
     parser.add_argument('--resize', type=str, default=None,
                         help="override the data yaml resize: fit (resize to --img-size), native, or a scale factor")
     parser.add_argument('--test-cache-path', type=str, default=None,
-                        help='labels .cache file (or directory to save it in), default: next to the labels')
+                        help='labels cache: a .cache file or a directory; default: next to the labels')
     parser.add_argument('--label-folder-name', type=str, default=DEFAULT_LABEL_FOLDER,
                         help="labels folder name, i.e. /dir/images/x.jpg -> /dir/<label-folder-name>/x.txt")
     opt = parser.parse_args()

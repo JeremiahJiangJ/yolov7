@@ -24,6 +24,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -179,6 +180,18 @@ class MixedConfig:
             assert w0 > 0, f'epoch_size source "{es}" has weight 0 at epoch 0'
             return int(round(sizes[k] / w0))
         return int(es)
+
+
+def source_cache_path(user_path, name, kind):
+    """Label cache of source `name` (kind: train / val) under --train-cache-path / --test-cache-path:
+    a .cache file 'cache/exp1.cache' -> cache/exp1.<name>.<kind>.cache, a directory 'cache/exp1' ->
+    cache/exp1/<name>.<kind>.cache. None if no path was given."""
+    if not user_path:
+        return None
+    p = Path(user_path)
+    if p.suffix == '.cache' and not p.is_dir():
+        return str(p.with_name(f'{p.stem}.{name}.{kind}.cache'))
+    return str(p / f'{name}.{kind}.cache')
 
 
 def largest_remainder(weights, total):
@@ -340,7 +353,9 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
             datasets.append(LoadImagesAndLabels(src.path, imgsz, batch_size, augment=True, hyp=hyp, rect=False,
                                                 cache_images=cache_images, single_cls=opt.single_cls,
                                                 stride=int(stride), prefix=f'{prefix}[{src.name}] ',
-                                                cache_path=src.cache_path, label_folder_name=src.label_folder,
+                                                cache_path=src.cache_path or source_cache_path(
+                                                    getattr(opt, 'train_cache_path', None), src.name, 'train'),
+                                                label_folder_name=src.label_folder,
                                                 resize=src.resize, fg_crop_prob=src.fg_crop_prob))
     dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
     schedule = cfg.schedule(dataset.sizes)
@@ -368,4 +383,6 @@ def create_val_dataloader(src, imgsz, batch_size, stride, opt, hyp=None, cache=F
     # Validation loader of one source, at its own resize mode (native sources: full frames, padded to the stride)
     return create_dataloader(src.val, imgsz, batch_size, stride, opt, hyp=hyp, cache=cache, rect=True, rank=-1,
                              world_size=world_size, workers=workers, pad=0.5, prefix=prefix,
-                             cache_path=src.val_cache_path, label_folder_name=src.label_folder, resize=src.resize)[0]
+                             cache_path=src.val_cache_path or source_cache_path(getattr(opt, 'test_cache_path', None),
+                                                                                src.name, 'val'),
+                             label_folder_name=src.label_folder, resize=src.resize)[0]

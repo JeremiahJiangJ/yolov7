@@ -76,9 +76,6 @@ def train(hyp, opt, device, tb_writer=None):
     if mixed:
         assert not opt.image_weights, '--image-weights is not supported with train_sources'
         assert not opt.rect, '--rect is not supported with train_sources'
-        if opt.train_cache_path or opt.test_cache_path:
-            logger.warning('--train-cache-path / --test-cache-path are ignored with train_sources, '
-                           'use cache_path / val_cache_path per source')
 
     # Logging- Doing this before checking the dataset. Might update data_dict
     loggers = {'wandb': None}  # loggers dict
@@ -304,6 +301,11 @@ def train(hyp, opt, device, tb_writer=None):
                                            pad=0.5, prefix=colorstr('val: '),
                                            cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
                                            seed=data_seed, resize=parse_resize(data_dict.get('resize', 'fit')))[0]
+
+        # Where every label cache of this run lives (to clean up afterwards)
+        caches = [d.cache_file for d in (dataset.datasets if mixed else [dataset])] + \
+                 [testloader.dataset.cache_file] + [loader.dataset.cache_file for _, loader in source_val]
+        logger.info(colorstr('label caches: ') + ', '.join(dict.fromkeys(str(c) for c in caches)))
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -684,9 +686,11 @@ if __name__ == '__main__':
     parser.add_argument('--deterministic', action='store_true',
                         help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
     parser.add_argument('--train-cache-path', type=str, default=None,
-                        help='train labels .cache file (or directory to save it in), default: next to the labels')
+                        help='train labels cache: a .cache file or a directory (train_sources: one file per source, '
+                             'see data/mixed/README.md); default: next to the labels')
     parser.add_argument('--test-cache-path', type=str, default=None,
-                        help='val labels .cache file (or directory to save it in), default: next to the labels')
+                        help='val labels cache: a .cache file or a directory (train_sources: one file per source); '
+                             'default: next to the labels')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
                         help='object area cut points in px^2 of the original image for per-area val metrics, '
                              'i.e. 300 650 1250 -> <300, 300<=A<650, 650<=A<1250, >=1250')
@@ -713,6 +717,9 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
+    if opt.train_cache_path and opt.train_cache_path == opt.test_cache_path and opt.train_cache_path.endswith('.cache'):
+        logger.warning('WARNING: --train-cache-path and --test-cache-path are the same file: train and val labels would '
+                       'overwrite each other\'s cache on every run. Use two files, or a directory for both')
     if opt.unfreeze_epoch:
         assert opt.freeze != [0], '--unfreeze-epoch needs --freeze'
         assert opt.local_rank == -1, '--unfreeze-epoch is not supported in DDP mode'

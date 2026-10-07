@@ -49,7 +49,7 @@ Per-source keys:
 | `fg_crop_prob` | top-level, else 0.5 | `native` / factor only: chance a mosaic tile or crop is placed around an object (else at random) |
 | `label_folder` | top-level, else `--label-folder-name` | label folder next to `images` |
 | `cache_images` | target: `--cache-images`, others: off | cache this source's images in RAM |
-| `cache_path`, `val_cache_path` | next to the labels | label cache file or directory |
+| `cache_path`, `val_cache_path` | from `--train-cache-path` / `--test-cache-path`, else next to the labels | this source's label cache file or directory (overrides the flags) |
 
 ## How it works
 
@@ -68,8 +68,23 @@ Per-source keys:
   whatever the other sources' weights are, so two weightings are compared on the same random draws. (Resumed runs
   still differ slightly from uninterrupted ones because YOLOv7 checkpoints store fp16 weights.)
 
-Not supported with `train_sources`: `--image-weights`, `--rect` (train), `--train-cache-path` / `--test-cache-path`
-(use `cache_path` / `val_cache_path`). `train_aux.py` does not support `train_sources`.
+Not supported with `train_sources`: `--image-weights`, `--rect` (train). `train_aux.py` does not support
+`train_sources`.
+
+## Label caches
+
+Pass `--train-cache-path` / `--test-cache-path` to keep every label cache of a run in one place, then delete that
+folder afterwards. Training prints all cache files it uses (`label caches: ...`). With a multi-source yaml there is
+one cache per source, named after the source:
+
+| Flag value | Stock data yaml | `train_sources` data yaml |
+|---|---|---|
+| `cache/exp1.cache` (a `.cache` file) | exactly that file | `cache/exp1.<source>.train.cache` (`.val.cache` for `--test-cache-path`) |
+| `cache/exp1` (a directory, created if needed) | `cache/exp1/labels_<hash>.cache` | `cache/exp1/<source>.train.cache` (`.val.cache`) |
+| not given | next to the labels (upstream) | next to each source's labels |
+
+A cache built for a different image list or label folder is rebuilt automatically. Edited label files with the same
+images are not detected: delete the cache to rebuild it.
 
 ## Epoch size
 
