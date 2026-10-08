@@ -24,12 +24,13 @@ before and after the changes. The exceptions are listed in [Behaviour changes](#
 | 9 | [Native-scale loading and augmentation](#9-native-scale-loading-and-augmentation) | `resize:` in the data yaml, `scale_min` / `scale_max` in the hyp | `utils/datasets.py`, `utils/autoanchor.py` |
 | 10 | [Repeat-factor sampling for rare classes](#10-repeat-factor-sampling) | `repeat_factor_threshold:` in the data yaml | `utils/mixed_data.py`, `utils/datasets.py` |
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
-| 12 | [Tools, scripts and example configs](#12-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
+| 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
+| 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations).
 
-`train.py` has every feature. `train_aux.py` (W6 / E6 / D6 / E6E models with auxiliary heads) has 1-6 and 11, not 4's
+`train.py` has every feature. `train_aux.py` (W6 / E6 / D6 / E6E models with auxiliary heads) has 1-6, 11 and 12, not 4's
 automatic cache deletion, 7, 8, 9 or 10.
 
 ---
@@ -344,7 +345,39 @@ then `--img-size` must be a multiple of 64).
 
 ---
 
-## 12. Tools, scripts and example configs
+## 12. IR polarity inversion and grayscale
+
+**Purpose.** IR cameras record white-hot or black-hot, and a dataset is often skewed to one polarity. Inverting
+frames during training teaches both. RGB frames can supplement scarce IR data once colour, a signal IR does not have,
+is removed.
+
+**Usage** (data yaml: per source, or top-level as the default for every source; a stock `train:` / `val:` yaml takes
+the top-level keys too):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `px_inversion_prob` | 0 | chance a training frame is inverted: 255 - value, inside the frame minus its `inversion_border` |
+| `inversion_border` | none | `{top, bottom, left, right}` in pixels of the original frame, left un-inverted (an IR camera's black border, which is not exactly 0 and would turn white). **Required** when `px_inversion_prob` > 0 (all 0 if there is no border); missing or misspelt keys stop training with an error naming the source |
+| `to_gray` | 0 | chance a training frame is converted to gray (3 equal channels); `1.0` also converts the source's val frames |
+
+`test.py --invert` evaluates the other polarity: every val frame inverted inside the border. Example and advice:
+`data/mixed/README.md`, "IR polarity and grayscale"; commented example in `data/mixed/template.yaml`.
+
+**Implementation.**
+- `utils/datasets.py: load_image` (the one place every training path loads a frame: mosaic, native-scale crops,
+  mixup, paste-in, close-mosaic) converts to gray, then inverts, on a copy, so RAM-cached images stay as recorded.
+  `_load_image` is the former body; image caching uses it.
+- `invert_region` scales the border from original pixels to the loaded size (`resize: fit` or a factor).
+  `parse_inversion` validates probability and border; `MixedConfig` calls it at start-up so a bad source fails before
+  any data is loaded.
+- Augmentation draws use Python's `random`, seeded like the other augmentations, so seeded runs stay
+  reproducible; with both keys at 0 no random number is drawn and stock runs are unchanged.
+- In validation (`augment=False`) a fraction is ignored: frames are gray only with `to_gray: 1` and inverted only with
+  `--invert` (`invert_all`).
+
+---
+
+## 13. Tools, scripts and example configs
 
 | Path | What |
 |---|---|
@@ -370,6 +403,9 @@ All on CPU with synthetic data (generated frames with known objects; real camera
 - Distillation gradients vanish when student and teacher are identical; distillation losses fall during training;
   P5 and P6 teachers pair correctly with the tiny student.
 - Label caches: naming, validity check, deletion on normal end, Ctrl+C and SIGTERM.
+- IR inversion: the border is untouched and the inside inverted, at native size and resized; ~50% of training frames
+  inverted at `px_inversion_prob: 0.5`; val untouched except with `--invert`; missing / bad borders refused.
+  `to_gray`: 27% of frames gray at 0.3, every train and val frame at 1.0; gray then inverted composes correctly.
 
 ## Known limitations
 

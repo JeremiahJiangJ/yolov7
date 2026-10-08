@@ -60,6 +60,19 @@ train_sources:
   #   resize: 0.5
   #   label_folder: labels_synth
 
+  # IR camera with both polarities wanted at deployment, and RGB frames as extra data (see README, "IR polarity and
+  # grayscale"). inversion_border is required when px_inversion_prob > 0: the black border, in original pixels, that
+  # inversion leaves alone (all 0 if none). test.py --invert tests the other polarity.
+  # - name: ir
+  #   path: /data/ir/images/train
+  #   weight: 20
+  #   px_inversion_prob: 0.5                                     # chance a training frame is inverted (255 - value)
+  #   inversion_border: {top: 12, bottom: 12, left: 8, right: 8}
+  # - name: rgb
+  #   path: /data/rgb/images/train
+  #   weight: 10
+  #   to_gray: 1.0                                               # chance a training frame is converted to gray
+
 # --- Weight schedule (optional) -----------------------------------------------------------------------------------------
 # The weights above apply from the start. Front-loaded: broad mix first so the large sources are covered, then shift
 # towards the target. Keep a floor on the other sources (here 30%) so they are not forgotten late in training.

@@ -55,17 +55,36 @@ Per-source keys:
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | `source<i>` | used in logs, `weight_schedule`, `epoch_size`, `test.py --source` |
-| `path` | required | training images (dir, list file, or list of those) |
+| `path` | required | training images: a dir or list file, or a list of them, pooled into one source as stock YOLOv7 pools `train: [a, b]` |
 | `weight` | required for `weighted` | relative training share (normalised, any scale): 60 / 40 = 60% / 40% of the samples |
 | `target` | `false` | exactly one source: its `val` drives fitness / `best.pt` / `--patience`; autoanchor uses it |
-| `val` | none | target: required (or a top-level `val:`). Other sources: opt-in validation, reported only |
+| `val` | none | target: required (or a top-level `val:`). Other sources: opt-in validation, reported only. A list is pooled too |
 | `resize` | top-level `resize`, else `fit` | `fit`: long side resized to `--img-size` (stock YOLOv7). `native`: never resized, objects keep their pixel size, `--img-size` is the training crop size. Number: fixed scale factor, for sources whose objects are at a different pixel scale |
 | `fg_crop_prob` | top-level, else 0.5 | `native` / factor only: chance a mosaic tile or crop is placed around an object (else at random) |
 | `mosaic_max_cells` | top-level, else 6 | `native` / factor only: max mosaic cells per axis for frames smaller than the tiles (see below). Lower it if data loading is the bottleneck |
 | `repeat_factor_threshold` | top-level, else 0 (off) | repeat-factor sampling: frames with classes in fewer than this fraction of the source's frames are sampled more often (see below) |
+| `px_inversion_prob` | top-level, else 0 (off) | IR polarity: chance a training frame is inverted (255 - value: white-hot <-> black-hot) inside its `inversion_border`. Needs `inversion_border` when > 0 (see below) |
+| `inversion_border` | top-level, else none | `{top: .., bottom: .., left: .., right: ..}`: border width in pixels of the original frame that inversion leaves alone (an IR camera's black border; all 0 if there is none). Required when `px_inversion_prob` > 0 |
+| `to_gray` | top-level, else 0 (off) | chance a training frame is converted to gray (3 equal channels), e.g. `1.0` for RGB frames supplementing IR. `1.0` also converts the source's val frames |
 | `label_folder` | top-level, else `--label-folder-name` | label folder next to `images` |
 | `cache_images` | target: `--cache-images`, others: off | cache this source's images in RAM |
 | `cache_path`, `val_cache_path` | from `--train-cache-path` / `--test-cache-path`, else next to the labels | this source's label cache file or directory (overrides the flags) |
+
+### Several datasets in one source
+
+A source is a group of frames that share the source keys (weight, resize, inversion, ...): list several folders
+under one name and they are concatenated, as stock YOLOv7 does with `train: [a, b]`. This is also how to have
+"several targets": put them in the one target source.
+
+```yaml
+  - name: ir
+    path: [/data/ir_site1/images/train, /data/ir_site2/images/train]
+    val: [/data/ir_site1/images/val, /data/ir_site2/images/val]
+    target: true
+```
+
+Within a source frames are sampled uniformly, so the larger folder dominates. If the folders need their own share,
+give them their own source (with its own `weight`) instead.
 
 ## How it works
 
@@ -120,6 +139,31 @@ Per-source keys:
   drawn in proportion to r too. Rare classes are boosted gently (a class 100x below the threshold about 10x) and no
   frame is dropped. With `epoch_size: target`, `--epochs` counts passes over this longer stream. See
   `tools/class_audit.py` for class frequencies and `test.py --freq-groups` for rare / common / frequent mAP.
+- **IR polarity and grayscale.** `to_gray` converts a frame to gray when it is loaded (`cv2` BGR -> gray -> 3 equal
+  channels), then `px_inversion_prob` inverts it (255 - value) inside the frame minus its `inversion_border`, so the
+  black border stays black. Both act per frame, before mosaic and the other augmentations, also during
+  `--close-mosaic`; the HSV augmentation keeps gray frames gray. Validation sees the frames as recorded (gray when
+  `to_gray: 1`); `test.py --invert` tests the other polarity (every val frame inverted inside its border). The border
+  is given in original pixels and scaled with `resize`. Measure it once per camera (the widest dark band on each side,
+  rounded up a few pixels: a band left inverted is a bright frame edge the model can learn as a cue). Example:
+
+  ```yaml
+  train_sources:
+    - name: ir                 # target: IR camera, mostly white-hot
+      path: /data/ir/images/train
+      val: /data/ir/images/val
+      target: true
+      weight: 60
+      px_inversion_prob: 0.5   # half the frames shown black-hot
+      inversion_border: {top: 12, bottom: 12, left: 8, right: 8}
+    - name: rgb                # RGB frames as extra data: colour is not available in IR
+      path: /data/rgb/images/train
+      weight: 40
+      to_gray: 1.0
+  ```
+
+  Inversion is meant for IR; on a grayed RGB source it gives "negative" images that look like neither polarity, so
+  leave it off there unless an experiment shows it helps.
 - **Reproducibility.** With `--seed`, the data of every epoch (order and augmentations) depends only on the seed,
   config and epoch: not on `--workers`, resume or loader rebuilds (`--close-mosaic`). A source's stream is the same
   whatever the other sources' weights are, so two weightings are compared on the same random draws. (Resumed runs
@@ -220,7 +264,9 @@ source's val set. Non-target sources with a `val` are validated every epoch at t
 `source_results.txt` and TensorBoard (`metrics_source/<name>/...`), to watch for forgetting.
 
 `test.py` accepts the same yaml: it tests the target's val set by default, `--source <name>` another source's,
-each at its own `resize`.
+each at its own `resize` (and in gray with `to_gray: 1`). `--invert` tests the other IR polarity: every val frame is
+inverted inside the source's `inversion_border` (which must be set; it also works with a stock yaml that has a
+top-level `inversion_border`). Run it with and without `--invert` to check that both polarities are detected.
 
 ## Inference at native scale
 

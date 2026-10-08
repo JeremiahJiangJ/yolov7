@@ -292,7 +292,10 @@ def train(hyp, opt, device, tb_writer=None):
                                                 label_folder_name=opt.label_folder_name, seed=data_seed,
                                                 resize=parse_resize(data_dict.get('resize', 'fit')),
                                                 fg_crop_prob=float(data_dict.get('fg_crop_prob', 0.5)),
-                                                mosaic_max_cells=int(data_dict.get('mosaic_max_cells', 6)))
+                                                mosaic_max_cells=int(data_dict.get('mosaic_max_cells', 6)),
+                                                invert_prob=data_dict.get('px_inversion_prob', 0.0),
+                                                invert_border=data_dict.get('inversion_border'),
+                                                gray_prob=data_dict.get('to_gray', 0.0))
         data_signature = None
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
@@ -320,7 +323,8 @@ def train(hyp, opt, device, tb_writer=None):
                                            world_size=opt.world_size, workers=opt.workers,
                                            pad=0.5, prefix=colorstr('val: '),
                                            cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
-                                           seed=data_seed, resize=parse_resize(data_dict.get('resize', 'fit')))[0]
+                                           seed=data_seed, resize=parse_resize(data_dict.get('resize', 'fit')),
+                                           gray_prob=data_dict.get('to_gray', 0.0))[0]  # gray if to_gray is 1
 
         # Where every label cache of this run lives (to clean up afterwards)
         caches = [d.cache_file for d in (dataset.datasets if mixed else [dataset])] + \

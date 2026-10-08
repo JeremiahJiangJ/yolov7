@@ -260,7 +260,10 @@ def train(hyp, opt, device, tb_writer=None):
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
                                             cache_path=opt.train_cache_path, label_folder_name=opt.label_folder_name,
-                                            seed=data_seed)
+                                            seed=data_seed,
+                                            invert_prob=data_dict.get('px_inversion_prob', 0.0),
+                                            invert_border=data_dict.get('inversion_border'),
+                                            gray_prob=data_dict.get('to_gray', 0.0))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -276,7 +279,8 @@ def train(hyp, opt, device, tb_writer=None):
                                        world_size=opt.world_size, workers=opt.workers,
                                        pad=0.5, prefix=colorstr('val: '),
                                        cache_path=opt.test_cache_path, label_folder_name=opt.label_folder_name,
-                                       seed=data_seed)[0]
+                                       seed=data_seed,
+                                       gray_prob=data_dict.get('to_gray', 0.0))[0]  # gray if to_gray is 1
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)

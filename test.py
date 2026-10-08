@@ -95,12 +95,19 @@ def test(data,
             src = mixed.target if opt.source is None else mixed.sources[mixed.names.index(opt.source)]
             assert src.val, f'source "{src.name}" has no val path'
             path, resize, label_folder, prefix = src.val, src.resize, src.label_folder, f'val[{src.name}]: '
+            border, gray = src.inversion_border, src.to_gray
         else:
             path, resize, label_folder, prefix = data[task], data.get('resize', 'fit'), opt.label_folder_name, f'{task}: '
+            border, gray = data.get('inversion_border'), data.get('to_gray', 0.0)
+        if opt.invert:  # the other IR polarity: every frame inverted inside its inversion border
+            assert border is not None, '--invert needs inversion_border in the data yaml (0s if there is no border)'
+            prefix = prefix.replace(':', ' (inverted):')
         resize = parse_resize(opt.resize or resize)
         dataloader = create_dataloader(path, imgsz, batch_size, gs, opt, pad=0.5, rect=True,
                                        prefix=colorstr(prefix), cache_path=opt.test_cache_path,
-                                       label_folder_name=label_folder, resize=resize)[0]
+                                       label_folder_name=label_folder, resize=resize,
+                                       invert_border=border, invert_all=opt.invert,
+                                       gray_prob=gray)[0]  # gray if to_gray is 1
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
@@ -350,6 +357,8 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--invert', action='store_true',
+                        help='invert every val frame inside the data yaml inversion_border (IR: test the other polarity)')
     parser.add_argument('--freq-groups', action='store_true',
                         help='report mAP per class-frequency group (rare / common / frequent in the training labels)')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,

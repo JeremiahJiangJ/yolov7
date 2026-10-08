@@ -33,7 +33,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from utils.datasets import STAT_SAMPLES, STAT_IMAGES, STAT_LABELS
-from utils.datasets import LoadImagesAndLabels, InfiniteDataLoader, DEFAULT_LABEL_FOLDER, parse_resize, \
+from utils.datasets import LoadImagesAndLabels, InfiniteDataLoader, DEFAULT_LABEL_FOLDER, parse_resize, parse_inversion, \
     create_dataloader
 from utils.torch_utils import torch_distributed_zero_first
 
@@ -63,6 +63,9 @@ class Source:
     fg_crop_prob: float = 0.5
     mosaic_max_cells: int = 6
     repeat_factor_threshold: float = 0.0  # > 0: repeat-factor sampling of frames with rare classes (see repeat_factors())
+    px_inversion_prob: float = 0.0  # IR polarity augmentation, see utils.datasets.parse_inversion()
+    inversion_border: Optional[dict] = None  # {top, bottom, left, right}: border pixels left un-inverted
+    to_gray: float = 0.0  # chance a training frame is converted to gray (1: always, in validation too)
     cache_images: Optional[bool] = None  # None: target follows --cache-images, other sources are not cached
     label_folder: Optional[str] = None  # None: --label-folder-name
     cache_path: Optional[str] = None  # train labels cache file or dir; None: next to the labels
@@ -121,7 +124,7 @@ class MixedConfig:
     """Parsed `train_sources` data yaml. Also points data_dict['train'] / ['val'] at the target source, for code that
     reads them (check_dataset, W&B)."""
     KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'mosaic_max_cells',
-            'repeat_factor_threshold', 'cache_images',
+            'repeat_factor_threshold', 'px_inversion_prob', 'inversion_border', 'to_gray', 'cache_images',
             'label_folder', 'cache_path', 'val_cache_path'}
 
     def __init__(self, data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
@@ -135,6 +138,8 @@ class MixedConfig:
         default_fg = float(data_dict.get('fg_crop_prob', 0.5))
         default_cells = int(data_dict.get('mosaic_max_cells', 6))
         default_rfs = float(data_dict.get('repeat_factor_threshold', 0.0))
+        default_inv, default_border = data_dict.get('px_inversion_prob', 0.0), data_dict.get('inversion_border')
+        default_gray = float(data_dict.get('to_gray', 0.0))
         default_label_folder = data_dict.get('label_folder') or label_folder_name
         self.sources = []
         for i, s in enumerate(srcs):
@@ -150,9 +155,18 @@ class MixedConfig:
                 fg_crop_prob=float(s.get('fg_crop_prob', default_fg)),
                 mosaic_max_cells=int(s.get('mosaic_max_cells', default_cells)),
                 repeat_factor_threshold=float(s.get('repeat_factor_threshold', default_rfs)),
+                px_inversion_prob=float(s.get('px_inversion_prob', default_inv)),
+                inversion_border=s.get('inversion_border', default_border),
+                to_gray=float(s.get('to_gray', default_gray)),
                 cache_images=s.get('cache_images'),
                 label_folder=s.get('label_folder') or default_label_folder, cache_path=s.get('cache_path'),
                 val_cache_path=s.get('val_cache_path')))
+        for src in self.sources:  # fail early: inversion needs a border
+            try:
+                parse_inversion(src.px_inversion_prob, src.inversion_border)
+                assert 0 <= src.to_gray <= 1, f'to_gray must be in [0, 1], got {src.to_gray}'
+            except AssertionError as e:
+                raise AssertionError(f'train_sources "{src.name}": {e}') from None
         self.names = [s.name for s in self.sources]
         assert len(set(self.names)) == len(self.names), f'train_sources names must be unique, got {self.names}'
         targets = [i for i, s in enumerate(self.sources) if s.target]
@@ -490,7 +504,10 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
                                                     getattr(opt, 'train_cache_path', None), src.name, 'train'),
                                                 label_folder_name=src.label_folder,
                                                 resize=src.resize, fg_crop_prob=src.fg_crop_prob,
-                                                mosaic_max_cells=src.mosaic_max_cells))
+                                                mosaic_max_cells=src.mosaic_max_cells,
+                                                invert_prob=src.px_inversion_prob,
+                                                invert_border=src.inversion_border,
+                                                gray_prob=src.to_gray))
     dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
     # Repeat-factor sampling: sampled frames (sampler streams) and mosaic / mixup / paste-in partners (dataset) are
     # both drawn in proportion to the repeat factors
@@ -618,13 +635,15 @@ def list_images(path):
 
 
 def create_val_dataloader(src, imgsz, batch_size, stride, opt, hyp=None, cache=False, world_size=1, workers=8,
-                          prefix=''):
+                          prefix='', invert=False):
     # Validation loader of one source, at its own resize mode (native sources: full frames, padded to the stride)
     return create_dataloader(src.val, imgsz, batch_size, stride, opt, hyp=hyp, cache=cache, rect=True, rank=-1,
                              world_size=world_size, workers=workers, pad=0.5, prefix=prefix,
                              cache_path=src.val_cache_path or source_cache_path(getattr(opt, 'test_cache_path', None),
                                                                                 src.name, 'val'),
-                             label_folder_name=src.label_folder, resize=src.resize)[0]
+                             label_folder_name=src.label_folder, resize=src.resize,
+                             invert_border=src.inversion_border, invert_all=invert,
+                             gray_prob=src.to_gray)[0]  # gray if to_gray is 1
 
 
 if __name__ == '__main__':

@@ -109,7 +109,7 @@ def delete_label_caches_at_exit():
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', cache_path=None,
                       label_folder_name=DEFAULT_LABEL_FOLDER, seed=None, resize='fit', fg_crop_prob=0.5,
-                      mosaic_max_cells=6):
+                      mosaic_max_cells=6, invert_prob=0.0, invert_border=None, invert_all=False, gray_prob=0.0):
     # seed: if not None, seed the sampler, dataloader generator and workers for reproducible data loading
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -127,7 +127,11 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       label_folder_name=label_folder_name,
                                       resize=resize,
                                       fg_crop_prob=fg_crop_prob,
-                                      mosaic_max_cells=mosaic_max_cells)
+                                      mosaic_max_cells=mosaic_max_cells,
+                                      invert_prob=invert_prob,
+                                      invert_border=invert_border,
+                                      invert_all=invert_all,
+                                      gray_prob=gray_prob)
     dataloader = build_dataloader(dataset, batch_size, rank=rank, world_size=world_size, workers=workers,
                                   image_weights=image_weights, quad=quad, seed=seed)
     return dataloader, dataset
@@ -473,7 +477,8 @@ def img2label_paths(img_paths, label_folder_name=DEFAULT_LABEL_FOLDER):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', cache_path=None,
-                 label_folder_name=DEFAULT_LABEL_FOLDER, resize='fit', fg_crop_prob=0.5, mosaic_max_cells=6):
+                 label_folder_name=DEFAULT_LABEL_FOLDER, resize='fit', fg_crop_prob=0.5, mosaic_max_cells=6,
+                 invert_prob=0.0, invert_border=None, invert_all=False, gray_prob=0.0):
         self.img_size = img_size
         self.label_folder_name = label_folder_name
         self.resize = parse_resize(resize)  # see parse_resize()
@@ -483,6 +488,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # native / fixed scale mosaic: max cells per axis for images smaller than the tiles (images loaded per sample
         # up to its square; 6 fills a 2560 canvas with 480 px tall frames, i.e. 640x480 at img_size 1280)
         self.mosaic_max_cells = mosaic_max_cells
+        # IR polarity: invert training frames with probability invert_prob (all frames if invert_all, for testing the
+        # other polarity), inside invert_border (see parse_inversion())
+        self.invert_prob, self.invert_border = parse_inversion(invert_prob, invert_border)
+        self.invert_all = invert_all
+        assert not invert_all or self.invert_border is not None, 'inverting needs inversion_border'
+        # Grayscale: convert frames to gray with probability gray_prob in training (e.g. RGB frames supplementing IR);
+        # gray_prob 1: every frame, in validation too (fractions apply only with augment)
+        self.gray_prob = float(gray_prob or 0)
+        assert 0 <= self.gray_prob <= 1, f'to_gray must be in [0, 1], got {gray_prob}'
+        if augment and (self.gray_prob or self.invert_prob):
+            logger.info(f'{prefix}to_gray {self.gray_prob:g}, px_inversion_prob {self.invert_prob:g}'
+                        f' (border top, bottom, left, right: {self.invert_border})')
         # Usage counters in shared memory (dataloader workers update them, the training loop reads them)
         self.stats = torch.zeros(STAT_ROWS, 4, dtype=torch.int64).share_memory_()
         self.augment = augment
@@ -616,7 +633,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 self.im_cache_dir.mkdir(parents=True, exist_ok=True)
             gb = 0  # Gigabytes of cached images
             self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))
+            results = ThreadPool(8).imap(lambda x: _load_image(*x), zip(repeat(self), range(n)))  # not inverted
             pbar = tqdm(enumerate(results), total=n)
             for i, x in pbar:
                 if cache_images == 'disk':
@@ -874,9 +891,52 @@ def _partner(self):
 
 
 def load_image(self, index):
-    # loads 1 image from dataset, returns img, original hw, resized hw
+    # loads 1 image from dataset, returns img, original hw, resized hw. Then, in this order: with to_gray (gray_prob:
+    # training, or 1 = always) converted to gray (3 equal channels); with px_inversion_prob (training) or invert_all
+    # (testing), inverted inside its inversion border (see invert_region())
     if hasattr(self, 'stats'):
         self.stats_row()[STAT_IMAGES] += 1
+    img, hw0, hw = _load_image(self, index)
+    gray = getattr(self, 'gray_prob', 0)
+    if gray >= 1 or (self.augment and gray > 0 and random.random() < gray):
+        img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    if getattr(self, 'invert_all', False) or \
+            (self.augment and getattr(self, 'invert_prob', 0) > 0 and random.random() < self.invert_prob):
+        img = invert_region(img, self.invert_border, hw0)
+    return img, hw0, hw
+
+
+def invert_region(img, border, hw0):
+    """Pixel inversion (255 - value: black-hot <-> white-hot for IR) inside the frame, leaving a border of
+    border = (top, bottom, left, right) pixels of the original frame (size hw0) untouched. Returns a new array."""
+    h, w = img.shape[:2]
+    sy, sx = h / hw0[0], w / hw0[1]  # the border is given in original pixels; the image may be resized
+    top, bottom, left, right = border
+    y1, y2, x1, x2 = round(top * sy), h - round(bottom * sy), round(left * sx), w - round(right * sx)
+    out = img.copy()
+    out[y1:y2, x1:x2] = 255 - out[y1:y2, x1:x2]
+    return out
+
+
+def parse_inversion(prob, border, what='px_inversion_prob'):
+    """Validated (probability, border): border = inversion_border {top, bottom, left, right}, required when the
+    probability is > 0 (pixels of the frame border inversion leaves alone, e.g. an IR camera's black border; 0 if none).
+    Returns (prob, (top, bottom, left, right) or None)."""
+    prob = float(prob or 0)
+    assert 0 <= prob <= 1, f'{what} must be in [0, 1], got {prob}'
+    if prob == 0 and border is None:
+        return prob, None
+    assert border is not None, (f'{what} > 0 needs inversion_border: {{top: .., bottom: .., left: .., right: ..}} '
+                                f'(border pixels of the original frame left un-inverted; all 0 if there is no border)')
+    keys = ('top', 'bottom', 'left', 'right')
+    assert isinstance(border, dict) and set(border) == set(keys), \
+        f'inversion_border needs exactly the keys {keys}, got {border}'
+    vals = tuple(int(border[k]) for k in keys)
+    assert all(v >= 0 for v in vals), f'inversion_border values must be >= 0, got {border}'
+    return prob, vals
+
+
+def _load_image(self, index):
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
