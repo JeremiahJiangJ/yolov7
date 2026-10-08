@@ -736,9 +736,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < hyp['mixup']:
                 if random.random() < 0.8:
-                    img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
+                    img2, labels2 = load_mosaic(self, _partner(self))
                 else:
-                    img2, labels2 = load_mosaic9(self, random.randint(0, len(self.labels) - 1))
+                    img2, labels2 = load_mosaic9(self, _partner(self))
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
@@ -785,7 +785,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if random.random() < hyp['paste_in']:
                 sample_labels, sample_images, sample_masks = [], [], [] 
                 while len(sample_labels) < 30:
-                    sample_labels_, sample_images_, sample_masks_ = load_samples(self, random.randint(0, len(self.labels) - 1))
+                    sample_labels_, sample_images_, sample_masks_ = load_samples(self, _partner(self))
                     sample_labels += sample_labels_
                     sample_images += sample_images_
                     sample_masks += sample_masks_
@@ -861,6 +861,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
+def _partners(self, k):
+    # k mosaic partner indices: uniform (stock), or in proportion to repeat factors if the dataset has them
+    w = getattr(self, 'partner_cum_weights', None)
+    return random.choices(self.indices, k=k) if w is None else random.choices(self.indices, cum_weights=w, k=k)
+
+
+def _partner(self):
+    # one mixup / paste-in partner index, as _partners()
+    w = getattr(self, 'partner_cum_weights', None)
+    return random.randint(0, len(self.labels) - 1) if w is None else random.choices(self.indices, cum_weights=w)[0]
+
+
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     if hasattr(self, 'stats'):
@@ -913,7 +925,7 @@ def load_mosaic(self, index):
     labels4, segments4 = [], []
     s = self.img_size
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
-    indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+    indices = [index] + _partners(self, 3)  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
         img, _, (h, w) = load_image(self, index)
@@ -974,7 +986,7 @@ def load_mosaic9(self, index):
 
     labels9, segments9 = [], []
     s = self.img_size
-    indices = [index] + random.choices(self.indices, k=8)  # 8 additional image indices
+    indices = [index] + _partners(self, 8)  # 8 additional image indices
     for i, index in enumerate(indices):
         # Load image
         img, _, (h, w) = load_image(self, index)
@@ -1168,7 +1180,7 @@ def load_mosaic_native(self, index):
     anchors = [(ax[i], ay[j]) for i, j in cells]
     # The sampled image goes to a random cell overlapping the nominal view (so it is seen); partners fill the rest
     central = [k for k, t in enumerate(tiles) if t[2] > view[0] and t[0] < view[2] and t[3] > view[1] and t[1] < view[3]]
-    indices = random.choices(self.indices, k=len(tiles) - 1)  # additional image indices
+    indices = _partners(self, len(tiles) - 1)  # additional image indices
     indices.insert(random.choice(central), index)
     labels4, segments4 = [], []
     for tile, anchor, index in zip(tiles, anchors, indices):
@@ -1204,7 +1216,7 @@ def load_samples(self, index):
     labels4, segments4 = [], []
     s = self.img_size
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
-    indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+    indices = [index] + _partners(self, 3)  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
         img, _, (h, w) = load_image(self, index)

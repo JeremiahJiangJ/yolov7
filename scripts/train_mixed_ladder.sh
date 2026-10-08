@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
-# Train the data/mixed experiment ladder with identical settings, to measure each change's effect
-# (see data/mixed/README.md). Every config except 1 has the same images per epoch (total images over all sources),
-# (5_weighted_native uses epoch_size: total), so --epochs gives the same training budget; for 1 (target only)
-# EPOCHS_TARGET is scaled to match.
+# Train the data/mixed experiment ladder with identical settings, to measure what each step changes
+# (see data/mixed/README.md):
+#   1 stock, target only -> 2 stock, pooled -> 3 multi-source, unweighted -> 4 native scale -> 5 weighted -> 6 + rfs
+# Steps 2-6 have the same samples per epoch (as many as frames in all sources), so the same --epochs is the same
+# training budget; step 1 (target only) uses EPOCHS_TARGET, scaled to match by default if you set it.
 # Usage: bash scripts/train_mixed_ladder.sh [extra train.py args, e.g. --area-int 300 650 1250]
+#        STEPS="1 2 5 6" bash scripts/train_mixed_ladder.sh   # a subset
 set -euo pipefail
 EPOCHS=${EPOCHS:-100}
 EPOCHS_TARGET=${EPOCHS_TARGET:-$EPOCHS}   # e.g. EPOCHS * (frames in all sources / target frames) for an equal budget
+STEPS=${STEPS:-"1 2 3 4 5 6"}
 COMMON=(--weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --hyp data/hyp.finetune.sgd.yaml
         --batch-size 32 --img-size 640 640 --seed 42 --device 0 --workers 8 --label-folder-name labels
         --fitness-metric-weights 0 0 1 0 --project runs/ladder --exist-ok)
+CONFIGS=(x 1_default_target 2_default_pooled 3_proportional_fit 4_proportional_native 5_weighted_native
+         6_weighted_native_rfs)
 
-python train.py "${COMMON[@]}" --epochs "$EPOCHS_TARGET" --data data/mixed/1_default_target.yaml --name 1_default_target "$@"
-for cfg in 2_default_pooled 3_proportional_fit 4_proportional_native 5_weighted_native; do
-  python train.py "${COMMON[@]}" --epochs "$EPOCHS" --data "data/mixed/$cfg.yaml" --name "$cfg" "$@"
+for s in $STEPS; do
+  cfg=${CONFIGS[$s]}
+  epochs=$EPOCHS; [ "$s" = 1 ] && epochs=$EPOCHS_TARGET
+  python train.py "${COMMON[@]}" --epochs "$epochs" --data "data/mixed/$cfg.yaml" --name "$cfg" "$@"
 done
 
-# Fair comparison: evaluate every best.pt on the same target val set at the same scale. Native-scale models must be
-# tested at native scale (--resize native), resized models at --img-size (--resize fit); add both if in doubt.
-for run in 1_default_target 2_default_pooled 3_proportional_fit; do
-  python test.py --weights "runs/ladder/$run/weights/best.pt" --data data/mixed/1_default_target.yaml \
-    --img-size 640 --label-folder-name labels --resize fit --project runs/ladder_test --name "$run" --exist-ok
-done
-for run in 4_proportional_native 5_weighted_native; do
-  python test.py --weights "runs/ladder/$run/weights/best.pt" --data data/mixed/1_default_target.yaml \
-    --img-size 1280 --label-folder-name labels --resize native --project runs/ladder_test --name "$run" --exist-ok
+# Fair comparison: every best.pt on the same target val set, each at the scale it was trained for: resized models at
+# --img-size (--resize fit), native-scale models on full frames (--resize native, --img-size = the target's long side).
+# --freq-groups adds mAP per class-frequency group (rare / common / frequent in the target's training labels).
+for s in $STEPS; do
+  cfg=${CONFIGS[$s]}
+  if [ "$s" -le 3 ]; then scale=(--img-size 640 --resize fit); else scale=(--img-size 1280 --resize native); fi
+  python test.py --weights "runs/ladder/$cfg/weights/best.pt" --data data/mixed/1_default_target.yaml \
+    "${scale[@]}" --label-folder-name labels --freq-groups --project runs/ladder_test --name "$cfg" --exist-ok
 done

@@ -25,8 +25,10 @@ Example configs (an experiment ladder, each step changes one thing):
 | `3_proportional_fit.yaml` | multi-source, no weighting, resized | 2 | source-local mosaic, shuffling/seeding, target anchors |
 | `4_proportional_native.yaml` | multi-source, no weighting, native scale | 3 | native scale |
 | `5_weighted_native.yaml` | multi-source, weighted, native scale | 4 | weighting |
+| `6_weighted_native_rfs.yaml` | as 5, plus repeat-factor sampling | 5 | oversampling rare classes |
 
-`scripts/train_mixed_ladder.sh` trains all five with identical settings.
+`scripts/train_mixed_ladder.sh` trains and tests all six with identical settings (`STEPS="1 5 6"` for a subset).
+All changes in this fork, beyond multi-source training: [`CHANGES.md`](../../CHANGES.md).
 
 ## Data yaml
 
@@ -60,6 +62,7 @@ Per-source keys:
 | `resize` | top-level `resize`, else `fit` | `fit`: long side resized to `--img-size` (stock YOLOv7). `native`: never resized, objects keep their pixel size, `--img-size` is the training crop size. Number: fixed scale factor, for sources whose objects are at a different pixel scale |
 | `fg_crop_prob` | top-level, else 0.5 | `native` / factor only: chance a mosaic tile or crop is placed around an object (else at random) |
 | `mosaic_max_cells` | top-level, else 6 | `native` / factor only: max mosaic cells per axis for frames smaller than the tiles (see below). Lower it if data loading is the bottleneck |
+| `repeat_factor_threshold` | top-level, else 0 (off) | repeat-factor sampling: frames with classes in fewer than this fraction of the source's frames are sampled more often (see below) |
 | `label_folder` | top-level, else `--label-folder-name` | label folder next to `images` |
 | `cache_images` | target: `--cache-images`, others: off | cache this source's images in RAM |
 | `cache_path`, `val_cache_path` | from `--train-cache-path` / `--test-cache-path`, else next to the labels | this source's label cache file or directory (overrides the flags) |
@@ -111,6 +114,12 @@ Per-source keys:
   The zoom is then sampled log-uniformly (zooming in and out by the same factor equally likely). Without these keys
   the stock behaviour is unchanged. Labels that augmentation shrinks below 2 px are dropped by YOLOv7: the per-epoch
   data log counts them per source (`labels shrunk < 2px`).
+- **Repeat-factor sampling.** With `repeat_factor_threshold: t`, frame i of the source gets a repeat factor
+  r_i = max(1, max over its classes of √(t / f_c)), f_c = fraction of the source's frames containing class c (LVIS).
+  Each pass over the source then holds frame i r_i times on average, and its mosaic / mixup / paste-in partners are
+  drawn in proportion to r too. Rare classes are boosted gently (a class 100x below the threshold about 10x) and no
+  frame is dropped. With `epoch_size: target`, `--epochs` counts passes over this longer stream. See
+  `tools/class_audit.py` for class frequencies and `test.py --freq-groups` for rare / common / frequent mAP.
 - **Reproducibility.** With `--seed`, the data of every epoch (order and augmentations) depends only on the seed,
   config and epoch: not on `--workers`, resume or loader rebuilds (`--close-mosaic`). A source's stream is the same
   whatever the other sources' weights are, so two weightings are compared on the same random draws. (Resumed runs

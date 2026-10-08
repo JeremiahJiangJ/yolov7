@@ -1,12 +1,25 @@
-# As 3_proportional_fit, but at native scale: images are never resized, so objects keep their pixel size;
-# --img-size becomes the training crop size and validation runs on full frames (padded to a multiple of 32).
-# Compare with 3_proportional_fit to see what native scale changes.
-sampling: proportional
-resize: native
-fg_crop_prob: 0.5   # chance a mosaic tile / crop is placed around an object (else at random)
-train_sources:
-  - {name: camC, path: /data/camC/images/train, val: /data/camC/images/val, target: true}
-  - {name: camA, path: /data/camA/images/train}
-  - {name: camB, path: /data/camB/images/train}
+# Experiment ladder, step 4 of 6 (see README.md): as step 3, at native scale.
+# Changes from step 3: frames are never resized, so objects keep their pixel size; --img-size becomes the training crop
+# size, mosaics use the native layout (random / object-aware placement, fill mosaic for small frames) and validation
+# runs on full frames padded to a multiple of 32. Test native models at their native frame size (see README.md).
+
+# --- Classes -----------------------------------------------------------------------------------------------------------
 nc: 1
 names: ['object']
+
+# --- Defaults for every source -----------------------------------------------------------------------------------------
+sampling: proportional  # every frame once per epoch, as steps 2-3
+resize: native          # never resized
+fg_crop_prob: 0.5       # chance a mosaic tile / crop is placed around an object (else at random)
+mosaic_max_cells: 6     # max mosaic cells per axis for frames smaller than the tiles
+
+# --- Sources -----------------------------------------------------------------------------------------------------------
+train_sources:
+  - name: camC
+    path: /data/camC/images/train
+    val: /data/camC/images/val
+    target: true
+  - name: camA
+    path: /data/camA/images/train
+  - name: camB
+    path: /data/camB/images/train

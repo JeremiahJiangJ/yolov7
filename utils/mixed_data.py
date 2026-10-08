@@ -62,6 +62,7 @@ class Source:
     resize: object = 'fit'  # see utils.datasets.parse_resize()
     fg_crop_prob: float = 0.5
     mosaic_max_cells: int = 6
+    repeat_factor_threshold: float = 0.0  # > 0: repeat-factor sampling of frames with rare classes (see repeat_factors())
     cache_images: Optional[bool] = None  # None: target follows --cache-images, other sources are not cached
     label_folder: Optional[str] = None  # None: --label-folder-name
     cache_path: Optional[str] = None  # train labels cache file or dir; None: next to the labels
@@ -119,7 +120,8 @@ class WeightSchedule:
 class MixedConfig:
     """Parsed `train_sources` data yaml. Also points data_dict['train'] / ['val'] at the target source, for code that
     reads them (check_dataset, W&B)."""
-    KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'mosaic_max_cells', 'cache_images',
+    KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'mosaic_max_cells',
+            'repeat_factor_threshold', 'cache_images',
             'label_folder', 'cache_path', 'val_cache_path'}
 
     def __init__(self, data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
@@ -132,6 +134,7 @@ class MixedConfig:
         default_resize = data_dict.get('resize', 'fit')
         default_fg = float(data_dict.get('fg_crop_prob', 0.5))
         default_cells = int(data_dict.get('mosaic_max_cells', 6))
+        default_rfs = float(data_dict.get('repeat_factor_threshold', 0.0))
         default_label_folder = data_dict.get('label_folder') or label_folder_name
         self.sources = []
         for i, s in enumerate(srcs):
@@ -145,7 +148,9 @@ class MixedConfig:
                 target=bool(s.get('target', False)), val=s.get('val'),
                 resize=parse_resize(s.get('resize', default_resize)),
                 fg_crop_prob=float(s.get('fg_crop_prob', default_fg)),
-                mosaic_max_cells=int(s.get('mosaic_max_cells', default_cells)), cache_images=s.get('cache_images'),
+                mosaic_max_cells=int(s.get('mosaic_max_cells', default_cells)),
+                repeat_factor_threshold=float(s.get('repeat_factor_threshold', default_rfs)),
+                cache_images=s.get('cache_images'),
                 label_folder=s.get('label_folder') or default_label_folder, cache_path=s.get('cache_path'),
                 val_cache_path=s.get('val_cache_path')))
         self.names = [s.name for s in self.sources]
@@ -178,18 +183,21 @@ class MixedConfig:
         return self.sources[self.target_idx]
 
     def schedule(self, sizes, epochs=None):
-        if self.sampling == 'proportional':  # every image once per epoch, i.e. shares = dataset sizes
+        # sizes: frames per source pass (the repeat-factor stream length where repeat factors are used)
+        if self.sampling == 'proportional':  # every frame once per epoch (rfs: every stream position)
             return WeightSchedule(self.names, sizes)
         return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec, epochs)
 
-    def resolve_epoch_size(self, sizes, schedule, epochs):
+    def resolve_epoch_size(self, sizes, schedule, epochs, stream=None):
         """Samples per epoch, fixed for the whole run (the training loop needs constant batches per epoch).
         epoch_size: <source name> (default: the target): sized so that over `epochs` epochs every frame of that source
           is sampled `epochs` times, whatever the weights and schedule -- i.e. --epochs means passes over that source,
           like training on it alone, and the other sources are added on top. Epoch = len(source) / its weight averaged
           over the run, so with a schedule raising its weight it gets fewer samples than that early on, more late.
         'total': as many samples as frames in all sources (the epoch of a pooled stock run, for equal budgets).
-        int: that many samples."""
+        int: that many samples.
+        stream: per-source pass lengths with repeat factors (default: sizes); a pass over the anchor source then
+        includes its repeated frames."""
         es = self.epoch_size
         if es is None or es == 'total':
             return int(sum(sizes))
@@ -197,7 +205,7 @@ class MixedConfig:
             k = self.names.index(es)
             mean_w = float(np.mean([schedule(e)[k] for e in range(max(epochs, 1))]))
             assert mean_w > 0, f'epoch_size source "{es}" has weight 0 throughout'
-            return max(int(round(sizes[k] / mean_w)), 1)
+            return max(int(round((stream or sizes)[k] / mean_w)), 1)
         assert int(es) > 0, 'epoch_size must be > 0'
         return int(es)
 
@@ -212,6 +220,26 @@ def source_cache_path(user_path, name, kind):
     if p.suffix == '.cache' and not p.is_dir():
         return str(p.with_name(f'{p.stem}.{name}.{kind}.cache'))
     return str(p / f'{name}.{kind}.cache')
+
+
+def repeat_factors(frame_classes, t):
+    """Repeat-factor sampling (LVIS, Gupta et al. 2019): frame i gets r_i = max(1, max over its classes c of sqrt(t / f_c)),
+    f_c = fraction of the source's frames containing c; frames without labels get 1. A class in fewer than t x frames
+    of its source is boosted (by the square root, so a class 100x below the threshold is repeated 10x, not 100x).
+    frame_classes: per frame, an array of its label classes. t <= 0: all 1 (off)."""
+    present = [np.unique(np.asarray(c, dtype=int)) for c in frame_classes]
+    r = np.ones(len(present))
+    if t <= 0 or not present:
+        return r
+    counts = np.bincount(np.concatenate(present + [np.zeros(0, dtype=int)]), minlength=1)
+    boost = np.maximum(1.0, np.sqrt(t / np.maximum(counts / len(present), 1e-12)))
+    return np.array([boost[p].max() if len(p) else 1.0 for p in present])
+
+
+def repeat_summary(name, t, r):
+    t = '' if t is None else f' (threshold {t:g})'
+    return (f'repeat factors {name}{t}: {np.mean(r > 1):.1%} of frames boosted, mean {r.mean():.2f}x, '
+            f'max {r.max():.1f}x, pass = {int(round(r.sum()))} samples for {len(r)} frames')
 
 
 def largest_remainder(weights, total):
@@ -287,8 +315,14 @@ class MixedSourceSampler(Sampler):
     epoch e is computed from (seed, config, e). __iter__ is called once per epoch on every rank (InfiniteDataLoader),
     and advances the counter; rebuild_loader() and resume set it with rewind() / start_epoch."""
 
-    def __init__(self, sizes, offsets, names, schedule, epoch_size, rank=-1, world_size=1, seed=0, start_epoch=0):
+    def __init__(self, sizes, offsets, names, schedule, epoch_size, rank=-1, world_size=1, seed=0, start_epoch=0,
+                 repeat=None):
+        """repeat: per source, None or its frames' repeat factors (repeat_factors()): each pass over the source then
+        holds frame i floor(r_i) times plus, for the fractional parts, a fixed number of extra copies drawn (seeded) in
+        proportion to them, so every pass has length round(sum(r))."""
         self.sizes, self.offsets, self.names = list(sizes), list(offsets), list(names)
+        self.repeat = list(repeat) if repeat is not None else [None] * len(self.sizes)
+        self.stream_len = [n if r is None else int(round(float(np.sum(r)))) for n, r in zip(self.sizes, self.repeat)]
         self.schedule, self.seed = schedule, int(seed)
         for n, size, used in zip(self.names, self.sizes, schedule.ever_positive()):
             if used and size == 0:
@@ -313,14 +347,24 @@ class MixedSourceSampler(Sampler):
             if len(self._perms) > 4 * len(self.sizes):
                 self._perms.clear()
             g = torch.Generator().manual_seed(stable_hash(self.seed, self.names[k], 'perm', cycle))
-            self._perms[(k, cycle)] = torch.randperm(self.sizes[k], generator=g).tolist()
+            r = self.repeat[k]
+            if r is None:
+                self._perms[(k, cycle)] = torch.randperm(self.sizes[k], generator=g).tolist()
+            else:  # repeat-factor pass: floor(r) copies of each frame + extra copies for the fractional parts
+                base = np.floor(r).astype(int)
+                frames = np.repeat(np.arange(len(r)), base)
+                extra = self.stream_len[k] - len(frames)
+                if extra > 0:
+                    frac = torch.tensor(r - base, dtype=torch.float64)
+                    frames = np.concatenate((frames, torch.multinomial(frac, extra, generator=g).numpy()))
+                self._perms[(k, cycle)] = frames[torch.randperm(len(frames), generator=g).numpy()].tolist()
         return self._perms[(k, cycle)]
 
     def _take(self, k, start, count):
         # `count` (index, aug_seed) pairs from source k's stream, from stream position `start`
         out = []
         for pos in range(start, start + count):
-            c, p = divmod(pos, self.sizes[k])
+            c, p = divmod(pos, self.stream_len[k])
             out.append((self._perm(k, c)[p] + self.offsets[k], stable_hash(self.seed, self.names[k], 'aug', c, p)))
         return out
 
@@ -351,6 +395,7 @@ class MixedSourceSampler(Sampler):
 
     def signature(self):  # stored in checkpoints: a different value on --resume means the data config changed
         return {'seed': self.seed, 'names': self.names, 'sizes': self.sizes, 'total': self.total,
+                'stream_len': self.stream_len,
                 'schedule': self.schedule.signature()}
 
     def plan(self, epochs, frames_per_sample=None, close_mosaic=0, objects_per_sample=None):
@@ -390,7 +435,13 @@ class MixedSourceSampler(Sampler):
             shares = []
             if frames_per_sample is not None:
                 u = loaded[k]
-                never = max(0.0, 1 - d / size) * math.exp(-(u - d) / size)  # partners miss a frame w.p. ~exp(-p/n)
+                rep = self.repeat[k]
+                if rep is None:  # sampled frames cycle through the source
+                    unsampled = max(0.0, 1 - d / size)
+                else:  # a frame with r copies in a pass of L is missed by the first d draws w.p. ~(1 - d / L)^r
+                    unsampled = float(np.mean((1 - min(d / self.stream_len[k], 1.0)) ** rep))
+                # partners (uniform, or by repeat factor) miss a frame w.p. ~exp(-partners / frames)
+                never = unsampled * math.exp(-(u - d) / size)
                 row += f'{fps[k]:>15.1f}{int(u):>15}{u / loaded.sum():>8.1%}{u / size:>13.1f}{never:>14.1%}'
                 shares.append(('frames loaded', u / loaded.sum()))
                 if d > 0 and never >= 0.01:
@@ -402,6 +453,9 @@ class MixedSourceSampler(Sampler):
             if d > 0 and any(not 1 / 1.5 < x / (d / total) < 1.5 for _, x in shares):
                 notes.append(f'{n}: {d / total:.0%} of the training, ' + ', '.join(f'{x:.0%} of the {what}'
                                                                                    for what, x in shares))
+        for n, rep in zip(self.names, self.repeat):
+            if rep is not None:
+                lines.append(f'  {repeat_summary(n, None, rep)}')
         if objects_per_sample is not None:
             lines.append('  objects/sample: measured on samples built with mosaic on (and separately for the '
                          '--close-mosaic epochs, included in objects)')
@@ -438,10 +492,17 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
                                                 resize=src.resize, fg_crop_prob=src.fg_crop_prob,
                                                 mosaic_max_cells=src.mosaic_max_cells))
     dataset = MixedDataset(datasets, cfg.names, cfg.target_idx)
-    schedule = cfg.schedule(dataset.sizes, epochs)
-    epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule, epochs)
+    # Repeat-factor sampling: sampled frames (sampler streams) and mosaic / mixup / paste-in partners (dataset) are
+    # both drawn in proportion to the repeat factors
+    repeat = [repeat_factors([l[:, 0] for l in d.labels], src.repeat_factor_threshold)
+              if src.repeat_factor_threshold > 0 else None for d, src in zip(datasets, cfg.sources)]
+    for d, r in zip(datasets, repeat):
+        d.partner_cum_weights = None if r is None else np.cumsum(r).tolist()
+    stream = [n if r is None else int(round(r.sum())) for n, r in zip(dataset.sizes, repeat)]
+    schedule = cfg.schedule(stream, epochs)
+    epoch_size = cfg.resolve_epoch_size(dataset.sizes, schedule, epochs, stream)
     sampler = MixedSourceSampler(dataset.sizes, dataset.offsets, cfg.names, schedule, epoch_size, rank=rank,
-                                 world_size=world_size, seed=seed, start_epoch=start_epoch)
+                                 world_size=world_size, seed=seed, start_epoch=start_epoch, repeat=repeat)
     if rank in [-1, 0]:
         s = f'sampling {cfg.sampling}, seed {sampler.seed}'
         if cfg.sampling == 'weighted' and len(schedule.points) > 1:
@@ -449,6 +510,9 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
         s += f'\n  target: {cfg.target.name}'
         s += '\n  resize: ' + ', '.join(f'{x.name}={x.resize}' for x in cfg.sources)
         s += '\n  cached: ' + (', '.join(n for n, d in zip(cfg.names, datasets) if d.imgs[0] is not None) or 'none')
+        for src, r in zip(cfg.sources, repeat):
+            if r is not None:
+                s += f'\n  {repeat_summary(src.name, src.repeat_factor_threshold, r)}'
         logger.info(f'{prefix}mixed sources: {s}')  # the sampler logs the per-source mix
 
     batch_size = min(batch_size, len(sampler))
@@ -516,6 +580,27 @@ def measure_sources(datasets, n=64, seed=0):
     return out
 
 
+def train_class_frames(data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
+    """Training frames containing each class, read from the label files of a data yaml dict's training data
+    (train: or train_sources:; each source's label folder)."""
+    from utils.datasets import img2label_paths
+    from utils.metrics import class_frames
+    if is_mixed(data_dict):
+        cfg = MixedConfig(dict(data_dict), label_folder_name)
+        parts = [(src.path, src.label_folder) for src in cfg.sources]
+    else:
+        parts = [(data_dict['train'], label_folder_name)]
+    labels = []
+    for path, folder in parts:
+        for lb in img2label_paths(list_images(path), folder):
+            try:
+                classes = [float(x.split()[0]) for x in Path(lb).read_text().splitlines() if x.strip()]
+            except OSError:
+                classes = []
+            labels.append(np.array(classes).reshape(-1, 1))
+    return class_frames(labels, int(data_dict['nc']))
+
+
 def list_images(path):
     # Image files a LoadImagesAndLabels(path) would read (before dropping corrupt ones), without reading them
     from utils.datasets import img_formats
@@ -580,9 +665,23 @@ if __name__ == '__main__':
         wh = np.median(wh, 0) if wh else np.array([opt.img_size, opt.img_size])
         scale = 1.0 if src.resize in ('fit', 'native') else src.resize
         ips.append(expected_images_per_sample(hyp, src.resize, opt.img_size, wh * scale, src.mosaic_max_cells))
-    schedule = cfg.schedule(sizes, opt.epochs)
+    repeat = []  # repeat factors from the label files
+    for src, f in zip(cfg.sources, files):
+        if src.repeat_factor_threshold <= 0:
+            repeat.append(None)
+            continue
+        from utils.datasets import img2label_paths
+        classes = []
+        for lb in img2label_paths(f, src.label_folder):
+            try:
+                classes.append([int(float(x.split()[0])) for x in Path(lb).read_text().splitlines() if x.strip()])
+            except OSError:
+                classes.append([])
+        repeat.append(repeat_factors(classes, src.repeat_factor_threshold))
+    stream = [n if r is None else int(round(r.sum())) for n, r in zip(sizes, repeat)]
+    schedule = cfg.schedule(stream, opt.epochs)
     sampler = MixedSourceSampler(sizes, np.cumsum([0] + sizes[:-1]).tolist(), cfg.names, schedule,
-                                 cfg.resolve_epoch_size(sizes, schedule, opt.epochs),
+                                 cfg.resolve_epoch_size(sizes, schedule, opt.epochs, stream), repeat=repeat,
                                  rank=0 if opt.world_size > 1 else -1,
                                  world_size=opt.world_size)
     print(f'sampling {cfg.sampling}, target {cfg.target.name}')
@@ -597,6 +696,10 @@ if __name__ == '__main__':
                                         label_folder_name=src.label_folder, resize=src.resize,
                                         fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells)
                     for src in cfg.sources]
+        for d, src in zip(datasets, cfg.sources):  # partners by repeat factor, as in training
+            if src.repeat_factor_threshold > 0:
+                d.partner_cum_weights = np.cumsum(repeat_factors([l[:, 0] for l in d.labels],
+                                                                 src.repeat_factor_threshold)).tolist()
         objects = measure_sources(datasets, opt.measure)
     print(sampler.plan(opt.epochs, ips, opt.close_mosaic, objects))
     if not opt.measure:

@@ -1,6 +1,8 @@
-# Experiment ladder, step 5 of 6 (see README.md): as step 4, plus source weighting.
-# Changes from step 4: the weights set each source's training share instead of its frame count. epoch_size: total
-# keeps the same samples per epoch as steps 2-4, so the same --epochs is the same training budget.
+# Experiment ladder, step 6 of 6 (see README.md): as step 5, plus repeat-factor sampling for rare classes.
+# Changes from step 5: frames containing classes rarer than repeat_factor_threshold (a fraction of the source's
+# frames) are sampled more often, by sqrt(threshold / class frequency), and so are their mosaic partners. Same training
+# shares and budget as step 5 (epoch_size: total). Only useful with several, unbalanced classes (with nc: 1 it does
+# nothing): run tools/class_audit.py first, and test with test.py --freq-groups to see rare / common / frequent mAP.
 
 # --- Classes -----------------------------------------------------------------------------------------------------------
 nc: 1
@@ -11,6 +13,7 @@ sampling: weighted
 resize: native
 fg_crop_prob: 0.5
 mosaic_max_cells: 6
+repeat_factor_threshold: 0.01  # classes in fewer than 1% of a source's frames are boosted
 
 # --- Sources -----------------------------------------------------------------------------------------------------------
 # weight: training share (relative, normalised): 50 / 30 / 20 = 50% / 30% / 20% of the training samples.

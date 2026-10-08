@@ -1,11 +1,16 @@
-# Stock YOLOv7 data loading: all cameras pooled into one dataset. Every image is equally likely, so the largest
-# dataset dominates (camA 35k : camB 7k : camC 2k -> ~80% : 16% : 4.5% of samples), mosaic partners come from any
-# camera, autoanchor runs on all of them and every image is resized to --img-size.
-# Baseline 2 of the experiment ladder, see README.md.
+# Experiment ladder, step 2 of 6 (see README.md): stock YOLOv7 data loading, all cameras pooled.
+# Changes from step 1: the other cameras are added. Stock pooling: every frame equally likely, so the largest dataset
+# dominates (camA 35k : camB 7k : camC 2k -> ~80% : 16% : 4.5% of the training), mosaic partners come from any camera,
+# autoanchor runs on all of them, and every frame is resized to --img-size.
+# Labels: --label-folder-name (the ladder script passes it).
+
+# --- Classes -----------------------------------------------------------------------------------------------------------
+nc: 1
+names: ['object']
+
+# --- Data --------------------------------------------------------------------------------------------------------------
 train:
   - /data/camA/images/train
   - /data/camB/images/train
   - /data/camC/images/train
 val: /data/camC/images/val   # validation (and best.pt) on the target camera only
-nc: 1
-names: ['object']

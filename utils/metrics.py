@@ -43,6 +43,34 @@ def area_bins(area_int):
     return bins
 
 
+# Class frequency groups (LVIS): by the number of training frames containing the class
+FREQ_GROUPS = (('rare', 1, 10), ('common', 11, 100), ('frequent', 101, float('inf')))
+
+
+def class_frames(labels, nc):
+    # number of frames containing each class; labels: per frame, an array whose first column is the class
+    return np.bincount(np.concatenate([np.unique(np.asarray(l)[:, 0].astype(int)) for l in labels if len(l)] +
+                                      [np.zeros(0, dtype=int)]), minlength=nc)[:nc]
+
+
+def ap_per_group(ap_class, ap50, ap, r, nt, frames):
+    """mAP and recall per class-frequency group (FREQ_GROUPS, plus classes absent from training). ap_class, ap50, ap,
+    r: per evaluated class (classes with validation labels), as from ap_per_class(); nt: validation labels per class;
+    frames: training frames containing each class (class_frames()). Returns a list of dicts."""
+    frames = np.asarray(frames)
+    groups = [('not in training', 0, 0)] + list(FREQ_GROUPS)
+    out = []
+    for name, lo, hi in groups:
+        in_group = (frames >= lo) & (frames <= hi)
+        idx = [i for i, c in enumerate(ap_class) if c < len(frames) and in_group[c]]
+        res = dict(name=name if hi == 0 else f'{name} ({lo}-{hi:g} frames)' if hi < float('inf') else f'{name} (>{lo - 1})',
+                   classes=int(in_group.sum()), evaluated=len(idx), labels=int(sum(nt[ap_class[i]] for i in idx)))
+        if idx:
+            res.update(map50=float(np.mean(ap50[idx])), map=float(np.mean(ap[idx])), r=float(np.mean(r[idx])))
+        out.append(res)
+    return out
+
+
 def ap_per_area(tp, conf, pred_cls, target_cls, pred_area, target_area, area_int, v5_metric=False):
     """ P, R, mAP@0.5 and mAP@0.5:0.95 per object-area bin, COCO style.
     # Arguments

@@ -11,10 +11,10 @@ from tqdm import tqdm
 
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader, parse_resize, delete_label_caches_at_exit, DEFAULT_LABEL_FOLDER
-from utils.mixed_data import MixedConfig, is_mixed
+from utils.mixed_data import MixedConfig, is_mixed, train_class_frames
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
-from utils.metrics import ap_per_class, ap_per_area, ConfusionMatrix
+from utils.metrics import ap_per_class, ap_per_area, ap_per_group, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
@@ -42,7 +42,8 @@ def test(data,
          trace=False,
          is_coco=False,
          v5_metric=False,
-         area_int=None):  # area cut points (px^2 of the original image) for per-area metrics
+         area_int=None,  # area cut points (px^2 of the original image) for per-area metrics
+         class_frames=None):  # training frames per class: report mAP per class-frequency group (rare/common/...)
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -260,6 +261,14 @@ def test(data,
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
 
+    # Print results per class-frequency group (training frames containing the class)
+    if class_frames is not None and nc > 1 and len(stats) and stats[0].any():
+        print(('%28s' + '%10s' * 3 + '%12s' * 3) % ('Class group', 'Classes', 'In val', 'Labels', 'R', 'mAP@.5',
+                                                    'mAP@.5:.95'))
+        for g in ap_per_group(ap_class, ap50, ap, r, nt, class_frames):
+            vals = ('%12.3g' * 3) % (g['r'], g['map50'], g['map']) if g['evaluated'] else ('%12s' * 3) % ('-', '-', '-')
+            print(('%28s' + '%10i' * 3) % (g['name'], g['classes'], g['evaluated'], g['labels']) + vals)
+
     # Print results per object area (px^2 of the original image)
     if area_results:
         print(('%20s' + '%12s' * 5) % ('Area', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95'))
@@ -341,6 +350,8 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--freq-groups', action='store_true',
+                        help='report mAP per class-frequency group (rare / common / frequent in the training labels)')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
                         help='object area cut points in px^2 of the original image for per-area metrics, '
                              'i.e. 300 650 1250 -> <300, 300<=A<650, 650<=A<1250, >=1250')
@@ -358,6 +369,8 @@ if __name__ == '__main__':
         delete_label_caches_at_exit()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
+    with open(opt.data) as f:
+        data_yaml = yaml.safe_load(f)
     print(opt)
     #check_requirements()
 
@@ -377,7 +390,8 @@ if __name__ == '__main__':
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
              v5_metric=opt.v5_metric,
-             area_int=opt.area_int
+             area_int=opt.area_int,
+             class_frames=train_class_frames(data_yaml, opt.label_folder_name) if opt.freq_groups else None
              )
 
     elif opt.task == 'speed':  # speed benchmarks

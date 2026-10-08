@@ -1,14 +1,25 @@
-# Multi-source machinery WITHOUT weighting: every image once per epoch (same source shares as 2_default_pooled),
-# images still resized to --img-size (resize: fit). Differences from 2_default_pooled:
-#   - mosaic / mixup partners come from the same source as the sampled image
+# Experiment ladder, step 3 of 6 (see README.md): multi-source loading, no weighting, frames resized.
+# Changes from step 2 (same training shares: every frame once per epoch):
+#   - mosaic / mixup / paste-in partners come from the same source as the sampled frame
 #   - samples are shuffled every epoch and reproducible with --seed (stock YOLOv7 does not shuffle on a single GPU)
 #   - autoanchor runs on the target only
-# Compare with 2_default_pooled to see what the machinery alone changes.
-sampling: proportional
-resize: fit
-train_sources:
-  - {name: camC, path: /data/camC/images/train, val: /data/camC/images/val, target: true}
-  - {name: camA, path: /data/camA/images/train}
-  - {name: camB, path: /data/camB/images/train}
+# Labels: --label-folder-name (the ladder script passes it), as in steps 1-2.
+
+# --- Classes -----------------------------------------------------------------------------------------------------------
 nc: 1
 names: ['object']
+
+# --- Defaults for every source -----------------------------------------------------------------------------------------
+sampling: proportional  # every frame once per epoch, as stock pooling
+resize: fit             # stock YOLOv7: long side resized to --img-size
+
+# --- Sources -----------------------------------------------------------------------------------------------------------
+train_sources:
+  - name: camC
+    path: /data/camC/images/train
+    val: /data/camC/images/val
+    target: true
+  - name: camA
+    path: /data/camA/images/train
+  - name: camB
+    path: /data/camB/images/train

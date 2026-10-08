@@ -34,7 +34,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
-from utils.metrics import area_fitness, area_bins, DEFAULT_FITNESS_WEIGHTS
+from utils.metrics import area_fitness, area_bins, class_frames, DEFAULT_FITNESS_WEIGHTS
 from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
@@ -296,6 +296,7 @@ def train(hyp, opt, device, tb_writer=None):
         data_signature = None
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
+    train_class_frames = class_frames(dataset.labels, nc) if nc > 1 else None  # for mAP per class-frequency group
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
     if distiller:  # e.g. a P6 teacher (stride 64) needs input sizes that are multiples of 64
         assert imgsz % distiller.stride == 0, f'--img-size {imgsz} must be a multiple of the teacher stride {distiller.stride}'
@@ -552,7 +553,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                  compute_loss=compute_loss,
                                                  is_coco=is_coco,
                                                  v5_metric=opt.v5_metric,
-                                                 area_int=opt.area_int)
+                                                 area_int=opt.area_int,
+                                                 class_frames=train_class_frames)
                 # Other sources' val sets (opt-in): forgetting / retention monitoring, not used for fitness
                 for name, loader in source_val:
                     logger.info(colorstr(f'val[{name}]: ') + 'not used for fitness')
