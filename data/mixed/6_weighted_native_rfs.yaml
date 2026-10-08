@@ -1,4 +1,4 @@
-# Experiment ladder, step 6 of 6 (see README.md): as step 5, plus repeat-factor sampling for rare classes.
+# Experiment ladder, step 6 of 6 (README.md, section 13): as step 5, plus repeat-factor sampling for rare classes.
 # Changes from step 5: frames containing classes rarer than repeat_factor_threshold (a fraction of the source's
 # frames) are sampled more often, by sqrt(threshold / class frequency), and so are their mosaic partners. Same training
 # shares and budget as step 5 (epoch_size: total). Only useful with several, unbalanced classes (with nc: 1 it does

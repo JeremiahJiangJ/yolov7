@@ -74,7 +74,7 @@ def train(hyp, opt, device, tb_writer=None):
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
-    # Multi-source training (`train_sources:` in the data yaml, see data/mixed/README.md); None: stock YOLOv7 data
+    # Multi-source training (`train_sources:` in the data yaml, see README.md, section 8); None: stock YOLOv7 data
     mixed = MixedConfig(data_dict, opt.label_folder_name) if is_mixed(data_dict) else None
     if mixed:
         assert not opt.image_weights, '--image-weights is not supported with train_sources'
@@ -756,7 +756,7 @@ if __name__ == '__main__':
                         help='keep label caches after training (default: delete them when the run ends or is stopped)')
     parser.add_argument('--train-cache-path', type=str, default=None,
                         help='train labels cache: a .cache file or a directory (train_sources: one file per source, '
-                             'see data/mixed/README.md); default: next to the labels')
+                             'see README.md, section 4); default: next to the labels')
     parser.add_argument('--test-cache-path', type=str, default=None,
                         help='val labels cache: a .cache file or a directory (train_sources: one file per source); '
                              'default: next to the labels')

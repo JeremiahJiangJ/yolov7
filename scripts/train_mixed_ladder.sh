@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Train the data/mixed experiment ladder with identical settings, to measure what each step changes
-# (see data/mixed/README.md):
+# (README.md, section 13):
 #   1 stock, target only -> 2 stock, pooled -> 3 multi-source, unweighted -> 4 native scale -> 5 weighted -> 6 + rfs
 # Steps 2-6 have the same samples per epoch (as many as frames in all sources), so the same --epochs is the same
 # training budget; step 1 (target only) uses EPOCHS_TARGET, scaled to match by default if you set it.

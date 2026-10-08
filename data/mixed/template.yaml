@@ -1,5 +1,5 @@
 # Multi-source training template: target camera C, supplementary cameras A and B.
-# Replace the paths, nc and names; everything else has a working default. See data/mixed/README.md.
+# Replace the paths, nc and names; everything else has a working default. See README.md, section 8.
 #
 # 1. Check the exposure plan (no training):
 #      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150 --img-size 1280 --close-mosaic 10 \
@@ -9,7 +9,7 @@
 #    on top, and so how long training takes. The plan also shows each source's share of the frames loaded and of the
 #    objects (add --measure 64): sources with smaller frames put more frames into each mosaic, and object density
 #    differs, so those shares can differ a lot from the training share. Adjust the weights if they do.
-#    Zoom range: set scale_min / scale_max in the hyp yaml (see data/mixed/README.md, "Scale augmentation").
+#    Zoom range: set scale_min / scale_max in the hyp yaml (README.md, section 9, "Scale augmentation").
 # 2. Train (crop size = deployment size, here 1280 for camera C):
 #      python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml \
 #        --data data/mixed/template.yaml --hyp data/hyp.finetune.sgd.yaml --epochs 150 \
@@ -17,7 +17,9 @@
 #        --fitness-metric-weights 0 0 1 0 --close-mosaic 10 --patience 30 \
 #        --train-cache-path ./cache/exp1 --test-cache-path ./cache/exp1 \
 #        --project runs/mixed --name camC_exp1
-# 3. Deploy at the native frame size: python detect.py --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280 ...
+# 3. Test: python test.py --data data/mixed/template.yaml --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280
+#    (--source camA: another source's val set; --freq-groups: rare / common / frequent classes; --area-int: per size)
+# 4. Deploy at the native frame size: python detect.py --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280 ...
 
 # --- Classes (same for every source) -----------------------------------------------------------------------------------
 nc: 1
@@ -29,11 +31,18 @@ resize: native          # native: never resized, objects keep their pixel size |
 fg_crop_prob: 0.5       # chance a mosaic tile / crop is placed around an object (else at random)
 mosaic_max_cells: 6     # max mosaic cells per axis for frames smaller than the tiles; lower if data loading is slow
 label_folder: labels    # /dir/images/x.jpg -> /dir/<label_folder>/x.txt
+# Off unless set (here or per source):
+# repeat_factor_threshold: 0.01  # rare classes: boost frames with classes in < 1% of the source's frames (section 10)
+# to_gray: 1.0                   # chance a training frame is converted to gray (section 12)
+# px_inversion_prob: 0.5         # IR: chance a training frame is inverted; needs inversion_border (section 12)
+# inversion_border: {top: 0, bottom: 0, left: 0, right: 0}   # border px left un-inverted (original frame)
 
 # --- Sources -----------------------------------------------------------------------------------------------------------
 # weight: training share (relative, normalised): 30 / 40 / 30 = 30% / 40% / 30% of the training samples.
 train_sources:
   # Target: exactly one. Its val set drives best.pt / --patience / fitness; autoanchor uses its objects.
+  # path / val can be lists: the folders are pooled into one source, as stock YOLOv7 pools train: [a, b]
+  # (e.g. two target-camera datasets: path: [/data/camC_site1/images/train, /data/camC_site2/images/train]).
   - name: camC
     path: /data/camC/images/train
     val: /data/camC/images/val
@@ -60,8 +69,8 @@ train_sources:
   #   resize: 0.5
   #   label_folder: labels_synth
 
-  # IR camera with both polarities wanted at deployment, and RGB frames as extra data (see README, "IR polarity and
-  # grayscale"). inversion_border is required when px_inversion_prob > 0: the black border, in original pixels, that
+  # IR camera with both polarities wanted at deployment, and RGB frames as extra data (README.md, section 12).
+  # inversion_border is required when px_inversion_prob > 0: the black border, in original pixels, that
   # inversion leaves alone (all 0 if none). test.py --invert tests the other polarity.
   # - name: ir
   #   path: /data/ir/images/train
@@ -73,7 +82,7 @@ train_sources:
   #   weight: 10
   #   to_gray: 1.0                                               # chance a training frame is converted to gray
 
-# --- Weight schedule (optional) -----------------------------------------------------------------------------------------
+# --- Weight schedule (optional) ----------------------------------------------------------------------------------------
 # The weights above apply from the start. Front-loaded: broad mix first so the large sources are covered, then shift
 # towards the target. Keep a floor on the other sources (here 30%) so they are not forgotten late in training.
 # progress: fraction of --epochs (the schedule scales with the run length); or use epoch: <n>.
@@ -83,7 +92,7 @@ weight_schedule:
   points:
     - {progress: 0.6, weights: {camC: 70, camA: 10, camB: 20}}
 
-# --- Epoch size (optional) ----------------------------------------------------------------------------------------------
+# --- Epoch size (optional) ---------------------------------------------------------------------------------------------
 # target (default): --epochs = passes over the target, whatever the weights and schedule (one epoch is on average one
 #   pass over camC plus the other sources' share).
 # total: as many samples per epoch as frames in all sources (the budget of a pooled stock run, for equal-budget

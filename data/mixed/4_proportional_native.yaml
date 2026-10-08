@@ -1,7 +1,7 @@
-# Experiment ladder, step 4 of 6 (see README.md): as step 3, at native scale.
+# Experiment ladder, step 4 of 6 (README.md, section 13): as step 3, at native scale.
 # Changes from step 3: frames are never resized, so objects keep their pixel size; --img-size becomes the training crop
 # size, mosaics use the native layout (random / object-aware placement, fill mosaic for small frames) and validation
-# runs on full frames padded to a multiple of 32. Test native models at their native frame size (see README.md).
+# runs on full frames padded to a multiple of 32. Test native models at their native frame size (README.md, section 9).
 
 # --- Classes -----------------------------------------------------------------------------------------------------------
 nc: 1

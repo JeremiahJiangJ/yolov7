@@ -1,4 +1,4 @@
-# Experiment ladder, step 5 of 6 (see README.md): as step 4, plus source weighting.
+# Experiment ladder, step 5 of 6 (README.md, section 13): as step 4, plus source weighting.
 # Changes from step 4: the weights set each source's training share instead of its frame count. epoch_size: total
 # keeps the same samples per epoch as steps 2-4, so the same --epochs is the same training budget.
 

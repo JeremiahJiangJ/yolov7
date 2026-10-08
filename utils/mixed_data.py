@@ -1,6 +1,6 @@
 # Multi-source training data: weighted sampling over several datasets ("sources"), one of which is the target.
 #
-# Enabled by a `train_sources:` list in the data yaml (see data/mixed/README.md). A plain `train:` / `val:` data yaml
+# Enabled by a `train_sources:` list in the data yaml (see README.md, section 8). A plain `train:` / `val:` data yaml
 # keeps the stock YOLOv7 pipeline.
 #
 # Each source is its own LoadImagesAndLabels, so mosaic / mixup / paste-in partners come from the SAME source as the

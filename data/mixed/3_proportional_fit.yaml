@@ -1,4 +1,4 @@
-# Experiment ladder, step 3 of 6 (see README.md): multi-source loading, no weighting, frames resized.
+# Experiment ladder, step 3 of 6 (README.md, section 13): multi-source loading, no weighting, frames resized.
 # Changes from step 2 (same training shares: every frame once per epoch):
 #   - mosaic / mixup / paste-in partners come from the same source as the sampled frame
 #   - samples are shuffled every epoch and reproducible with --seed (stock YOLOv7 does not shuffle on a single GPU)

@@ -1,4 +1,4 @@
-# Experiment ladder, step 1 of 6 (see README.md): stock YOLOv7 data loading, target camera only.
+# Experiment ladder, step 1 of 6 (README.md, section 13): stock YOLOv7 data loading, target camera only.
 # A plain train: / val: data yaml, so every YOLOv7 default applies: frames resized to --img-size, stock mosaic, no
 # source weighting, no shuffling on a single GPU. Labels: --label-folder-name (the ladder script passes it).
 
