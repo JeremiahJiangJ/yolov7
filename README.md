@@ -782,9 +782,10 @@ at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-poin
   3 px) for strong warps; YOLOv7's OTA loss backpropagates through warped labels into the warp parameters.
 - An `input` DEC with mosaic tiles, `warp_aug`, the size target, `det_grad_epochs` and `lr_scale` trains end to end
   (2 epochs: strongest local zoom 2.8x), writes the warp plots, and seeded runs are reproducible.
-- Not yet verified: a training run combining `input` and `P3-P5` (the first attempt ran out of memory on a 15 GB CPU
-  machine at `canon_size: 320`, before `canon_size: 224` and `eq_regions` were added), and `test.py` / `detect.py` on
-  checkpoints of this version.
+- `input` + `P3-P5` together train end to end (2 epochs: every DEC leaves the identity, strongest local zoom
+  2.3-2.9x; warp plots per DEC). At `canon_size: 320` this peaked at 11.5 GB on CPU with batch 8 (training process and
+  data workers): several DECs are costly; the defaults are now `canon_size: 224` and `eq_regions: 32`.
+- Not yet verified: `test.py` / `detect.py` on checkpoints of this version, and the memory at the new defaults.
 - Labels warped with gradients are the correct gradient; a test on a weakly trained detector found no measurable pull
   towards the identity with detached labels either, so they are not shown to cause the identity basin.
 
