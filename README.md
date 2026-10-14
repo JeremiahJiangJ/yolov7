@@ -52,7 +52,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | A bigger model to guide tiny | `--teacher yolov7.pt` | [11](#11-knowledge-distillation) |
 | IR white-hot and black-hot | `px_inversion_prob:` + `inversion_border:` in the data yaml, `test.py --invert` | [12](#12-ir-polarity-inversion-and-grayscale) |
 | RGB data supplementing IR | `to_gray: 1.0` on the RGB source | [12](#12-ir-polarity-inversion-and-grayscale) |
-| Objects at very different sizes in one frame (near / far) | `--lse data/lse/input.yaml` | [14](#14-local-scale-equivariance) |
+| Objects whose apparent size changes as they move (near / far) | `--lse data/lse/input.yaml` | [14](#14-local-scale-equivariance) |
 
 ## Contents
 
@@ -71,7 +71,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
 | 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
-| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--lse data/lse/{input,latent_tiny}.yaml` | `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py` |
+| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--lse data/lse/{input,stages}.yaml` | `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
@@ -690,78 +690,107 @@ Each step changes one thing, so comparing neighbours isolates its effect:
 
 ## 14. Local scale equivariance
 
-**Purpose.** Objects of the same kind appear at very different pixel sizes within one frame (near vs far from the
-camera). Local scale equivariance (after Rahman et al., "Local Scale Equivariance with Latent Deep Equilibrium
-Canonicalizer", ICCV 2025) adds a small **canonicalizer** that, per image, picks a smooth warp rescaling parts of the
-image differently (e.g. magnifying a distant region), so the detector sees objects at a more uniform, "canonical"
-scale. Predictions are mapped back, so boxes are always in image pixels.
+**Purpose.** The same kind of object appears at very different sizes as it moves towards or away from the camera.
+Local scale equivariance (after Rahman et al., "Local Scale Equivariance with Latent Deep Equilibrium Canonicalizer",
+ICCV 2025) adds **deep equilibrium canonicalizers (DECs)**: small networks that pick, per frame, a smooth warp that
+rescales parts of the frame differently, so the detector sees objects at a more uniform, "canonical" scale. Boxes are
+always reported in image pixels.
 
-**Usage.** `train.py --lse data/lse/input.yaml` (or `data/lse/latent_tiny.yaml`). The checkpoint keeps the
-canonicalizer: `test.py`, `detect.py` and fine-tuning from it need no flag. Both modes start as the identity (the
-canonicalizer's output layer is zero), so `--weights yolov7-tiny.pt --lse ...` starts from exactly the pretrained
-detector.
+**Usage.** `train.py --lse data/lse/input.yaml` (or `data/lse/stages.yaml`, or your own). The checkpoint keeps the
+canonicalizers: `test.py`, `detect.py` and fine-tuning from it need no flag. Every DEC starts as the identity (its output
+layer is zero), so `--weights yolov7-tiny.pt --lse ...` starts from exactly the pretrained detector.
 
-| Mode | What is warped | Detector | Boxes |
-|---|---|---|---|
-| `input` | the image | unchanged, runs on the canonical image; labels are warped into it for training | mapped back to the image after the forward pass |
-| `latent` | feature maps of whole backbone stages (`spans`), warped back before the stage output is used | stages run in the canonical frame; the head gets the local scale (zero-initialised 1x1 convs) | already in image pixels |
+**Where (`decs`).** Any combination, each entry with its own canonicalizer:
 
-Config keys (`data/lse/*.yaml`, commented): `mode`, `grid` (knots per axis, default 8: 7 x 7 cells), `max_zoom`
-(largest ratio between the most magnified and most shrunk cell of a row / column, default 4), `canon_size` (long side
-of the image the canonicalizer sees, default 320), `channels`, `iters` / `grad_iters` (fixed-point iterations, of
-which the last are backpropagated), `eq_weight` / `eq_strength` (consistency loss), `prior_weight` (pull towards the
-identity), `spans` (latent), `min_conf` (input mode inference).
+| Entry | Warps | Effect |
+|---|---|---|
+| `input` | the image | the unchanged detector runs on the canonical image; labels are warped into it for training, predicted boxes are mapped back |
+| `P1` ... `P6` | the backbone stage starting at the stride-2^k downsampling layer, up to the next one (found from the model; yolov7-tiny: P1 `[0, 0]`, P2 `[1, 7]`, P3 `[8, 14]`, P4 `[15, 21]`, P5 `[22, 28]`; yolov7: P1 `[1, 2]` ... P5 `[38, 50]`) | the stage runs in its canonical frame: its inputs are warped on entry, its output is warped back before it is used; the head gets every stage's local scale (zero-initialised 1x1 convs) |
+| `[first, last]` | an explicit span of layers | as `Pk` (checked at start-up: after the span, only its last layer may be read) |
 
-Training logs, per epoch, the consistency loss, the prior, the mean warp displacement (fraction of the image) and the
-strongest local magnification / shrinking (`lse.txt`, TensorBoard `lse/*`). In input mode `train_batch0_lse.jpg` ...
-show the canonical images with their warped labels.
+E.g. `[input]`, `[P3]`, `[P3, P4, P5]`, `[input, P1, P2, P3, P4, P5]`. Stage DECs look at the detector's input image
+(after the input DEC, if any), as in the paper. `input` keeps the detector, its pretrained weights and export unchanged;
+stage DECs change the backbone's computation, cost more (warping feature maps) and add head inputs.
 
-**Which mode.** `input` keeps the detector, its pretrained weights and export unchanged and is equivariant by
-construction (up to the canonicalizer's consistency): start there. `latent` is closer to the paper (canonicalization
-inside the network); it changes the backbone's computation and the head's input, costs more (warping and un-warping
-feature maps at three resolutions) and its spans are model specific.
+**Mosaic.** A warp assumes one scene. The data loaders record each frame's rectangle in a sample (through mosaic,
+mosaic9, the native-scale mosaic and crops, the affine augmentation and flips), and with `per_tile: true` (default)
+each frame tile is canonicalized on its own and warped inside its rectangle only (a warp maps its rectangle onto
+itself, so tiles still meet at the seams). Mixup blends two scenes: those samples are warped as one image (a warning
+is logged; set `mixup: 0`). Rotation / shear / perspective turn tiles into non-rectangles: keep them 0. Alternatively
+train in two stages, as the paper's transformers effectively did: stage 1 without `--lse`, stage 2 fine-tuned from it
+with `--lse` and `--hyp data/hyp.finetune.lse.yaml` (no mosaic, mixup, paste-in).
 
-**Implementation (`utils/lse.py`, hooks in `models/yolo.py`).**
-- Warp family: a coarse grid of monotone knots (cell widths = softmax of bounded parameters; `max_zoom` bounds the
-  local zoom). A canonical point (u, v) samples the input at y = gy(u, v), x = gx(u, y). Evaluating gx at the input
-  row y (rather than at v) makes the Jacobian determinant gx_u * gy_v positive everywhere: the warp never folds, and
-  its inverse is two exact 1-D inversions. (The paper's family evaluates gx at v; with neighbouring rows rescaled
-  differently it folded 0.5-3% of the image in tests, making labels and features impossible to map consistently.)
-- Canonicalizer: a small conv net looks at the canonical image and updates the warp parameters,
-  phi <- phi + delta(warp(image, phi)), for `iters` iterations (a truncated deep-equilibrium solve, no extra
-  dependency); only the last `grad_iters` are backpropagated. Because delta only sees the canonical image, the
-  parameters that map a rescaled image to the same canonical image are a fixed point too: equivariance by
-  construction, as far as the warp family is closed under composition. It runs on a downscaled copy of the image, in
-  fp32 outside autocast.
-- Training loss = detection loss (in the canonical frame for `input`; gradients reach the canonicalizer through the
-  warp) + `eq_weight` x consistency (the canonical image of a randomly rescaled image must equal that of the image;
-  this, not "canonical = as captured", defines the canonical form) + `prior_weight` x (tanh phi)^2. Labels are warped
-  without gradients.
-- Boxes are mapped side by side: each side goes where the warp moves its midpoint. Mapping a box to the canonical
-  frame and back returns it (median error 0.6 px for moderate warps), unlike the bounding box of the warped outline,
-  which grows at every mapping.
-- Latent spans are checked at start-up: a span's layers may only read its input or earlier layers of the span, and
-  later layers only its last layer. yolov7-tiny: `[[8, 14], [15, 21], [22, 28]]` (the stages ending at the P3 / P4 /
-  P5 taps).
-- `test.py` / `detect.py` do not trace LSE models (the canonicalizer is data dependent).
+**Losses.** Detection loss (gradients reach the canonicalizers through the warps; for `input`, labels are warped *with*
+gradients, so moving content together with its boxes costs nothing and only the effect of scale on detection remains)
+\+ `eq_weight` x consistency (the canonical frame of a randomly rescaled frame must equal that of the frame: this
+defines the canonical form, and the identity does not minimise it) + `size_weight` x size target (optional: objects at
+`target_size` pixels in the canonical frame, a canonical form defined by the labels; at test time the warp is still
+predicted from the image alone) + `prior_weight` x pull towards the identity (default 0).
+
+**Against the identity basin.** A detector trained on unwarped images (e.g. pretrained on COCO) is a local minimum at
+the identity warp: any warp is a distribution shift, the detection loss rises and pushes back. Remedies, all in the
+config: `warp_aug` (randomly rescale frames of the detector input, labels following, so the detector stops being
+penalised by warps; try 0.5), `det_grad_epochs` (first epochs: canonicalizers learn from their own losses only),
+`lr_scale` (canonicalizer learning rate = lr0 x lr_scale; the templates use 10, as the paper's DEM), `size_weight`
+(a direct signal towards a useful warp), `prior_weight: 0`. Check the warp plots and `lse.txt` (`zoom_in` /
+`zoom_out` above 1, `disp` above 0) before judging the detector.
+
+**Comparing.** Compare with and without `--lse` under the same augmentation, seeds and budget (README section 6:
+`--area-int` for per-size AP). Scale augmentation and mosaic already teach some robustness to object size, so the
+margin of LSE is expected to be largest when they are weak or off.
+
+**Monitoring.** Per epoch, per DEC: consistency, size and prior losses, mean warp displacement and the strongest local
+zoom in / out (`lse.txt`, TensorBoard `lse/*`); warp plots on 4 fixed validation images, `lse/<dec>/epoch_*.jpg` (the
+image with the canonical grid drawn on it, the local zoom (red magnified, blue shrunk) and the canonical image; also in
+TensorBoard), and `lse/<dec>_progress.jpg`, the first image's warp grid over the epochs. `train_batch*_lse.jpg`: what
+the detector sees with an input DEC, with its labels.
+
+Config keys (`data/lse/*.yaml`, commented): `decs`, `per_tile`, `grid` (knots per axis, 8: 7 x 7 cells), `max_zoom`
+(largest ratio between the most magnified and most shrunk cell of a row / column, 4), `canon_size` (each frame is seen
+at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-point iterations, the last backpropagated),
+`lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`, `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`,
+`det_grad_epochs`, `min_conf`.
+
+**Implementation (`utils/lse.py`, hooks in `models/yolo.py`, tile tracking in `utils/datasets.py`).**
+- Warp family: a coarse grid of monotone knots per region (cell widths = softmax of bounded parameters; `max_zoom`
+  bounds the local zoom). A canonical point (u, v) samples the input at y = gy(u, v), x = gx(u, y). Evaluating gx at
+  the input row y (rather than at v, as in the paper's family) makes the Jacobian determinant gx_u * gy_v positive
+  everywhere: the warp never folds, and its inverse is two exact 1-D inversions. (The paper's family folded 0.5-3% of
+  the image in tests when neighbouring rows were rescaled differently, making labels and features impossible to map
+  consistently.)
+- Canonicalizer: a small conv net looks at the canonical frame and updates the warp parameters,
+  phi <- phi + delta(warp(frame, phi)), for `iters` iterations (a truncated deep-equilibrium solve, no extra
+  dependency); only the last `grad_iters` are backpropagated. Because delta only sees the canonical frame, the
+  parameters that map a rescaled frame to the same canonical frame are a fixed point too (equivariance by construction,
+  as far as the warp family is closed under composition). Updates are centred per row / column (a constant changes
+  nothing), so the parameters do not drift into the flat part of tanh. It runs in fp32 outside autocast.
+- Regions: per image, the frame rectangles of the sample (or the whole image); crops resized to canon_size go to the
+  canonicalizer, the sampling grid is assembled region by region. Boxes are assigned to the region containing their
+  centre and mapped side by side (each side where the warp moves its midpoint), so mapping a box to the canonical frame
+  and back returns it (median error 0.7 px), unlike the bounding box of the warped outline, which grows at every
+  mapping.
+- Stage spans are found from each backbone layer's output stride (a dummy forward). Inside a span, inputs from earlier
+  layers are warped on entry (so blocks that read several earlier layers, as in yolov7's downsampling blocks, work).
+- `test.py` / `detect.py` do not trace LSE models (the canonicalizers are data dependent).
 
 **Checked** (CPU, synthetic data)
-- At initialisation an LSE model gives the plain detector's outputs (input mode: boxes within 1.5e-4 px; latent:
-  3e-5), and gradients reach every LSE parameter; the stock pipeline (no `--lse`) is unchanged.
-- Geometry: the inverse map is exact (error 3e-7 of the image) at all tested warp strengths; un-warping a warped image
-  leaves a mean error of 0.003-0.005 (interpolation); a box mapped to the canonical frame and back returns within a
-  median 0.6 px (moderate warps) / 3 px (strong).
-- Both modes train end to end (2 epochs; warps grow from the identity to ~1.5x local zoom), save, reload, test and
-  detect; fine-tuning from an LSE checkpoint without `--lse` keeps the canonicalizer; seeded runs are reproducible.
-- The canonicalizer alone, trained on the consistency loss on synthetic scenes, learns to undo random local rescalings
-  of held-out images: the canonical-image mismatch fell to 61% of the raw mismatch after 1500 steps and was still
-  falling (an oracle that knows the exact inverse reaches 2%). It learns, slowly: give it enough training, and check
-  `lse.txt` (`eq` falling, `zoom_in` / `zoom_out` above 1) before judging the detector.
+- At initialisation, every placement (`input`, `P3`, `P3-P5`, `input` + `P1-P5`, explicit spans; yolov7-tiny and
+  yolov7) gives the plain detector's outputs (within 1.2e-4), also with mosaic tiles; the stock pipeline (no `--lse`)
+  is unchanged; after one step every canonicalizer parameter receives gradients.
+- Geometry: the inverse is exact (3e-7); warping with identity parameters is exact (3e-5); per-tile warps keep every
+  tile on its side of the seams; a box mapped to the canonical frame and back returns within a median 0.7 px (95%:
+  3 px) for strong warps; YOLOv7's OTA loss backpropagates through warped labels into the warp parameters.
+- An `input` DEC with mosaic tiles, `warp_aug`, the size target, `det_grad_epochs` and `lr_scale` trains end to end
+  (2 epochs: strongest local zoom 2.8x), writes the warp plots, and seeded runs are reproducible.
+- Not yet verified: a training run combining `input` and `P3-P5` (the first attempt ran out of memory on a 15 GB CPU
+  machine at `canon_size: 320`, before `canon_size: 224` and `eq_regions` were added), and `test.py` / `detect.py` on
+  checkpoints of this version.
+- Labels warped with gradients are the correct gradient; a test on a weakly trained detector found no measurable pull
+  towards the identity with detached labels either, so they are not shown to cause the identity basin.
 
-**Limitations.** Not supported: `train_aux.py`, `--teacher` with `input` mode (the student predicts in the canonical
-frame; `latent` works), test-time augmentation with the validation loss, `export.py`. Not yet tested on GPU or real
-data: whether and how much it helps your cameras is an experiment (compare with the same seeds and budget, per area
-bin).
+**Limitations.** Not supported: `train_aux.py`, `--teacher` with an `input` DEC (the student predicts in the canonical
+frame; stage DECs work), `--quad`, test-time augmentation with the validation loss, `export.py`. Stage DECs need a
+`Detect` / `IDetect` head. Not yet tested on GPU or real data: whether and how much it helps is an experiment.
 
 ---
 
@@ -795,7 +824,7 @@ All on CPU with synthetic data (generated frames with known objects; real camera
 - Resumed runs are not bit-identical to uninterrupted ones (fp16 checkpoints).
 - `--evolve` is untested with the new options, and `--fitness-area-weights` is refused with it.
 - Repeat-factor sampling is only available through a multi-source data yaml (a single source works).
-- Local scale equivariance (section 14): not in `train_aux.py` or `export.py`; input mode not with `--teacher`.
+- Local scale equivariance (section 14): not in `train_aux.py` or `export.py`; an input DEC not with `--teacher`.
 
 ## Citation
 

@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from threading import Thread
 
+import cv2
 import numpy as np
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,8 +26,10 @@ import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
+from utils.datasets import letterbox
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
+from utils.lse import plot_warps
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
     usage_report, measure_sources
 from utils.distill import Distiller
@@ -116,10 +119,16 @@ def train(hyp, opt, device, tb_writer=None):
             model.attach_lse(opt.lse)
     lse = getattr(model, 'lse', None)  # local scale equivariance (README.md, section 14)
     if lse is not None:
-        logger.info(colorstr('lse: ') + f"local scale equivariance, mode {lse.mode}: " +
-                    ', '.join(f'{k}={v}' for k, v in lse.cfg.items()))
-        assert not (opt.teacher and lse.mode == 'input'), \
-            '--teacher with LSE input mode is not supported (the student predicts in the canonical frame)'
+        logger.info(colorstr('lse: ') + f"canonicalizers {lse.names} (stage spans {lse.spans}): " +
+                    ', '.join(f'{k}={v}' for k, v in lse.cfg.items() if k != 'decs'))
+        assert not (opt.teacher and lse.has_input), \
+            '--teacher with an input canonicalizer is not supported (the student predicts in the canonical frame)'
+        if hyp.get('mixup', 0) > 0:
+            logger.warning(colorstr('lse: ') + 'mixup blends two scenes: those samples are canonicalized as one image '
+                                               '(set mixup: 0 for one warp per frame throughout)')
+        if any(hyp.get(k, 0) for k in ('degrees', 'shear', 'perspective')):
+            logger.warning(colorstr('lse: ') + 'rotation / shear / perspective augmentation: frame tiles are '
+                                               'approximated by their bounding rectangles')
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -147,6 +156,8 @@ def train(hyp, opt, device, tb_writer=None):
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in model.named_modules():
+        if k.startswith('lse'):  # canonicalizers: own group below (lr_scale)
+            continue
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
             pg2.append(v.bias)  # biases
         if isinstance(v, nn.BatchNorm2d):
@@ -217,7 +228,11 @@ def train(hyp, opt, device, tb_writer=None):
 
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    if lse is not None:  # canonicalizers, at lr0 x lr_scale
+        optimizer.add_param_group({'params': list(lse.parameters()), 'lr': hyp['lr0'] * lse.cfg['lr_scale'],
+                                   'weight_decay': hyp['weight_decay']})
+    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)) +
+                (f', {len(list(lse.parameters()))} canonicalizer (lr x {lse.cfg["lr_scale"]})' if lse is not None else ''))
     del pg0, pg1, pg2
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
@@ -319,6 +334,7 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Process 0
     source_val = []  # [(name, loader)] of non-target sources with a val path: reported, never used for fitness
+    lse_vis, lse_progress = None, {}  # fixed validation images for the LSE warp plots, warp grids per epoch
     if rank in [-1, 0]:
         if mixed:  # target validation drives fitness / best.pt
             testloader = create_val_dataloader(mixed.target, imgsz_test, batch_size * 2, gs, opt, hyp=hyp,
@@ -371,6 +387,19 @@ def train(hyp, opt, device, tb_writer=None):
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
+    if lse is not None and rank in [-1, 0] and plots:
+        ims, rects = [], []
+        for f in getattr(testloader.dataset, 'img_files', [])[:4]:
+            im = cv2.imread(f)
+            if im is None:
+                continue
+            lb, ratio, (dw, dh) = letterbox(im, imgsz_test, auto=False)
+            ims.append(lb[:, :, ::-1])
+            H, W = lb.shape[:2]  # the frame without the letterbox bars, as training canonicalizes it
+            rects.append(torch.tensor([[dw / W, dh / H, 1 - dw / W, 1 - dh / H]]))
+        if ims:
+            lse_vis = torch.from_numpy(np.stack(ims).transpose(0, 3, 1, 2).copy()).float() / 255, rects
+
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
@@ -447,7 +476,9 @@ def train(hyp, opt, device, tb_writer=None):
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        if lse is not None:
+            (model.module if is_parallel(model) else model).lse.epoch = epoch  # det_grad_epochs warm-up
+        for i, (imgs, targets, paths, extras) in pbar:  # batch -------------------------------------------------------------
             if not opt.quad:  # per-source usage (quad batches merge images)
                 n_obj = np.bincount(targets[:, 0].long().numpy(), minlength=len(paths))
                 for j, f in enumerate(paths):
@@ -478,7 +509,8 @@ def train(hyp, opt, device, tb_writer=None):
             # Forward
             with amp.autocast(enabled=cuda):
                 if lse is not None:  # targets come back in the frame of the predictions (warped in input mode)
-                    pred, targets_l, loss_lse, lse_stats = model(imgs, lse_targets=targets.to(device))
+                    tiles = list(extras) if all(torch.is_tensor(t) for t in extras) else None  # frame rectangles
+                    pred, targets_l, loss_lse, lse_stats = model(imgs, lse_targets=targets.to(device), lse_tiles=tiles)
                 else:
                     pred, targets_l = model(imgs), targets.to(device)  # forward
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
@@ -524,8 +556,9 @@ def train(hyp, opt, device, tb_writer=None):
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-                    if lse is not None and lse.mode == 'input' and ni < 3:  # what the detector sees, with its labels
-                        ci, ct = (model.module if is_parallel(model) else model).lse.preview(imgs, targets.to(device))
+                    if lse is not None and lse.has_input and ni < 3:  # what the detector sees, with its labels
+                        ci, ct = (model.module if is_parallel(model) else model).lse.preview(imgs, targets.to(device),
+                                                                                             tiles)
                         Thread(target=plot_images, args=(ci.cpu(), ct.cpu(), paths, save_dir / f'train_batch{ni}_lse.jpg'),
                                daemon=True).start()
                     # if tb_writer:
@@ -549,8 +582,9 @@ def train(hyp, opt, device, tb_writer=None):
 
         if lse is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
-            logger.info(colorstr('lse: ') + f'{line} (eq: consistency, disp: mean warp displacement, zoom_in / '
-                                             f'zoom_out: strongest local magnification / shrinking)')
+            logger.info(colorstr('lse: ') + f'{line} (per canonicalizer: eq consistency, size target, disp mean warp '
+                                             f'displacement, zoom_in / zoom_out strongest local magnification / '
+                                             f'shrinking)')
             with open(save_dir / 'lse.txt', 'a') as f:
                 f.write(f'epoch {epoch}: {line}\n')
             for k, v in mlse.items():
@@ -558,6 +592,19 @@ def train(hyp, opt, device, tb_writer=None):
                     tb_writer.add_scalar(f'lse/{k}', v, epoch)
                 if wandb_logger.wandb:
                     wandb_logger.log({f'lse/{k}': v})
+            if plots and lse_vis is not None:  # warp progression on fixed validation images: lse/<dec>/epoch_*.jpg
+                for name, (panel, overlay) in plot_warps(ema.ema.lse, lse_vis[0].to(device), lse_vis[1]).items():
+                    d = save_dir / 'lse' / name
+                    d.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(d / f'epoch_{epoch:03d}.jpg'), panel)
+                    lse_progress.setdefault(name, []).append((epoch, overlay))
+                    keep = lse_progress[name]  # strip of the first image's warp grid over the epochs (up to 10)
+                    pick = [keep[round(j * (len(keep) - 1) / 9)] for j in range(10)] if len(keep) > 10 else keep
+                    strip = [cv2.putText(o.copy(), f'epoch {e}', (5, o.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                         (255, 255, 255), 1, cv2.LINE_AA) for e, o in pick]
+                    cv2.imwrite(str(save_dir / 'lse' / f'{name}_progress.jpg'), np.hstack(strip))
+                    if tb_writer:
+                        tb_writer.add_image(f'lse/{name}', panel[:, :, ::-1].copy(), epoch, dataformats='HWC')
 
         if distiller and rank in [-1, 0]:  # not part of results.txt (fixed columns), see TensorBoard train/distill_*
             logger.info(f'distill loss (box, obj, cls): {", ".join(f"{x:.4g}" for x in mkd.tolist())} '

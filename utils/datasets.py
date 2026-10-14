@@ -741,6 +741,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
+        # Frame rectangles (pixel xyxy) of the sample, kept through augmentation: each one shows a single frame (for
+        # utils/lse.py, which canonicalizes each frame of a mosaic on its own). Training samples return them, normalised.
+        self._tiles = []
         mosaic = self.mosaic and random.random() < hyp['mosaic']
         if mosaic:
             # Load mosaic
@@ -749,6 +752,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             else:
                 img, labels = load_mosaic9(self, index)
             shapes = None
+            tiles, self._tiles = self._tiles, []  # the partner mosaic of mixup must not add to them
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < hyp['mixup']:
@@ -759,6 +763,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
+                tiles = []  # two scenes blended: no frame rectangles (treated as one image)
+            self._tiles = tiles
 
         elif self.augment and not self.rect and self.resize != 'fit':
             # Native / fixed scale training without mosaic: an img_size crop of the frame, not a downscaled frame
@@ -773,6 +779,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            self._tiles = [[pad[0], pad[1], pad[0] + ratio[0] * w, pad[1] + ratio[1] * h]]
 
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
@@ -787,7 +794,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                                                  scale=hyp['scale'],
                                                  shear=hyp['shear'],
                                                  perspective=hyp['perspective'],
-                                                 scale_range=scale_range(hyp), stats=self.stats_row())
+                                                 scale_range=scale_range(hyp), stats=self.stats_row(),
+                                                 tiles=self._tiles)
             
             
             #img, labels = self.albumentations(img, labels)
@@ -820,18 +828,22 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
             labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
 
+        tiles = np.array(self._tiles, dtype=np.float32).reshape(-1, 4) / \
+            np.array([img.shape[1], img.shape[0], img.shape[1], img.shape[0]], dtype=np.float32)
         if self.augment:
             # flip up-down
             if random.random() < hyp['flipud']:
                 img = np.flipud(img)
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
+                tiles[:, [1, 3]] = 1 - tiles[:, [3, 1]]
 
             # flip left-right
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
+                tiles[:, [0, 2]] = 1 - tiles[:, [2, 0]]
 
         labels_out = torch.zeros((nL, 6))
         if nL:
@@ -841,6 +853,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
+        if self.augment:  # training: frame rectangles (normalised xyxy) instead of the COCO rescaling shapes
+            shapes = torch.from_numpy(tiles)
         return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
     @staticmethod
@@ -1006,6 +1020,8 @@ def load_mosaic(self, index):
             x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
         img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+        if x2a > x1a and y2a > y1a:
+            self._tiles.append([x1a, y1a, x2a, y2a])
         padw = x1a - x1b
         padh = y1a - y1b
 
@@ -1034,7 +1050,8 @@ def load_mosaic(self, index):
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
                                        border=self.mosaic_border,  # border to remove
-                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row(),
+                                       tiles=self._tiles)
 
     return img4, labels4
 
@@ -1086,11 +1103,15 @@ def load_mosaic9(self, index):
 
         # Image
         img9[y1:y2, x1:x2] = img[y1 - pady:, x1 - padx:]  # img9[ymin:ymax, xmin:xmax]
+        self._tiles.append([x1, y1, min(x2, 3 * s), min(y2, 3 * s)])
         hp, wp = h, w  # height, width previous
 
     # Offset
     yc, xc = [int(random.uniform(0, s)) for _ in self.mosaic_border]  # mosaic center x, y
     img9 = img9[yc:yc + 2 * s, xc:xc + 2 * s]
+    self._tiles = [[max(t[0] - xc, 0), max(t[1] - yc, 0), min(t[2] - xc, 2 * s), min(t[3] - yc, 2 * s)]
+                   for t in self._tiles]
+    self._tiles = [t for t in self._tiles if t[2] > t[0] and t[3] > t[1]]
 
     # Concat/clip labels
     labels9 = np.concatenate(labels9, 0)
@@ -1113,7 +1134,8 @@ def load_mosaic9(self, index):
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
                                        border=self.mosaic_border,  # border to remove
-                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row(),
+                                       tiles=self._tiles)
 
     return img9, labels9
 
@@ -1201,6 +1223,8 @@ def _paste(self, canvas, index, region, view, anchor_high):
     x2, y2 = min(region[2], ox + w), min(region[3], oy + h)
     if x2 > x1 and y2 > y1:
         canvas[y1:y2, x1:x2] = img[y1 - oy:y2 - oy, x1 - ox:x2 - ox]
+        if hasattr(self, '_tiles'):
+            self._tiles.append([x1, y1, x2, y2])
     if labels.size:
         b = boxes + [ox, oy, ox, oy]
         area0 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
@@ -1257,7 +1281,8 @@ def load_mosaic_native(self, index):
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
                                        border=self.mosaic_border,  # border to remove
-                                       scale_range=scale_range(self.hyp), stats=self.stats_row())
+                                       scale_range=scale_range(self.hyp), stats=self.stats_row(),
+                                       tiles=self._tiles)
     return img4, labels4
 
 
@@ -1445,9 +1470,11 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 
 
 def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
-                       border=(0, 0), scale_range=None, stats=None):
+                       border=(0, 0), scale_range=None, stats=None, tiles=None):
     # scale_range: (min, max) zoom sampled log-uniformly instead of the stock uniform(1 - scale, 1.1 + scale)
     # stats: dataset stats row (see LoadImagesAndLabels.stats); counts labels dropped for being shrunk below 2 px
+    # tiles: list of frame rectangles (pixel xyxy), transformed in place (bounding boxes of the moved corners, clipped;
+    # exact without rotation / shear / perspective)
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
 
@@ -1492,6 +1519,17 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
             img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
         else:  # affine
             img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    if tiles:
+        xy = np.ones((len(tiles) * 4, 3))
+        t = np.array(tiles, dtype=float)
+        xy[:, :2] = t[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(-1, 2)
+        xy = xy @ M.T
+        xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(-1, 8)
+        t = np.stack([xy[:, 0::2].min(1), xy[:, 1::2].min(1), xy[:, 0::2].max(1), xy[:, 1::2].max(1)], 1)
+        t[:, [0, 2]] = t[:, [0, 2]].clip(0, width)
+        t[:, [1, 3]] = t[:, [1, 3]].clip(0, height)
+        tiles[:] = [list(r) for r in t if r[2] - r[0] >= 1 and r[3] - r[1] >= 1]
 
     # Visualize
     # import matplotlib.pyplot as plt

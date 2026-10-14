@@ -132,7 +132,7 @@ def test(data,
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            lse_input = getattr(model, 'lse', None) is not None and model.lse.mode == 'input'
+            lse_input = getattr(model, 'lse', None) is not None and model.lse.has_input
             if compute_loss and lse_input and not augment:  # raw outputs are in the canonical frame: so are the targets
                 (out, train_out), loss_targets, _, _ = model(img, lse_targets=targets)
             else:

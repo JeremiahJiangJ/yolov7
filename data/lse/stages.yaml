@@ -1,0 +1,36 @@
+# Local scale equivariance: deep equilibrium canonicalizers (DECs) inside the backbone (README.md, section 14).
+# P<k> is the backbone stage starting at the stride-2^k downsampling layer, up to the next one (found automatically
+# from the model; yolov7-tiny: P1 [0, 0], P2 [1, 7], P3 [8, 14], P4 [15, 21], P5 [22, 28]). The stage runs in its
+# canonical frame: its inputs are warped, its output is warped back before it is used; the head is told every
+# stage's local scale. Each stage gets its own canonicalizer, looking at the input image. Starts as the identity.
+#   python train.py --lse data/lse/stages.yaml ...
+
+# --- Where ------------------------------------------------------------------------------------------------------------
+decs: [P3, P4, P5]  # input | P1..P6 (backbone stages, see above) | [first, last] layer spans; any mix,
+                   # e.g. [input, P3, P4, P5]. Each entry gets its own canonicalizer.
+per_tile: true     # mosaic samples: canonicalize every frame tile on its own (false: the whole sample at once)
+
+# --- Warp -------------------------------------------------------------------------------------------------------------
+grid: 8            # knots per axis of the coarse warp grid: 7 x 7 cells, each rescaled on its own
+max_zoom: 4.0      # largest ratio between the most magnified and the most shrunk cell of a row / column
+
+# --- Canonicalizer ----------------------------------------------------------------------------------------------------
+canon_size: 224    # it sees each frame (tile) resized to canon_size x canon_size
+channels: [16, 32, 64]
+iters: 4           # fixed-point iterations (phi <- phi + delta(canonical frame))
+grad_iters: 2      # last iterations backpropagated
+lr_scale: 10.0     # canonicalizer learning rate = lr0 x lr_scale
+
+# --- Losses (added to the detection loss) -----------------------------------------------------------------------------
+eq_weight: 1.0     # consistency: a randomly rescaled frame must give the same canonical frame
+eq_strength: 1.0   # strength of those random rescalings
+eq_regions: 32     # at most this many frames (tiles) per batch in it, at random (it doubles the canonicalizer cost)
+size_weight: 0.0   # size target: pull objects towards target_size pixels in the canonical frame (labels needed;
+target_size: 96    #   at test time the canonicalizer predicts the warp from the image alone). Try 0.1 - 1
+prior_weight: 0.0  # pull towards the identity warp (only if warps become extreme)
+
+# --- Against the identity basin ---------------------------------------------------------------------------------------
+warp_aug: 0.0      # chance a frame of the detector input is randomly rescaled first (labels follow): makes the
+warp_aug_strength: 1.0  #   detector robust to warps, so warping stops costing it. Try 0.5
+det_grad_epochs: 0 # first epochs where canonicalizers learn from their own losses only, not the detection loss
+
