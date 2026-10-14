@@ -62,7 +62,9 @@ def test(data,
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
-        if trace:
+        if trace and getattr(model, 'lse', None) is not None:
+            print('LSE model: not traced (the canonicalizer is data dependent)')
+        elif trace:
             model = TracedModel(model, device, imgsz)
 
     # Half
@@ -130,12 +132,16 @@ def test(data,
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
+            lse_input = getattr(model, 'lse', None) is not None and model.lse.mode == 'input'
+            if compute_loss and lse_input and not augment:  # raw outputs are in the canonical frame: so are the targets
+                (out, train_out), loss_targets, _, _ = model(img, lse_targets=targets)
+            else:
+                (out, train_out), loss_targets = model(img, augment=augment), targets  # inference and training outputs
             t0 += time_synchronized() - t
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                loss += compute_loss([x.float() for x in train_out], loss_targets)[1][:3]  # box, obj, cls
 
             # Run NMS
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels

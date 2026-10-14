@@ -17,6 +17,7 @@
 #        --fitness-metric-weights 0 0 1 0 --close-mosaic 10 --patience 30 \
 #        --train-cache-path ./cache/exp1 --test-cache-path ./cache/exp1 \
 #        --project runs/mixed --name camC_exp1
+#    Optional: --lse data/lse/input.yaml adds local scale equivariance (README.md, section 14).
 # 3. Test: python test.py --data data/mixed/template.yaml --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280
 #    (--source camA: another source's val set; --freq-groups: rare / common / frequent classes; --area-int: per size)
 # 4. Deploy at the native frame size: python detect.py --weights runs/mixed/camC_exp1/weights/best.pt --img-size 1280 ...

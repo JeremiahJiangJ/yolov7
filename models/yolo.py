@@ -578,7 +578,26 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def attach_lse(self, cfg):
+        """Local scale equivariance (utils/lse.py, README.md section 14): adds self.lse, a canonicalizer that warps the
+        input image (mode input) or backbone stages (mode latent). Starts as the identity: the model's outputs are
+        unchanged until it is trained."""
+        from utils.lse import LSE, load_lse_cfg
+        cfg = load_lse_cfg(cfg)
+        head = self.model[-1]
+        assert isinstance(head, (Detect, IDetect)) or cfg['mode'] == 'input', \
+            'LSE latent mode supports Detect / IDetect heads'
+        ch = [m.in_channels for m in head.m] if isinstance(head, (Detect, IDetect)) else []
+        layer_from = [[m.f] if isinstance(m.f, int) else list(m.f) for m in self.model]
+        self.lse = LSE(cfg, head_channels=ch, layer_from=layer_from).to(next(self.parameters()).device)
+        return self.lse
+
+    def forward(self, x, augment=False, profile=False, lse_targets=None):
+        # lse_targets: with LSE, also return the targets in the frame the predictions are in (warped in input mode) and
+        # the LSE auxiliary loss and statistics (training): (out, targets, lse_loss, lse_stats)
+        if lse_targets is not None:
+            assert not augment, 'lse_targets is not supported with test-time augmentation'
+            return self.forward_once(x, profile, lse_targets=lse_targets)
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -598,8 +617,15 @@ class Model(nn.Module):
         else:
             return self.forward_once(x, profile)  # single-scale inference, train
 
-    def forward_once(self, x, profile=False):
+    def forward_once(self, x, profile=False, lse_targets=None):
         y, dt = [], []  # outputs
+        lse = getattr(self, 'lse', None)
+        if lse is not None:  # local scale equivariance: warp grids from the canonicalizer
+            img_hw = x.shape[-2:]
+            G, lse_loss, lse_stats = lse.canonicalize(x)
+            cache = {}  # inverse grids per feature map size (latent mode)
+            if lse.mode == 'input':
+                x = lse.warp_feat(x, G)  # the detector sees the canonical image
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -610,6 +636,12 @@ class Model(nn.Module):
             if self.traced:
                 if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
                     break
+
+            if lse is not None and lse.mode == 'latent':
+                if m.i in lse.starts:
+                    x = lse.warp_feat(x, G)  # the stage runs in the canonical frame
+                if isinstance(m, (Detect, IDetect)):
+                    x = lse.condition(x, G, cache)  # tell the head the local scale
 
             if profile:
                 c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
@@ -623,11 +655,27 @@ class Model(nn.Module):
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
-            
+
+            if lse is not None and m.i in lse.ends:
+                x = lse.unwarp_feat(x, G, cache)  # back to the image frame before the stage output is used
+
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
+        if lse is not None:
+            if lse.mode == 'input' and not self.training and isinstance(x, tuple) and torch.is_tensor(x[0]) \
+                    and x[0].dim() == 3:  # decoded boxes: canonical -> image pixels
+                from utils.lse import unwarp_predictions
+                x = (unwarp_predictions(x[0], G, *img_hw, lse.cfg['min_conf']),) + tuple(x[1:])
+            if lse_targets is not None:
+                if lse.mode == 'input':
+                    from utils.lse import warp_targets
+                    with torch.no_grad():
+                        lse_targets = warp_targets(lse_targets, G.detach(), *img_hw)
+                return x, lse_targets, lse_loss, lse_stats
+        elif lse_targets is not None:
+            return x, lse_targets, None, None
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency

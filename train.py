@@ -102,6 +102,9 @@ def train(hyp, opt, device, tb_writer=None):
             attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location=device)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        lse_cfg = opt.lse or (getattr(ckpt['model'], 'lse', None) and ckpt['model'].lse.cfg)  # --lse, else the ckpt's
+        if lse_cfg:  # attach before loading, so a checkpoint's canonicalizer weights are restored too
+            model.attach_lse(lse_cfg)
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
@@ -109,6 +112,14 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        if opt.lse:
+            model.attach_lse(opt.lse)
+    lse = getattr(model, 'lse', None)  # local scale equivariance (README.md, section 14)
+    if lse is not None:
+        logger.info(colorstr('lse: ') + f"local scale equivariance, mode {lse.mode}: " +
+                    ', '.join(f'{k}={v}' for k, v in lse.cfg.items()))
+        assert not (opt.teacher and lse.mode == 'input'), \
+            '--teacher with LSE input mode is not supported (the student predicts in the canonical frame)'
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -427,6 +438,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         mkd = torch.zeros(3, device=device)  # mean distillation losses
+        mlse = {}  # mean LSE statistics (consistency, prior, warp strength)
         seen = np.zeros((len(usage_names), 2), dtype=np.int64)  # samples, objects consumed per source this epoch
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
@@ -465,11 +477,18 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward
             with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
-                if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
+                if lse is not None:  # targets come back in the frame of the predictions (warped in input mode)
+                    pred, targets_l, loss_lse, lse_stats = model(imgs, lse_targets=targets.to(device))
                 else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    pred, targets_l = model(imgs), targets.to(device)  # forward
+                if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
+                    loss, loss_items = compute_loss_ota(pred, targets_l, imgs)  # loss scaled by batch_size
+                else:
+                    loss, loss_items = compute_loss(pred, targets_l)  # loss scaled by batch_size
+                if lse is not None:  # consistency + prior, scaled by batch size like the detection loss
+                    loss = loss + loss_lse * imgs.shape[0]
+                    for k, v in lse_stats.items():
+                        mlse[k] = (mlse.get(k, 0.0) * i + v) / (i + 1)
                 if distiller:
                     loss_kd, kd_items = distiller(imgs, pred)
                     loss = loss + loss_kd
@@ -505,6 +524,10 @@ def train(hyp, opt, device, tb_writer=None):
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                    if lse is not None and lse.mode == 'input' and ni < 3:  # what the detector sees, with its labels
+                        ci, ct = (model.module if is_parallel(model) else model).lse.preview(imgs, targets.to(device))
+                        Thread(target=plot_images, args=(ci.cpu(), ct.cpu(), paths, save_dir / f'train_batch{ni}_lse.jpg'),
+                               daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
@@ -523,6 +546,18 @@ def train(hyp, opt, device, tb_writer=None):
             logger.info(colorstr('data used: ') + f'epoch {epoch}\n{usage}')
             with open(save_dir / 'data_usage.txt', 'a') as f:
                 f.write(f'epoch {epoch}/{epochs - 1}\n{usage}\n')
+
+        if lse is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
+            line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
+            logger.info(colorstr('lse: ') + f'{line} (eq: consistency, disp: mean warp displacement, zoom_in / '
+                                             f'zoom_out: strongest local magnification / shrinking)')
+            with open(save_dir / 'lse.txt', 'a') as f:
+                f.write(f'epoch {epoch}: {line}\n')
+            for k, v in mlse.items():
+                if tb_writer:
+                    tb_writer.add_scalar(f'lse/{k}', v, epoch)
+                if wandb_logger.wandb:
+                    wandb_logger.log({f'lse/{k}': v})
 
         if distiller and rank in [-1, 0]:  # not part of results.txt (fixed columns), see TensorBoard train/distill_*
             logger.info(f'distill loss (box, obj, cls): {", ".join(f"{x:.4g}" for x in mkd.tolist())} '
@@ -748,6 +783,9 @@ if __name__ == '__main__':
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
                         help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
+    parser.add_argument('--lse', type=str, default='',
+                        help='local scale equivariance config yaml (data/lse/*.yaml, README.md section 14); a '
+                             'checkpoint trained with LSE keeps it without this flag')
     parser.add_argument('--teacher', type=str, default='',
                         help='distill from this larger model (weights .pt with the same classes), see utils/distill.py')
     parser.add_argument('--distill-weight', type=float, default=1.0,

@@ -35,7 +35,9 @@ def detect(save_img=False):
     stride = int(model.stride.max())  # model stride
     imgsz = check_img_size(imgsz, s=stride)  # check img_size
 
-    if trace:
+    if trace and getattr(model, 'lse', None) is not None:
+        print('LSE model: not traced (the canonicalizer is data dependent)')
+    elif trace:
         model = TracedModel(model, device, opt.img_size)
 
     if half:

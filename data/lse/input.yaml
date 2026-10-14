@@ -1,0 +1,24 @@
+# Local scale equivariance, input mode (README.md, section 14): a canonicalizer warps each image so parts of it are
+# magnified or shrunk (e.g. distant, small objects magnified); the unchanged detector runs on the warped image; labels
+# are warped into it for training and predicted boxes are mapped back to the image. Starts as the identity.
+#   python train.py --lse data/lse/input.yaml ...   (test.py / detect.py: nothing to add, the checkpoint keeps it)
+
+mode: input
+
+# --- Warp -------------------------------------------------------------------------------------------------------------
+grid: 8            # knots per axis of the coarse warp grid: 7 x 7 cells, each rescaled on its own
+max_zoom: 4.0      # largest ratio between the most magnified and the most shrunk cell of a row / column
+                   # (4: up to ~2x magnified next to ~2x shrunk)
+
+# --- Canonicalizer ----------------------------------------------------------------------------------------------------
+canon_size: 320    # long side of the downscaled image it looks at (larger: sees smaller objects, costs more)
+channels: [16, 32, 64]
+iters: 4           # fixed-point iterations (phi <- phi + delta(canonical image))
+grad_iters: 2      # last iterations backpropagated
+
+# --- Losses (added to the detection loss) -----------------------------------------------------------------------------
+eq_weight: 1.0     # consistency: a randomly rescaled image must give the same canonical image
+eq_strength: 1.0   # strength of those random rescalings
+prior_weight: 0.01 # pull towards the identity warp
+
+min_conf: 0.0001   # inference: predictions below this objectness are not mapped back (NMS drops them anyway)
