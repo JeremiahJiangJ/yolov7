@@ -1,0 +1,8 @@
+# LSE experiment E2 (scripts/train_lse_experiments.sh): input DEC + size target + warp augmentation.
+# Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+# TARGET_SIZE: set target_size to your median object size, obj_px in lse.txt after one epoch of any LSE run (e.g. e1).
+decs: [input]
+lr_scale: 10.0
+size_weight: 0.5
+target_size: 96    # TARGET_SIZE
+warp_aug: 0.5

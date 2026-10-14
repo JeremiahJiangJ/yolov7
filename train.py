@@ -121,8 +121,9 @@ def train(hyp, opt, device, tb_writer=None):
     if lse is not None:
         logger.info(colorstr('lse: ') + f"canonicalizers {lse.names} (stage spans {lse.spans}): " +
                     ', '.join(f'{k}={v}' for k, v in lse.cfg.items() if k != 'decs'))
-        assert not (opt.teacher and lse.has_input), \
-            '--teacher with an input canonicalizer is not supported (the student predicts in the canonical frame)'
+        assert not (opt.teacher and lse.frame), \
+            '--teacher with an input / open-ended (Pk+) canonicalizer is not supported (the student predicts in the ' \
+            'canonical frame)'
         if hyp.get('mixup', 0) > 0:
             logger.warning(colorstr('lse: ') + 'mixup blends two scenes: those samples are canonicalized as one image '
                                                '(set mixup: 0 for one warp per frame throughout)')
@@ -467,7 +468,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         mkd = torch.zeros(3, device=device)  # mean distillation losses
-        mlse = {}  # mean LSE statistics (consistency, prior, warp strength)
+        mlse, nlse = {}, {}  # mean LSE statistics (consistency, prior, warp strength) and their counts
         seen = np.zeros((len(usage_names), 2), dtype=np.int64)  # samples, objects consumed per source this epoch
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
@@ -519,8 +520,9 @@ def train(hyp, opt, device, tb_writer=None):
                     loss, loss_items = compute_loss(pred, targets_l)  # loss scaled by batch_size
                 if lse is not None:  # consistency + prior, scaled by batch size like the detection loss
                     loss = loss + loss_lse * imgs.shape[0]
-                    for k, v in lse_stats.items():
-                        mlse[k] = (mlse.get(k, 0.0) * i + v) / (i + 1)
+                    for k, v in lse_stats.items():  # running means (a key can be missing from a batch)
+                        c = nlse[k] = nlse.get(k, 0) + 1
+                        mlse[k] = mlse.get(k, 0.0) + (v - mlse.get(k, 0.0)) / c
                 if distiller:
                     loss_kd, kd_items = distiller(imgs, pred)
                     loss = loss + loss_kd
@@ -582,9 +584,10 @@ def train(hyp, opt, device, tb_writer=None):
 
         if lse is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
-            logger.info(colorstr('lse: ') + f'{line} (per canonicalizer: eq consistency, size target, disp mean warp '
-                                             f'displacement, zoom_in / zoom_out strongest local magnification / '
-                                             f'shrinking)')
+            logger.info(colorstr('lse: ') + f'{line} (obj_px median object size the detector sees; per '
+                                             f'canonicalizer: eq consistency, size target, obj_px in its canonical '
+                                             f'frame, disp mean warp displacement, zoom_in / zoom_out strongest local '
+                                             f'magnification / shrinking)')
             with open(save_dir / 'lse.txt', 'a') as f:
                 f.write(f'epoch {epoch}: {line}\n')
             for k, v in mlse.items():

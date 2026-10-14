@@ -1,0 +1,10 @@
+# LSE experiment E4 (scripts/train_lse_experiments.sh): closed DECs on the P3, P4 and P5 stages (each stage runs in its
+# own canonical frame and is warped back; the head is told the local scales), same losses as E2. Three canonicalizers:
+# about 3x the canonicalizer cost of E2.
+# Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+# TARGET_SIZE: set target_size to your median object size, obj_px in lse.txt after one epoch of any LSE run (e.g. e1).
+decs: [P3, P4, P5]
+lr_scale: 10.0
+size_weight: 0.5
+target_size: 96    # TARGET_SIZE
+warp_aug: 0.5

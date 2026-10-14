@@ -1,0 +1,9 @@
+# LSE experiment E5 (scripts/train_lse_experiments.sh, optional): input DEC and an open-ended P3+ DEC on top of it
+# (the P3+ warp refines the input warp for the deeper layers), same losses as E2.
+# Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+# TARGET_SIZE: set target_size to your median object size, obj_px in lse.txt after one epoch of any LSE run (e.g. e1).
+decs: [input, P3+]
+lr_scale: 10.0
+size_weight: 0.5
+target_size: 96    # TARGET_SIZE
+warp_aug: 0.5

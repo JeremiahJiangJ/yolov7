@@ -1,0 +1,9 @@
+# LSE experiment E3 (scripts/train_lse_experiments.sh): open-ended DEC from the stride-8 stage on (P3+), same losses
+# as E2. The stem sees the original image; features are warped instead of pixels.
+# Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+# TARGET_SIZE: set target_size to your median object size, obj_px in lse.txt after one epoch of any LSE run (e.g. e1).
+decs: [P3+]
+lr_scale: 10.0
+size_weight: 0.5
+target_size: 96    # TARGET_SIZE
+warp_aug: 0.5

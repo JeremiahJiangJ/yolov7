@@ -1,0 +1,6 @@
+# LSE experiment E1 (scripts/train_lse_experiments.sh): input DEC, consistency loss only (the paper's recipe).
+# Tells whether the canonicalizer leaves the identity on its own. If zoom_in / zoom_out in lse.txt stay near 1, it is
+# in the identity basin: E2 adds the remedies.
+# Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+decs: [input]
+lr_scale: 10.0

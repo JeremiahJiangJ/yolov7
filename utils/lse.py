@@ -9,7 +9,10 @@
 #   P1..P6: the backbone stage starting at the stride-2^k downsampling layer runs in a canonical frame: its inputs are
 #           warped, its output is warped back before it is used. The head is told every stage's local scale
 #           (zero-initialised 1x1 convs), so boxes stay in image pixels.
-#   [a, b]: the same for an explicit span of layers a..b.
+#   P1+..P6+: from the start of that stage on, everything (later stages, neck, head) runs in the canonical frame: inputs
+#           are warped on entry and never warped back; labels are warped in and predicted boxes mapped back, as for
+#           input (exact box sizes; the stem before the stage sees the image). At most one, combinable with input.
+#   [a, b]: the same as Pk for an explicit span of layers a..b.
 # Each latent DEC looks at the detector's input image (after the input DEC, if any), as in the paper.
 
 # Regions. A training sample can be a mosaic of several frames: each frame rectangle (tracked by the data loader, see
@@ -61,7 +64,7 @@ DEFAULTS = dict(
     warp_aug_strength=1.0,  # strength of those rescalings (in units of phi)
     det_grad_epochs=0,     # first epochs in which the canonicalizers learn from their own losses only (not detection)
     lr_scale=1.0,          # canonicalizer learning rate = lr0 x lr_scale
-    min_conf=1e-4,         # input DEC inference: only boxes with objectness above this are mapped back
+    min_conf=1e-3,         # inference: only boxes with objectness above this are mapped back (test.py conf_thres)
 )
 
 
@@ -82,7 +85,8 @@ def load_lse_cfg(cfg):
     decs = []
     for d in cfg['decs']:
         if isinstance(d, str):
-            assert d == 'input' or (d[0] == 'P' and d[1:].isdigit()), f'LSE decs: input, P1..P6 or [first, last], got {d}'
+            assert d == 'input' or (d[0] == 'P' and d[1:].rstrip('+').isdigit() and d.count('+') <= 1), \
+                f'LSE decs: input, P1..P6, P1+..P6+ or [first, last], got {d}'
             decs.append(d)
         else:
             assert len(d) == 2 and int(d[0]) <= int(d[1]), f'LSE decs: a layer span is [first, last], got {d}'
@@ -90,6 +94,10 @@ def load_lse_cfg(cfg):
     assert decs, 'LSE decs is empty'
     names = [dec_name(d) for d in decs]
     assert len(set(names)) == len(names), f'LSE decs repeated: {names}'
+    opened = [n for n in names if n.endswith('+')]
+    assert len(opened) <= 1, f'LSE decs: at most one open-ended stage (Pk+), got {opened}'
+    assert not opened or all(n == 'input' or n.endswith('+') for n in names), \
+        f'LSE decs: an open-ended stage ({opened[0]}) combines with input only, not with closed stages, got {names}'
     cfg['decs'] = decs
     return cfg
 
@@ -291,10 +299,73 @@ class Regions:
         k = inside.float().argmax(1)
         return torch.where(inside.any(1), k, torch.full_like(k, -1))
 
-    def map_boxes(self, img, xyxy, to_canonical):
-        """Boxes (N, 4) normalised xyxy of images img -> canonical frame (to_canonical) or back. Each side goes where the
-        warp moves its midpoint, so a box mapped to the canonical frame and back is returned (unlike the bounding box of
-        the warped outline, which grows at every mapping). Boxes whose centre is in no region are unchanged."""
+    def _sides(self, k, b, to_canonical):
+        """Edge-midpoint mapping of boxes b (N, 4, region coordinates) of regions k: each side goes where the warp moves
+        its midpoint."""
+        x1, y1, x2, y2 = b.unbind(-1)
+        xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
+        px, py = torch.stack([x1, x2, xm, xm], -1).reshape(-1), torch.stack([ym, ym, y1, y2], -1).reshape(-1)
+        kk = k.view(-1, 1).expand(-1, 4).reshape(-1)
+        if to_canonical:
+            qx, qy, _, _ = inverse_points(self.G.to(b.dtype), kk, px, py)
+        else:
+            qx, qy = forward_points(self.G.to(b.dtype), kk, px, py)
+        qx, qy = qx.view(-1, 4), qy.view(-1, 4)
+        return torch.stack([torch.minimum(qx[:, 0], qx[:, 1]), torch.minimum(qy[:, 2], qy[:, 3]),
+                            torch.maximum(qx[:, 0], qx[:, 1]), torch.maximum(qy[:, 2], qy[:, 3])], -1)
+
+    def _outline(self, k, b, n=8):
+        """Bounding box, in the canonical frame, of the warped outline of boxes b (region coordinates): the extent of
+        the warped object (edges bend under a non-uniform warp)."""
+        x1, y1, x2, y2 = b.unbind(-1)
+        t = torch.linspace(0, 1, n + 1, device=b.device, dtype=b.dtype).view(1, -1)
+        xs = torch.cat([x1[:, None] + (x2 - x1)[:, None] * t, x2[:, None].expand(-1, n + 1),
+                        x1[:, None] + (x2 - x1)[:, None] * t, x1[:, None].expand(-1, n + 1)], 1)
+        ys = torch.cat([y1[:, None].expand(-1, n + 1), y1[:, None] + (y2 - y1)[:, None] * t,
+                        y2[:, None].expand(-1, n + 1), y1[:, None] + (y2 - y1)[:, None] * t], 1)
+        kk = k.view(-1, 1).expand_as(xs).reshape(-1)
+        qx, qy, _, _ = inverse_points(self.G.to(b.dtype), kk, xs.reshape(-1), ys.reshape(-1))
+        qx, qy = qx.view(len(b), -1), qy.view(len(b), -1)
+        return torch.stack([qx.amin(1), qy.amin(1), qx.amax(1), qy.amax(1)], -1)
+
+    def _centre_scale(self, k, b):
+        """Boxes b of the canonical frame (region coordinates) -> the input box with the forward-mapped centre and the
+        size divided by the local magnification there."""
+        G = self.G.to(b.dtype)
+        cx, cy = forward_points(G, k, (b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2)
+        _, _, sx, sy = inverse_points(G, k, cx, cy)
+        w, h = (b[:, 2] - b[:, 0]) * sx, (b[:, 3] - b[:, 1]) * sy
+        return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], -1)
+
+    def _solve_outline(self, k, b, q, iters):
+        """Newton's method for outline(q) = b (finite-difference 4 x 4 Jacobian per box) from q, halving the step of a
+        box whose error grows and keeping each box's best estimate. Corners are kept ordered: a box with x1 and x2 (or
+        y1 and y2) swapped has the same outline. Returns the boxes and their remaining error."""
+        err = (self._outline(k, q) - b).abs().amax(1)
+        step = torch.ones_like(err)
+        eps = 1e-3
+        eye = torch.eye(4, device=b.device, dtype=b.dtype)
+        for _ in range(iters):
+            f = self._outline(k, q)
+            qs = (q[:, None, :] + eps * eye[None]).reshape(-1, 4)  # one coordinate nudged at a time
+            J = ((self._outline(k.repeat_interleave(4), qs).view(-1, 4, 4) - f[:, None, :]) / eps).transpose(1, 2)
+            dq = torch.linalg.solve(J + 1e-6 * eye, (b - f).unsqueeze(-1)).squeeze(-1)
+            cand = q + step[:, None] * dq.clamp(-0.5, 0.5)
+            cand = torch.cat([torch.minimum(cand[:, :2], cand[:, 2:]), torch.maximum(cand[:, :2], cand[:, 2:])], 1)
+            cerr = (self._outline(k, cand) - b).abs().amax(1)
+            better = cerr < err
+            q = torch.where(better[:, None], cand, q)
+            err = torch.where(better, cerr, err)
+            step = torch.where(better, torch.ones_like(step), step / 2)
+        return q, err
+
+    def map_boxes(self, img, xyxy, to_canonical, iters=12):
+        """Boxes (N, 4) normalised xyxy of images img -> canonical frame (to_canonical) or back. Into the canonical frame
+        a box becomes the bounding box of its warped outline (the warped object's extent). Back, the box whose warped
+        outline gives the canonical box is solved for, from two starts (edge midpoints mapped back; centre mapped back
+        with the size divided by the local magnification), keeping the better. Under strongly sheared warps several
+        boxes can share one outline bounding box; see README.md, section 14 for the measured accuracy. Boxes whose centre
+        is in no region are unchanged."""
         k = self.assign(img, (xyxy[:, 0] + xyxy[:, 2]) / 2, (xyxy[:, 1] + xyxy[:, 3]) / 2)
         m = k >= 0
         if not m.any():
@@ -302,22 +373,17 @@ class Regions:
         k, b = k[m], xyxy[m]
         r = self.rect[k].to(b.dtype)
         rw, rh = r[:, 2] - r[:, 0], r[:, 3] - r[:, 1]
-        x1, y1, x2, y2 = ((b[:, 0] - r[:, 0]) / rw, (b[:, 1] - r[:, 1]) / rh,
-                          (b[:, 2] - r[:, 0]) / rw, (b[:, 3] - r[:, 1]) / rh)
-        xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
-        px, py = torch.stack([x1, x2, xm, xm], -1).reshape(-1), torch.stack([ym, ym, y1, y2], -1).reshape(-1)
-        kk = k.view(-1, 1).expand(-1, 4).reshape(-1)
-        G = self.G.to(b.dtype)
+        scale, off = torch.stack([rw, rh, rw, rh], -1), r[:, [0, 1, 0, 1]]
+        b = (b - off) / scale  # region coordinates
         if to_canonical:
-            qx, qy, _, _ = inverse_points(G, kk, px, py)
+            q = self._outline(k, b)
         else:
-            qx, qy = forward_points(G, kk, px, py)
-        qx, qy = qx.view(-1, 4), qy.view(-1, 4)
-        q = torch.stack([torch.minimum(qx[:, 0], qx[:, 1]), torch.minimum(qy[:, 2], qy[:, 3]),
-                         torch.maximum(qx[:, 0], qx[:, 1]), torch.maximum(qy[:, 2], qy[:, 3])], -1)
-        q = q * torch.stack([rw, rh, rw, rh], -1) + r[:, [0, 1, 0, 1]]
+            n = len(b)
+            q, err = self._solve_outline(k.repeat(2), b.repeat(2, 1),
+                                         torch.cat([self._sides(k, b, False), self._centre_scale(k, b)]), iters)
+            q = torch.where((err[:n] <= err[n:])[:, None], q[:n], q[n:])
         out = xyxy.clone()
-        out[m] = q
+        out[m] = q * scale + off
         return out
 
     def zoom_at(self, img, cx, cy):
@@ -345,7 +411,7 @@ def warp_targets(targets, regions, h, w, min_px=2.0):
     return out[keep].to(targets.dtype)
 
 
-def unwarp_predictions(z, regions, h, w, min_conf=1e-4):
+def unwarp_predictions(z, regions, h, w, min_conf=1e-3):
     """Decoded predictions (B, N, no) [x, y, w, h, obj, ...] in canonical pixels -> image pixels. Only boxes with
     objectness above min_conf are mapped (NMS discards the others at any usual threshold)."""
     z = z.clone()
@@ -430,23 +496,28 @@ class LSE(nn.Module):
         self.cfg = cfg = load_lse_cfg(cfg)
         self.epoch = 0  # set by train.py (det_grad_epochs)
         self.names = [dec_name(d) for d in cfg['decs']]
-        self.spans = {}  # latent DEC name -> [first, last] layer
+        self.spans = {}  # latent DEC name -> [first, last] layer (last None: open-ended, never warped back)
         for d, name in zip(cfg['decs'], self.names):
             if name == 'input':
                 continue
             if isinstance(d, str):
-                assert stages and d in stages, f'LSE dec {d}: this model has backbone stages {sorted(stages or {})}'
-                self.spans[name] = stages[d]
+                k = d.rstrip('+')
+                assert stages and k in stages, f'LSE dec {d}: this model has backbone stages {sorted(stages or {})}'
+                self.spans[name] = [stages[k][0], None] if d.endswith('+') else stages[k]
             else:
                 self.spans[name] = d
-        validate_spans(list(self.spans.values()), layer_from)
+        validate_spans([v for v in self.spans.values() if v[1] is not None], layer_from)
         self.canon = nn.ModuleDict({n: Canonicalizer(cfg['grid'], cfg['channels'], cfg['max_zoom'], cfg['canon_size'],
                                                      cfg['iters'], cfg['grad_iters']) for n in self.names})
         self.has_input = 'input' in self.names
-        self.latent = [n for n in self.names if n != 'input']
-        self.layer_dec = {i: n for n, (a, b) in self.spans.items() for i in range(a, b + 1)}  # layer -> latent DEC
-        if self.latent:  # local scale of every latent DEC -> head features (zero-initialised: no effect at start)
-            self.cond = nn.ModuleList(nn.Conv2d(2 * len(self.latent), c, 1) for c in head_channels)
+        self.latent = [n for n in self.names if n != 'input']  # stage DECs (they see the detector input)
+        self.closed = [n for n in self.latent if self.spans[n][1] is not None]  # warped back at the end of the stage
+        self.frame = [n for n in self.names if n == 'input' or n.endswith('+')]  # DECs the predictions are made in
+        n_layers = len(layer_from) if layer_from is not None else 0
+        self.layer_dec = {i: n for n, (a, b) in self.spans.items()  # layer -> stage DEC
+                          for i in range(a, (b if b is not None else n_layers - 1) + 1)}
+        if self.closed:  # local scale of every closed stage DEC -> head features (zero-initialised: no effect at start)
+            self.cond = nn.ModuleList(nn.Conv2d(2 * len(self.closed), c, 1) for c in head_channels)
             for m in self.cond:
                 nn.init.zeros_(m.weight)
                 nn.init.zeros_(m.bias)
@@ -475,6 +546,8 @@ class LSE(nn.Module):
                         targets = warp_targets(targets, aug, h, w)
             if self.training:
                 loss, stats = xf.new_zeros(()), {'regions/img': len(base.b) / n}
+                if targets is not None and len(targets):  # median object size the detector sees (for target_size)
+                    stats['obj_px'] = torch.sqrt(targets[:, 4].float() * w * targets[:, 5].float() * h).median().item()
             warm = self.training and self.epoch < cfg['det_grad_epochs']
             for name in (['input'] if self.has_input else []) + self.latent:  # input first: the stages see its output
                 s = base.crops(xf, cfg['canon_size'])
@@ -485,9 +558,9 @@ class LSE(nn.Module):
                     loss = loss + l
                     stats.update({f'{name}/{k}': v for k, v in st.items()})
                 regs[name] = base.with_grid(G.detach()) if warm else reg  # warm-up: no detection gradient yet
+                if name in self.frame and targets is not None:  # with gradients: content and its boxes move together
+                    targets = warp_targets(targets, regs[name], h, w)
                 if name == 'input':
-                    if targets is not None:  # with gradients: content and its boxes move together
-                        targets = warp_targets(targets, regs[name], h, w)
                     xf = regs[name].warp(xf)
         return xf.to(x.dtype), regs, targets, loss, stats
 
@@ -507,15 +580,18 @@ class LSE(nn.Module):
         prior = (torch.tanh(phi_x) ** 2).mean() + (torch.tanh(phi_y) ** 2).mean()
         loss = cfg['eq_weight'] * eq + cfg['prior_weight'] * prior
         stats = {'eq': eq.item(), 'prior': prior.item()}
-        if cfg['size_weight'] > 0 and targets is not None and len(targets):
+        if targets is not None and len(targets):
             t = targets.float()
             z, m = reg.zoom_at(t[:, 0].long(), t[:, 2], t[:, 3])
             if m.any():
                 size = torch.sqrt(t[m, 4] * w * t[m, 5] * h).clamp_min(1)
-                want = torch.log(cfg['target_size'] / size).clamp(-math.log(cfg['max_zoom']), math.log(cfg['max_zoom']))
-                size_loss = ((torch.log(z) - want) ** 2).mean()
-                loss = loss + cfg['size_weight'] * size_loss
-                stats['size'] = size_loss.item()
+                stats['obj_px'] = (size * z.detach()).median().item()  # median object size in the canonical frame
+                if cfg['size_weight'] > 0:
+                    want = torch.log(cfg['target_size'] / size).clamp(-math.log(cfg['max_zoom']),
+                                                                      math.log(cfg['max_zoom']))
+                    size_loss = ((torch.log(z) - want) ** 2).mean()
+                    loss = loss + cfg['size_weight'] * size_loss
+                    stats['size'] = size_loss.item()
         stats.update(warp_stats(G.detach()))
         return loss, stats
 
@@ -537,7 +613,7 @@ class LSE(nn.Module):
         for t, conv in zip(x, self.cond):
             key = tuple(t.shape[-2:])
             maps = []
-            for name in self.latent:
+            for name in self.closed:
                 cache = caches.setdefault(name, {})
                 if key not in cache:
                     with torch.autocast(device_type=t.device.type, enabled=False):

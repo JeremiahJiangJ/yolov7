@@ -587,7 +587,8 @@ class Model(nn.Module):
             del self.lse  # re-attach: stage detection runs the plain model
         head = self.model[-1]
         latent = any(d != 'input' for d in cfg['decs'])
-        assert not latent or isinstance(head, (Detect, IDetect)), 'LSE stage canonicalizers support Detect / IDetect heads'
+        closed = any(d != 'input' and not (isinstance(d, str) and d.endswith('+')) for d in cfg['decs'])
+        assert not closed or isinstance(head, (Detect, IDetect)), 'LSE closed stage canonicalizers need Detect / IDetect'
         ch = [m.in_channels for m in head.m] if isinstance(head, (Detect, IDetect)) else []
         layer_from = [[m.f] if isinstance(m.f, int) else list(m.f) for m in self.model]
         stages = stage_spans(self) if latent else {}
@@ -654,7 +655,7 @@ class Model(nn.Module):
                             t = entered[(dec, j)]
                         ts.append(t)
                     x = ts[0] if isinstance(m.f, int) else ts
-                elif lse.latent and isinstance(m, (Detect, IDetect)):
+                elif lse.closed and isinstance(m, (Detect, IDetect)):
                     x = lse.condition(x, regs, caches)  # tell the head every stage's local scale
 
             if profile:
@@ -670,7 +671,7 @@ class Model(nn.Module):
 
             x = m(x)  # run
 
-            if dec is not None and m.i == lse.spans[dec][1]:
+            if dec is not None and m.i == lse.spans[dec][1]:  # closed stage (open ones are never warped back)
                 x = lse.unwarp_feat(x, regs[dec], caches.setdefault(dec, {}))  # back to the image frame
 
             y.append(x if m.i in self.save else None)  # save output
@@ -678,10 +679,13 @@ class Model(nn.Module):
         if profile:
             print('%.1fms total' % sum(dt))
         if lse is not None:
-            if lse.has_input and not self.training and isinstance(x, tuple) and torch.is_tensor(x[0]) \
-                    and x[0].dim() == 3:  # decoded boxes: canonical -> image pixels
+            if lse.frame and not self.training and isinstance(x, tuple) and torch.is_tensor(x[0]) \
+                    and x[0].dim() == 3:  # decoded boxes: canonical -> image pixels (open stage first, then input)
                 from utils.lse import unwarp_predictions
-                x = (unwarp_predictions(x[0], regs['input'], *img_hw, lse.cfg['min_conf']),) + tuple(x[1:])
+                z = x[0]
+                for name in reversed(lse.frame):
+                    z = unwarp_predictions(z, regs[name], *img_hw, lse.cfg['min_conf'])
+                x = (z,) + tuple(x[1:])
             if lse_targets is not None or lse_tiles is not None:
                 return x, lse_targets, lse_loss, lse_stats
         elif lse_targets is not None or lse_tiles is not None:

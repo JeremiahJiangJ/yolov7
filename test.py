@@ -19,6 +19,20 @@ from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
 
+def local_warp_batch(img, targets, strength, seed=0, grid=8, max_zoom=4.0):
+    """Images (B, 3, H, W) and their normalised targets rescaled by random monotone local warps (utils/lse.py), the
+    targets mapped exactly; the warps depend only on the seed (and batch size), so every model sees the same images."""
+    from utils.lse import Regions, make_grid, warp_targets
+    g = torch.Generator().manual_seed(int(seed))
+    nb = img.shape[0]
+    phi = [((torch.rand(nb, grid, grid - 1, generator=g) * 2 - 1) * strength).to(img.device) for _ in range(2)]
+    reg = Regions.make(nb, None, img.device).with_grid(make_grid(*phi, max_zoom))
+    with torch.no_grad():
+        warped = reg.warp(img.float()).to(img.dtype)
+        targets = warp_targets(targets, reg, *img.shape[-2:])
+    return warped, targets
+
+
 def test(data,
          weights=None,
          batch_size=32,
@@ -43,7 +57,8 @@ def test(data,
          is_coco=False,
          v5_metric=False,
          area_int=None,  # area cut points (px^2 of the original image) for per-area metrics
-         class_frames=None):  # training frames per class: report mAP per class-frequency group (rare/common/...)
+         class_frames=None,  # training frames per class: report mAP per class-frequency group (rare/common/...)
+         warp_test=0.0):  # > 0: evaluate on images rescaled by random local warps of this strength (README section 14)
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -122,17 +137,22 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    if warp_test > 0:
+        assert not save_json, '--warp-test with --save-json: boxes would be in the warped images\' coordinates'
+        print(f'warp test: images rescaled by random local warps of strength {warp_test} (seeded, labels warped)')
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
+        if warp_test > 0:  # local scale robustness: the same random warps (seeded per batch) for every model
+            img, targets = local_warp_batch(img, targets, warp_test, seed=batch_i)
 
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            lse_input = getattr(model, 'lse', None) is not None and model.lse.has_input
+            lse_input = getattr(model, 'lse', None) is not None and bool(model.lse.frame)  # predicts in a canonical frame
             if compute_loss and lse_input and not augment:  # raw outputs are in the canonical frame: so are the targets
                 (out, train_out), loss_targets, _, _ = model(img, lse_targets=targets)
             else:
@@ -363,6 +383,9 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--warp-test', type=float, default=0.0,
+                        help='evaluate on validation images rescaled by random local warps of this strength (labels '
+                             'warped with them; the same warps for every model): local scale robustness, e.g. 0.5, 1.0')
     parser.add_argument('--invert', action='store_true',
                         help='invert every val frame inside the data yaml inversion_border (IR: test the other polarity)')
     parser.add_argument('--freq-groups', action='store_true',
@@ -406,7 +429,8 @@ if __name__ == '__main__':
              trace=not opt.no_trace,
              v5_metric=opt.v5_metric,
              area_int=opt.area_int,
-             class_frames=train_class_frames(data_yaml, opt.label_folder_name) if opt.freq_groups else None
+             class_frames=train_class_frames(data_yaml, opt.label_folder_name) if opt.freq_groups else None,
+             warp_test=opt.warp_test
              )
 
     elif opt.task == 'speed':  # speed benchmarks
