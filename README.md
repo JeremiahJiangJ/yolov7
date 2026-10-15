@@ -59,7 +59,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | # | Feature | Enable with | Main files |
 |---|---|---|---|
 | 1 | [Compatibility with recent PyTorch / NumPy / Pillow / Python](#1-compatibility-with-recent-libraries) | always on | `utils/torch_utils.py`, `utils/metrics.py`, `utils/plots.py`, `utils/loss.py`, `models/experimental.py`, `train.py` |
-| 2 | [Reproducible training](#2-reproducible-training) | `--seed [N]`, `--deterministic` | `utils/torch_utils.py`, `utils/general.py`, `utils/datasets.py`, `train.py` |
+| 2 | [Reproducible training](#2-reproducible-training) | `--seed [N]`, `--deterministic`, `--deterministic-algorithms` | `utils/torch_utils.py`, `utils/general.py`, `utils/datasets.py`, `train.py` |
 | 3 | [Configurable label folder](#3-configurable-label-folder) | `--label-folder-name` | `utils/datasets.py` |
 | 4 | [Label caches: location, validity, clean-up](#4-label-caches) | `--train-cache-path`, `--test-cache-path`, `--keep-cache` | `utils/datasets.py`, `utils/mixed_data.py`, `train.py`, `test.py` |
 | 5 | [AdamW and hyperparameter files](#5-adamw-and-hyperparameter-files) | `--adam`, `data/hyp.{scratch,finetune}.{sgd,adamw}.yaml` | `train.py`, `data/` |
@@ -121,12 +121,16 @@ differences between experiments come from the change being tested.
 **Usage.**
 - `--seed` (42) or `--seed N`: seeds everything and turns on `--deterministic`.
 - `--deterministic` without `--seed`: keeps the upstream seeds (`2 + rank`) with deterministic cuDNN.
+- `--deterministic-algorithms` (with `--seed`): also `torch.use_deterministic_algorithms`, for runs as reproducible as
+  PyTorch allows on GPU (slower). Operations without a deterministic CUDA version (e.g. upsampling and `grid_sample`
+  backward, used by DEC layers) log a warning naming them (default, `warn`) or stop training (`strict`). Implies
+  `--deterministic`; kept on `--resume`.
 
 **Implementation.**
 - `utils/torch_utils.py: init_torch_seeds / set_deterministic`: `torch.manual_seed`, `torch.cuda.manual_seed_all`;
   deterministic mode sets `cudnn.benchmark = False`, `cudnn.deterministic = True`.
-  `torch.use_deterministic_algorithms` is deliberately not used (it stops training on CUDA operations without a
-  deterministic implementation).
+  `set_deterministic_algorithms` (`--deterministic-algorithms`): `torch.use_deterministic_algorithms(True,
+  warn_only=...)` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` (required for deterministic cuBLAS), set before any CUDA work.
 - `utils/general.py: init_seeds`: Python, NumPy and PyTorch seeds; `train.py` seeds each DDP rank with `seed + rank`.
 - Stock data loader (`utils/datasets.py: create_dataloader`): seeded `torch.Generator`, `seed_worker` re-seeding NumPy
   and `random` in each worker, `DistributedSampler(seed=seed)`.
@@ -135,7 +139,8 @@ differences between experiments come from the change being tested.
 - `--evolve` mutations are seeded with `seed + generation`.
 
 **Notes.** GPU runs are not guaranteed bit-identical: some CUDA operations (e.g. upsampling backward) accumulate in a
-non-deterministic order. Resumed runs differ slightly from uninterrupted ones because checkpoints store fp16 weights;
+non-deterministic order; `--deterministic-algorithms` removes all others and names these. Checked on CPU only: two
+seeded runs with `--deterministic-algorithms strict` (plain and DEC model) give identical results. Resumed runs differ slightly from uninterrupted ones because checkpoints store fp16 weights;
 the data stream itself resumes exactly.
 
 ---

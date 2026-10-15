@@ -56,6 +56,16 @@ def set_deterministic():
     cudnn.benchmark, cudnn.deterministic = False, True
 
 
+def set_deterministic_algorithms(mode='warn'):
+    """torch.use_deterministic_algorithms (train.py --deterministic-algorithms): deterministic implementations of every
+    op that has one. Ops without one on this device (e.g. grid_sample backward on CUDA, used by DEC layers) warn
+    (mode 'warn') or raise (mode 'strict'). Call before the first CUDA matmul: cuBLAS needs CUBLAS_WORKSPACE_CONFIG."""
+    assert mode in ('warn', 'strict'), f"--deterministic-algorithms: warn or strict, got {mode!r}"
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')  # https://docs.nvidia.com/cuda/cublas/#results-reproducibility
+    torch.use_deterministic_algorithms(True, warn_only=mode == 'warn')
+    set_deterministic()
+
+
 def seed_worker(worker_id):
     # DataLoader worker_init_fn: seed numpy and random from the per-worker torch seed
     # https://pytorch.org/docs/stable/notes/randomness.html#dataloader
