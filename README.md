@@ -71,7 +71,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
 | 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
-| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--lse data/lse/{input,open,stages}.yaml`, `test.py --warp-test` | `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py`, `scripts/*_lse_experiments.sh` |
+| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--lse data/lse/{input,open,stages}.yaml`, `test.py --warp-test`, `--cfg cfg/training/yolov7-tiny-nofpn-p*.yaml` | `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py`, `scripts/*_lse_experiments.sh` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
@@ -763,11 +763,22 @@ accuracy (visible in mAP@.5:.95 more than mAP@.5). `max_zoom` bounds the warps, 
 
 | Regime (hyp) | Runs | Question |
 |---|---|---|
-| A. no augmentation (`hyp.finetune.noaug.yaml`) | A0 baseline, A1 `input` consistency only (`e1`), A2 `input` + size target + `warp_aug` (`e2`), A3 `P3+` (`e3`), A4 `P3, P4, P5` (`e4`); optional A5 `input` + `P3+` (`e5`) | Does LSE help where nothing else teaches scale robustness, and which placement? Does the canonicalizer leave the identity without the remedies (A1)? |
+| A. no augmentation (`hyp.finetune.noaug.yaml`) | A0 baseline, A1 `input` consistency only (`e1`), A2 `input` + size target + `warp_aug` (`e2`), A3 `P3+` (`e3`), A4 `P3, P4, P5` (`e4`); optional A5 `input` + `P3+` (`e5`); A6 control: random warps only (`c0`) | Does LSE help where nothing else teaches scale robustness, and which placement? Does the canonicalizer leave the identity without the remedies (A1)? Is the gain canonicalization or just warp augmentation (A2 vs A6)? |
+| D. no feature pyramid (`--cfg yolov7-tiny-nofpn-p4.yaml`, no augmentation) | D0 baseline, D2 (`e2`), D3 (`e3`), D6 control (`c0`) | With A0 / A2 / A3 / A6: can a canonicalizer replace the pyramid? Then the best D run against B0, the usual deployment baseline |
 | B. full augmentation with mosaic (`hyp.finetune.lse_mosaic.yaml`) | B0 baseline, B2 (`e2`), B3 (`e3`): the best one or two of A | Is there still a gain when mosaic and scale augmentation already teach scale robustness? |
 | C. two stages (`hyp.finetune.lse.yaml`, 30 epochs from B0) | C0 baseline (continued without LSE), C2 (`e2`), C3 (`e3`) | Does adding LSE to an already trained detector help (the paper's setting)? |
 
 Before running, set `target_size` in `e2`-`e5` (see the script header: one epoch, then `obj_px` in `lse.txt`).
+
+**Without the feature pyramid.** `cfg/training/yolov7-tiny-nofpn-p3.yaml` / `-p4` / `-p5`: yolov7-tiny's backbone up
+to stride 8 / 16 / 32, then one detection level (an SPPCSPC block for context, a 3x3 conv, `IDetect`), without the
+top-down / bottom-up pyramid. The pyramid is how YOLO handles object scale; without it a canonicalizer is the only
+thing that brings objects to the size the one head handles, so this is where LSE has the most to add. `--weights
+yolov7-tiny.pt` initialises the backbone (the `-p5` head's SPPCSPC block too). Stage DECs exist up to the kept level
+(`-p4`: `P1`-`P4`, `P3+`, `P4+`). Size at 640 x 640 (3 classes): yolov7-tiny 6.0 M parameters / 13.0 GFLOPs; `-p3`
+0.28 M / 5.7; `-p4` 1.1 M / 7.1; `-p5` 4.3 M / 8.6, plus the canonicalizer. One level has 3 anchors: autoanchor
+refits them to the data if they fit badly (check the log), and `target_size` near the geometric mean of the final
+anchors' sizes puts objects where the head is strongest.
 `scripts/test_lse_experiments.sh` evaluates every run on the clean validation set and with `--warp-test 0.5` and
 `1.0`, with per-size AP (`--area-int`, cut points to adapt). `test.py --warp-test S` rescales each validation image by
 a random local warp of strength S (S = 0.5 / 1.0 / 1.5: strongest local zoom ~1.5x / 2x / 2.7x), labels warped with
@@ -819,7 +830,9 @@ objectness are not mapped back, 0.001 = test.py's default `--conf-thres`; NMS dr
 - `input`, `input` + `P3+` and `input` + `P3-P5` train end to end with mosaic tiles, `warp_aug`, the size target and
   `lr_scale` (2 epochs: every DEC leaves the identity, strongest local zoom 2-2.9x), write the warp plots, and seeded
   runs are reproducible. `test.py` (also `--warp-test`, also on plain checkpoints) and `detect.py` run on the
-  checkpoints. Memory, `input` + `P3-P5` at the defaults (canon_size 224), batch 8 at 320 on CPU: 7.1 GB peak
+  checkpoints. The no-pyramid models (`-p3`, `-p4`, `-p5`) build, load yolov7-tiny's backbone, give the plain
+  model's outputs at initialisation with every placement they support and train with an LSE config; the `c0` control
+  keeps the canonicalizer at the identity while the random warps apply. Memory, `input` + `P3-P5` at the defaults (canon_size 224), batch 8 at 320 on CPU: 7.1 GB peak
   (training process and data workers; 11.5 GB at canon_size 320).
 - Labels warped with gradients are the correct gradient; a test on a weakly trained detector found no measurable pull
   towards the identity with detached labels either, so they are not shown to cause the identity basin.

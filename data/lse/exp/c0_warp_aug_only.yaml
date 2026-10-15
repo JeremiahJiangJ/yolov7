@@ -1,0 +1,9 @@
+# LSE control C0 (scripts/train_lse_experiments.sh): random local warps of the detector input (labels follow) and no
+# learned canonicalization: the canonicalizer never trains (lr_scale 0, no losses of its own) and stays the identity.
+# Separates the augmentation effect of warping from the effect of canonicalizing: compare with e2 at the same
+# warp_aug. Keys not listed: the defaults in utils/lse.py (DEFAULTS), documented in data/lse/input.yaml.
+decs: [input]
+lr_scale: 0.0
+eq_weight: 0.0
+size_weight: 0.0
+warp_aug: 0.5
