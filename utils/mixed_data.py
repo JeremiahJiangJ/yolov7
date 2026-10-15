@@ -8,7 +8,7 @@
 # 4 mosaic tiles would be drawn uniformly from all images, pulling exposure back towards raw dataset sizes.)
 #
 # Sampling: epoch e draws exactly round(w_k(e) * epoch_size) images from source k, with weights w_k optionally
-# following a schedule. By default the epoch size is set so that --epochs means passes over the target, as when
+# following a schedule (sampling: generalist sets w_k from the source sizes, see MixedConfig.generalist_weights). By default the epoch size is set so that --epochs means passes over the target, as when
 # training on the target alone: weights only decide how much other data is added (see MixedConfig.resolve_epoch_size). Each source is an endless stream of shuffled passes over its images, so every image is seen
 # once before any repeats.
 #
@@ -131,8 +131,8 @@ class MixedConfig:
         srcs = data_dict['train_sources']
         assert isinstance(srcs, list) and srcs, 'train_sources must be a non-empty list'
         self.sampling = data_dict.get('sampling', 'weighted')
-        assert self.sampling in ('weighted', 'proportional'), \
-            f"sampling must be 'weighted' or 'proportional', got {self.sampling!r}"
+        assert self.sampling in ('weighted', 'proportional', 'generalist'), \
+            f"sampling must be 'weighted', 'proportional' or 'generalist', got {self.sampling!r}"
         # top-level defaults for the per-source keys of the same name
         default_resize = data_dict.get('resize', 'fit')
         default_fg = float(data_dict.get('fg_crop_prob', 0.5))
@@ -147,7 +147,8 @@ class MixedConfig:
             assert not unknown, f'train_sources[{i}]: unknown keys {sorted(unknown)}, expected {sorted(self.KEYS)}'
             assert 'path' in s, f'train_sources[{i}] needs a path'
             if self.sampling == 'weighted':
-                assert 'weight' in s, f"train_sources[{i}] needs a weight (or use sampling: proportional)"
+                assert 'weight' in s, \
+                    f"train_sources[{i}] needs a weight (or use sampling: proportional or generalist)"
             self.sources.append(Source(
                 name=str(s.get('name', f'source{i}')), path=s['path'], weight=float(s.get('weight', 1)),
                 target=bool(s.get('target', False)), val=s.get('val'),
@@ -176,6 +177,9 @@ class MixedConfig:
             self.target.val = data_dict.get('val')
         assert self.target.val, f'target source "{self.target.name}" needs a val path'
 
+        generalist_keys = [k for k in ('generalist_power', 'generalist_max_repeat') if k in data_dict]
+        if generalist_keys and self.sampling != 'generalist':
+            logger.warning(f'{generalist_keys} only apply to sampling: generalist (sampling is {self.sampling})')
         if self.sampling == 'proportional':
             ignored = [k for k in ('weight_schedule', 'epoch_size') if k in data_dict]
             if ignored:
@@ -183,7 +187,21 @@ class MixedConfig:
             self.schedule_spec, self.epoch_size = None, None
         else:
             self.schedule_spec = data_dict.get('weight_schedule')
-            self.epoch_size = data_dict.get('epoch_size', 'target')
+            # generalist: no source is favoured, so by default an epoch is as many samples as frames in all sources
+            self.epoch_size = data_dict.get('epoch_size', 'total' if self.sampling == 'generalist' else 'target')
+            if self.sampling == 'generalist':
+                self.power = float(data_dict.get('generalist_power', 0.5))
+                assert self.power >= 0, f'generalist_power must be >= 0, got {self.power}'
+                self.max_repeat = data_dict.get('generalist_max_repeat')
+                assert self.max_repeat is None or float(self.max_repeat) > 0, \
+                    f'generalist_max_repeat must be > 0, got {self.max_repeat}'
+                assert self.max_repeat is None or not isinstance(self.epoch_size, str) or \
+                    self.epoch_size == 'total', 'generalist_max_repeat needs epoch_size: total or an int'
+                ignored = [f'{s.name}: weight' for s, raw in zip(self.sources, srcs) if 'weight' in raw]
+                ignored += ['weight_schedule'] if self.schedule_spec else []
+                if ignored:
+                    logger.warning(f'sampling: generalist sets the weights itself, ignoring {ignored}')
+                self.schedule_spec = None
             if self.epoch_size == 'target':
                 self.epoch_size = self.target.name
             if isinstance(self.epoch_size, str):
@@ -196,10 +214,53 @@ class MixedConfig:
     def target(self):
         return self.sources[self.target_idx]
 
+    def generalist_weights(self, sizes, epochs=None):
+        """sampling: generalist. Training shares proportional to frames ** generalist_power (temperature sampling, as
+        for multi-dataset / multilingual training): 1 = proportional to the source sizes (large sources dominate), 0 =
+        equal shares (small sources are repeated most), 0.5 (default, square root) in between. With
+        generalist_max_repeat, no source is sampled more than that many times per frame over the run: a source above
+        it gets exactly that many, and the rest of its share goes to the others (in the same proportions)."""
+        n = np.asarray(sizes, dtype=float)
+        assert (n > 0).all(), f'sampling: generalist: empty source(s) {[a for a, b in zip(self.names, n) if b <= 0]}'
+        u = n ** self.power
+        w = u / u.sum()
+        self.generalist_capped = []
+        if self.max_repeat is not None:
+            assert epochs, 'generalist_max_repeat needs the number of epochs'
+            per_epoch = n.sum() if self.epoch_size in (None, 'total') else float(self.epoch_size)
+            cap = float(self.max_repeat) * n / (epochs * per_epoch)  # largest share that stays within max_repeat
+            if cap.sum() < 1:
+                logger.warning(f'generalist_max_repeat {self.max_repeat}: {epochs} epochs x {int(per_epoch)} samples '
+                               f'sample every source more often than that whatever the shares; using shares '
+                               f'proportional to the source sizes (the same repetition for all, '
+                               f'{epochs * per_epoch / n.sum():.0f} per frame)')
+                w = n / n.sum()
+            else:
+                fixed = np.zeros(len(n), dtype=bool)
+                while True:  # cap the sources above their cap, share the rest among the others, until none is above
+                    free = ~fixed
+                    w = np.where(fixed, cap, 0.0)
+                    w[free] = (1 - cap[fixed].sum()) * u[free] / u[free].sum()
+                    over = free & (w > cap * (1 + 1e-9))
+                    if not over.any():
+                        break
+                    fixed |= over
+                self.generalist_capped = [a for a, f in zip(self.names, fixed) if f]
+        return w.tolist()
+
+    def generalist_report(self, sizes, weights, total):
+        """Log lines: each source's share and samples per frame over the run (total = training samples)."""
+        rows = ', '.join(f'{a} {w:.1%} ({w * total / max(n, 1):.0f}/frame{", capped" if a in self.generalist_capped else ""})'
+                         for a, w, n in zip(self.names, weights, sizes))
+        cap = f', max {self.max_repeat} samples per frame' if self.max_repeat is not None else ''
+        return f'generalist (shares ~ frames^{self.power:g}{cap}): {rows}'
+
     def schedule(self, sizes, epochs=None):
         # sizes: frames per source pass (the repeat-factor stream length where repeat factors are used)
         if self.sampling == 'proportional':  # every frame once per epoch (rfs: every stream position)
             return WeightSchedule(self.names, sizes)
+        if self.sampling == 'generalist':
+            return WeightSchedule(self.names, self.generalist_weights(sizes, epochs))
         return WeightSchedule(self.names, [s.weight for s in self.sources], self.schedule_spec, epochs)
 
     def resolve_epoch_size(self, sizes, schedule, epochs, stream=None):
@@ -524,6 +585,8 @@ def create_mixed_dataloader(cfg, imgsz, batch_size, stride, opt, hyp=None, cache
         s = f'sampling {cfg.sampling}, seed {sampler.seed}'
         if cfg.sampling == 'weighted' and len(schedule.points) > 1:
             s += f', weight schedule ({schedule.mode}) from epochs {[e for e, _ in schedule.points]}'
+        if cfg.sampling == 'generalist':
+            s += '\n  ' + cfg.generalist_report(stream, schedule(0), epoch_size * epochs)
         s += f'\n  target: {cfg.target.name}'
         s += '\n  resize: ' + ', '.join(f'{x.name}={x.resize}' for x in cfg.sources)
         s += '\n  cached: ' + (', '.join(n for n, d in zip(cfg.names, datasets) if d.imgs[0] is not None) or 'none')
@@ -704,6 +767,8 @@ if __name__ == '__main__':
                                  rank=0 if opt.world_size > 1 else -1,
                                  world_size=opt.world_size)
     print(f'sampling {cfg.sampling}, target {cfg.target.name}')
+    if cfg.sampling == 'generalist':
+        print(cfg.generalist_report(stream, schedule(0), sampler.total * opt.epochs))
     if len(schedule.points) > 1:
         print(f'weight schedule ({schedule.mode}): ' + '; '.join(
             f'epoch {e}: ' + ', '.join(f'{n} {x:.0%}' for n, x in zip(cfg.names, w)) for e, w in schedule.points))

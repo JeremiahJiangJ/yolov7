@@ -298,7 +298,8 @@ Used here and in the logs:
 ### Data yaml
 
 ```yaml
-sampling: weighted        # weighted (default) | proportional (every image once per epoch, weights ignored)
+sampling: weighted        # weighted (default) | proportional (every image once per epoch, weights ignored) |
+                          # generalist (weights set from the source sizes, below)
 resize: native            # default for all sources: fit | native | <scale factor>
 fg_crop_prob: 0.5         # default for all sources
 label_folder: labels      # default for all sources (otherwise --label-folder-name)
@@ -368,6 +369,34 @@ give them their own source (with its own `weight`) instead.
   still differ slightly from uninterrupted ones because YOLOv7 checkpoints store fp16 weights.)
 
 Not supported with `train_sources`: `--image-weights`, `--rect` (train), `train_aux.py`.
+
+### Generalist sampling
+
+For a model meant to work on every source (no single target to favour), `sampling: generalist` sets the weights from
+the source sizes (per-source `weight` and `weight_schedule` are ignored):
+
+```yaml
+sampling: generalist
+generalist_power: 0.5        # default. Shares ~ frames ^ power: 1 = proportional, 0 = equal shares
+generalist_max_repeat: 300   # optional: no source sampled more than this many times per frame over the run
+epoch_size: total            # the default with generalist
+```
+
+- **Shares proportional to frames ^ `generalist_power`** (temperature sampling, the usual recipe for mixing
+  datasets of very different sizes). Proportional (1) lets the largest source dominate; equal shares (0) repeat the
+  smallest source most; the square root (0.5) boosts small sources without repeating them excessively. E.g. sources
+  of 12,285 / 40,048 / 3,283 / 750 frames get 28% / 51% / 15% / 7%.
+- **`generalist_max_repeat`**: the most times any frame may be sampled over the run (`--epochs` x `epoch_size`
+  samples; needs `epoch_size: total` or an int). A source above it gets exactly that, and the rest of its share goes to
+  the other sources in the same proportions. With the sources above and 100 epochs, 300 caps the 750-frame source at
+  4% (300 samples per frame) and gives the others 29% / 52% / 15%. If the run is so long that every source would
+  exceed the cap, the shares fall back to proportional (the same repetition for all) with a warning.
+- The log and the data plan show each source's share and samples per frame (times each frame is the sampled frame;
+  `loads/frame` in the plan also counts mosaic partners). Check them with the dry run below before training.
+- There is still exactly one `target`: its val set drives fitness, `best.pt` and `--patience`. For a generalist, give
+  every source a `val` (reported per epoch in `source_results.txt`) and judge by the mean of the per-source scores.
+- These are starting weights, not optimal ones: if a source's val lags, raise its share with `sampling: weighted`
+  and explicit weights (the generalist weights from the log are a good start).
 
 ### Epoch size
 

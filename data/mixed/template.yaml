@@ -28,6 +28,8 @@ names: ['object']
 
 # --- Defaults for every source (each can be overridden per source below) -----------------------------------------------
 sampling: weighted      # weighted | proportional (every image once per epoch, weights ignored: the unweighted baseline)
+                        # | generalist (weights from the source sizes, for a model meant for every source; README.md
+                        # section 8: generalist_power (default 0.5), generalist_max_repeat; epoch_size default total)
 resize: native          # native: never resized, objects keep their pixel size | fit: stock YOLOv7 | <factor>, e.g. 0.5
 fg_crop_prob: 0.5       # chance a mosaic tile / crop is placed around an object (else at random)
 mosaic_max_cells: 6     # max mosaic cells per axis for frames smaller than the tiles; lower if data loading is slow
