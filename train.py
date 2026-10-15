@@ -38,7 +38,7 @@ from utils.metrics import area_fitness, area_bins, class_frames, DEFAULT_FITNESS
 from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
-    torch_load
+    torch_load, set_deterministic_algorithms
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
@@ -748,6 +748,9 @@ if __name__ == '__main__':
                         help='global training seed, implies --deterministic (bare --seed uses 42)')
     parser.add_argument('--deterministic', action='store_true',
                         help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
+    parser.add_argument('--deterministic-algorithms', nargs='?', const='warn', default=None, choices=['warn', 'strict'],
+                        help='also torch.use_deterministic_algorithms (slower; implies --deterministic): ops without a '
+                             'deterministic version warn (default) or raise (strict)')
     parser.add_argument('--teacher', type=str, default='',
                         help='distill from this larger model (weights .pt with the same classes), see utils/distill.py')
     parser.add_argument('--distill-weight', type=float, default=1.0,
@@ -779,7 +782,7 @@ if __name__ == '__main__':
         assert len(opt.fitness_area_weights) == len(area_bins(opt.area_int)), \
             f'--fitness-area-weights needs {len(area_bins(opt.area_int))} values, one per --area-int bin'
         assert not opt.evolve, '--fitness-area-weights is not supported with --evolve'
-    if opt.seed is not None:
+    if opt.seed is not None or opt.deterministic_algorithms:
         opt.deterministic = True
 
     # Set DDP variables
@@ -819,6 +822,8 @@ if __name__ == '__main__':
 
     # DDP mode
     opt.total_batch_size = opt.batch_size
+    if getattr(opt, 'deterministic_algorithms', None):  # before any CUDA work (cuBLAS reads its workspace setting once)
+        set_deterministic_algorithms(opt.deterministic_algorithms)
     device = select_device(opt.device, batch_size=opt.batch_size)
     if opt.local_rank != -1:
         assert torch.cuda.device_count() > opt.local_rank
