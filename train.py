@@ -30,6 +30,8 @@ from utils.datasets import create_dataloader, rebuild_loader, parse_resize, dele
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
     usage_report, measure_sources
 from utils.distill import Distiller
+from utils.local_scale import LocalScaleLoss
+from models.local_scale import get_lse
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
@@ -128,6 +130,19 @@ def train(hyp, opt, device, tb_writer=None):
     if distiller and not opt.resume:
         distiller.sync_anchors(model)  # pair predictions anchor by anchor; autoanchor is skipped below
 
+    # Local scale canonicalization (`lse:` in the model yaml) and / or augmentation (hyp lse_*), see README.md
+    # section 14
+    lse = get_lse(model)
+    lse_loss = LocalScaleLoss(hyp, model)
+    lse_loss = lse_loss if lse_loss.active else None
+    if lse is not None:
+        assert not (distiller and lse.input), '--teacher with an lse model that canonicalizes the input: the student ' \
+                                              'predicts in the canonical frame, the teacher in the input frame'
+        logger.info(colorstr('lse: ') + ', '.join(f'{k}={v}' for k, v in lse_loss.h.items()))
+    elif lse_loss:
+        logger.info(colorstr('lse: ') + f"local-scale augmentation of {lse_loss.h['lse_aug']:g} of the images "
+                                        f"(strength {lse_loss.h['lse_strength']:g}, grid {lse_loss.h['lse_grid']})")
+
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
@@ -136,6 +151,8 @@ def train(hyp, opt, device, tb_writer=None):
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in model.named_modules():
+        if k.split('.')[0] == 'lse':
+            continue  # canonicalizers: own parameter group, below
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
             pg2.append(v.bias)  # biases
         if isinstance(v, nn.BatchNorm2d):
@@ -207,6 +224,10 @@ def train(hyp, opt, device, tb_writer=None):
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    if lse is not None:  # canonicalizers, lr scaled by hyp lse_lr_scale
+        optimizer.add_param_group({'params': list(lse.parameters()), 'lr': hyp['lr0'] * lse_loss.h['lse_lr_scale'],
+                                   'weight_decay': hyp['weight_decay']})
+        logger.info(f"Optimizer group: {len(list(lse.parameters()))} lse (lr x {lse_loss.h['lse_lr_scale']:g})")
     del pg0, pg1, pg2
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
@@ -260,7 +281,11 @@ def train(hyp, opt, device, tb_writer=None):
 
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
+        if lse is not None:  # replicas would not keep the batch's warps (LocalScale.grids)
+            logger.warning('WARNING: DataParallel is not supported with lse models, training on one GPU '
+                           '(use DDP for several)')
+        else:
+            model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
     if opt.sync_bn and cuda and rank != -1:
@@ -427,6 +452,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         mkd = torch.zeros(3, device=device)  # mean distillation losses
+        mlse = torch.zeros(3, device=device)  # mean lse losses (canon, equi, prior)
         seen = np.zeros((len(usage_names), 2), dtype=np.int64)  # samples, objects consumed per source this epoch
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
@@ -463,13 +489,23 @@ def train(hyp, opt, device, tb_writer=None):
                     ns = [math.ceil(x * sf / ms) * ms for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
+            # Local-scale augmentation (optional, hyp lse_aug)
+            if lse_loss:
+                imgs, targets = lse_loss.augment(imgs, targets)
+
             # Forward
             with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
+                pred = model(lse_loss.inputs(imgs) if lse_loss else imgs)  # forward (+ warped copy, hyp lse_equi)
+                det_targets = targets
+                if lse_loss:  # canonicalizer losses; targets in the canonical frame if the input is canonicalized
+                    pred, det_targets, loss_lse = lse_loss(imgs, pred, targets)
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
+                    loss, loss_items = compute_loss_ota(pred, det_targets.to(device), imgs)  # loss scaled by batch_size
                 else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    loss, loss_items = compute_loss(pred, det_targets.to(device))  # loss scaled by batch_size
+                if lse_loss:
+                    loss = loss + loss_lse
+                    mlse = (mlse * i + lse_loss.items.to(device)) / (i + 1)
                 if distiller:
                     loss_kd, kd_items = distiller(imgs, pred)
                     loss = loss + loss_kd
@@ -528,6 +564,17 @@ def train(hyp, opt, device, tb_writer=None):
             logger.info(f'distill loss (box, obj, cls): {", ".join(f"{x:.4g}" for x in mkd.tolist())} '
                         f'(x {distiller.weight} in the total loss)')
             for x, tag in zip(mkd.tolist(), ('train/distill_box', 'train/distill_obj', 'train/distill_cls')):
+                if tb_writer:
+                    tb_writer.add_scalar(tag, x, epoch)
+                if wandb_logger.wandb:
+                    wandb_logger.log({tag: x})
+
+        if lse is not None and rank in [-1, 0]:  # not part of results.txt, see TensorBoard train/lse_*
+            w = lse_loss.h
+            logger.info(f'lse loss (canon, equi, prior): {", ".join(f"{x:.4g}" for x in mlse.tolist())} '
+                        f"(x {w['lse_canon']:g}, {w['lse_equi']:g}, {w['lse_prior']:g} in the total loss; prior: mean "
+                        f"squared distance of the warps from the identity, in coarse grid cells)")
+            for x, tag in zip(mlse.tolist(), ('train/lse_canon', 'train/lse_equi', 'train/lse_prior')):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)
                 if wandb_logger.wandb:

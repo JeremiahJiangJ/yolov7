@@ -17,6 +17,7 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_file, che
 from utils.metrics import ap_per_class, ap_per_area, ap_per_group, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
+from models.local_scale import canonical_targets, random_grid, warp, warp_targets
 
 
 def test(data,
@@ -43,7 +44,8 @@ def test(data,
          is_coco=False,
          v5_metric=False,
          area_int=None,  # area cut points (px^2 of the original image) for per-area metrics
-         class_frames=None):  # training frames per class: report mAP per class-frequency group (rare/common/...)
+         class_frames=None,  # training frames per class: report mAP per class-frequency group (rare/common/...)
+         lse_warp=0.0):  # > 0: evaluate under random local scaling of this strength (README.md, section 14)
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -62,7 +64,9 @@ def test(data,
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
-        if trace:
+        if trace and getattr(model, 'lse', None) is not None:
+            print('lse model: not traced (the canonicalizer and the box mapping run outside the traced part)')
+        elif trace:
             model = TracedModel(model, device, imgsz)
 
     # Half
@@ -126,6 +130,9 @@ def test(data,
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
+        if lse_warp > 0:  # random local scaling, labels follow; seeded by batch: the same warps for every model
+            grids = random_grid(nb, 8, lse_warp, device=device, generator=torch.Generator().manual_seed(batch_i))
+            img, targets = warp(img, grids), warp_targets(targets, grids)
 
         with torch.no_grad():
             # Run model
@@ -135,7 +142,8 @@ def test(data,
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                # targets in the frame the raw outputs are in (canonical if an lse model canonicalizes the input)
+                loss += compute_loss([x.float() for x in train_out], canonical_targets(model, targets))[1][:3]  # box, obj, cls
 
             # Run NMS
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
@@ -359,6 +367,9 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--invert', action='store_true',
                         help='invert every val frame inside the data yaml inversion_border (IR: test the other polarity)')
+    parser.add_argument('--lse-warp', type=float, default=0.0,
+                        help='evaluate under random (seeded) local scaling of this strength, e.g. 0.25 (README.md, '
+                             'section 14)')
     parser.add_argument('--freq-groups', action='store_true',
                         help='report mAP per class-frequency group (rare / common / frequent in the training labels)')
     parser.add_argument('--area-int', nargs='+', type=float, default=None,
@@ -400,7 +411,8 @@ if __name__ == '__main__':
              trace=not opt.no_trace,
              v5_metric=opt.v5_metric,
              area_int=opt.area_int,
-             class_frames=train_class_frames(data_yaml, opt.label_folder_name) if opt.freq_groups else None
+             class_frames=train_class_frames(data_yaml, opt.label_folder_name) if opt.freq_groups else None,
+             lse_warp=opt.lse_warp
              )
 
     elif opt.task == 'speed':  # speed benchmarks

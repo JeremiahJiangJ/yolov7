@@ -45,6 +45,8 @@ if __name__ == '__main__':
     # Load PyTorch model
     device = select_device(opt.device)
     model = attempt_load(opt.weights, map_location=device)  # load FP32 model
+    assert getattr(model, 'lse', None) is None, 'models with an lse: section (local scale canonicalization) cannot ' \
+                                                'be exported yet: data-dependent solver loop, grid_sample'
     labels = model.names
 
     # Checks

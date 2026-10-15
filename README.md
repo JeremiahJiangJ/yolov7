@@ -50,6 +50,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | Keep small objects at their pixel size | `resize: native` in the data yaml, `scale_min` / `scale_max` in the hyp | [9](#9-native-scale-loading-and-augmentation) |
 | Rare classes | `tools/class_audit.py`, then `repeat_factor_threshold:` in the data yaml, `--freq-groups` to evaluate | [10](#10-repeat-factor-sampling), [13](#13-tools-scripts-and-example-configs) |
 | A bigger model to guide tiny | `--teacher yolov7.pt` | [11](#11-knowledge-distillation) |
+| Objects at different distances in one frame (experimental) | `--cfg cfg/training/yolov7-tiny-lse-input.yaml`, `test.py --lse-warp 0.25` | [14](#14-local-scale-canonicalization) |
 | IR white-hot and black-hot | `px_inversion_prob:` + `inversion_border:` in the data yaml, `test.py --invert` | [12](#12-ir-polarity-inversion-and-grayscale) |
 | RGB data supplementing IR | `to_gray: 1.0` on the RGB source | [12](#12-ir-polarity-inversion-and-grayscale) |
 
@@ -70,12 +71,13 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
 | 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
+| 14 | [Local scale canonicalization](#14-local-scale-canonicalization) (experimental) | `lse:` in the model yaml, `lse_*` in the hyp; `test.py --lse-warp` | `models/local_scale.py`, `utils/local_scale.py`, `models/yolo.py`, `train.py`, `test.py` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
 
 `train.py` has every feature. `train_aux.py` (W6 / E6 / D6 / E6E models with auxiliary heads) has 1-6, 11 and 12 (with a
-stock data yaml), not 4's automatic cache deletion, 7, 8, 9 or 10.
+stock data yaml), not 4's automatic cache deletion, 7, 8, 9, 10 or 14.
 
 ---
 
@@ -655,6 +657,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | `data/mixed/1_...` to `6_...` | Experiment ladder (below) |
 | `scripts/train_mixed_ladder.sh` | Trains and tests the ladder with identical settings (`STEPS="1 5 6"` for a subset) |
 | `scripts/train_default.sh`, `train_weighted.sh`, `train_distill.sh` | Example training commands |
+| `scripts/train_lse.sh` | Local scale experiment: stock, augmentation, input and latent canonicalization, tested clean and warped (section 14) |
 
 ### Class audit: `tools/class_audit.py`
 
@@ -688,6 +691,159 @@ Each step changes one thing, so comparing neighbours isolates its effect:
 
 ---
 
+## 14. Local scale canonicalization
+
+**Purpose.** Objects seen at different distances in one frame are scaled differently: a *local* scale change, which
+the FPN levels, anchors and scale augmentation only approximate. This is a port of
+[Local Scale Equivariance with Latent Deep Equilibrium Canonicalizer](https://github.com/ashiq24/local-scale-equivariance)
+(Rahman et al., ICCV 2025) to detection: a small deep equilibrium canonicalizer (DEC) predicts a monotone warp that
+brings the image, or backbone feature maps, to a canonical local scale before the detector sees it. It is experimental:
+whether it beats plain local-scale augmentation on your data, and at what cost, is what `scripts/train_lse.sh` measures.
+
+**Usage.**
+
+```shell
+# input canonicalization (boxes mapped between the frames)
+python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny-lse-input.yaml \
+  --hyp data/hyp.finetune.sgd.lse.yaml --data data/your.yaml ...
+# latent canonicalization of the P3 / P4 backbone stages (neck and head unchanged)
+python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny-lse-latent.yaml \
+  --hyp data/hyp.finetune.sgd.lse.yaml --data data/your.yaml ...
+# baseline: stock model with the same local scaling as augmentation (any hyp file plus lse_aug)
+python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --hyp hyp_with_lse_aug_0.5.yaml ...
+# evaluate on clean and on locally scaled val images (seeded: the same warps for every model)
+python test.py --weights best.pt --data data/your.yaml --img-size 1280
+python test.py --weights best.pt --data data/your.yaml --img-size 1280 --lse-warp 0.25
+```
+
+`test.py`, `detect.py` and checkpoints work unchanged with lse models (not traced: tracing is skipped for them).
+
+**Model yaml** (`lse:` section; see `cfg/training/yolov7-tiny-lse-*.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `input` | false | canonicalize the input image |
+| `stages` | `[]` | `[[a, b], ...]`: warp the input of layer `a`, unwarp the output of layer `b` (layers a..b see canonical features) |
+| `grid` | 8 | coarse warp grid R per warp (input first, then stages), >= 4 |
+| `separable` | true | input warp separable (one x warp for all rows, one y warp for all columns) |
+| `separable_stages` | false | stage warps separable |
+| `dem_size` | 256 | the canonicalizers see the image resized to this square (the tiny configs use 160: cost grows with its square) |
+| `dem_channels`, `dem_kernels`, `dem_pools` | `[3, 32, 64]`, `[5, 3]`, `[4, 2]` | canonicalizer net (as `adapter_channels` etc. in the reference) |
+| `iters` | 5 | fixed-point iterations (`inner_epochs` in the reference) |
+| `solver` | anderson | or `picard` (plain iteration) |
+
+**Hyperparameters** (`lse_*` keys, defaults used when a hyp file leaves them out; `data/hyp.finetune.sgd.lse.yaml`
+lists them all):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `lse_aug` | 0 | chance a training image gets a random local-scale warp, labels follow; also for stock models |
+| `lse_strength` | 0.25 | random warp strength (`warping_strength` in the reference: 0.2-0.25); 0.25 changes the scale of neighbouring cells by up to ~2x |
+| `lse_grid` | 8 | random warp grid (`warping_resolution`) |
+| `lse_separable` | 1 | random warps separable (1) or not (0) |
+| `lse_canon` | 1.0 | canonicalization consistency loss gain |
+| `lse_equi` | 0 | objectness equivariance loss gain; > 0 doubles the training forward |
+| `lse_prior` | 0 | gain of the warps' distance from the identity |
+| `lse_lr_scale` | 1.0 | canonicalizer learning rate / `lr0` |
+
+The defaults are starting points, not tuned (no real data was available).
+
+### How it works
+
+- **Warp** (`models/local_scale.py`, as `utils/sampling_utils.py` in the reference). Parameters of shape (R, R-1) per
+  axis go through softmax and cumulative sum per row (x) / column (y): a monotone grid of sampling positions that maps
+  the image onto itself (no crop, no padding). `warp(x, G)(u) = x(G(u))`, bilinear. Constant parameters are the
+  identity.
+- **Canonicalizer** (`Canonicalizer`, as `DEMAdapter`). A conv net scores the image seen through the current warp,
+  `f(phi) = net(warp(image, phi))`; the warp is the fixed point `phi* = f(phi*)`, found by Anderson acceleration without
+  gradient, followed by one differentiable step from `phi*` (Jacobian-free backpropagation). It runs in FP32 at
+  `dem_size` (~23k parameters per warp for the defaults). The final norm starts at weight 0, so every warp starts at
+  the identity and a pretrained detector is unchanged at the first step.
+- **Input canonicalization** (`input: true`). The detector runs on the canonical image. In eval mode the decoded boxes
+  are mapped back to the input frame inside the model, so NMS, metrics and `detect.py` see input-frame boxes. In
+  training the targets are mapped into the canonical frame (and in `test.py`'s validation loss).
+- **Latent canonicalization** (`stages`). Each stage's input is warped and its output unwarped with the exact inverse,
+  so everything after the stage, including the neck's concatenations, is in the input frame. The stage's canonicalizer
+  sees the image in the stage's frame. The yaml is checked: only the stage's last layer may be read after it.
+- **Boxes.** Input frame -> warped frame: the bounding box of the warped box (points along its edges, inverted by
+  bisection + Newton steps). Warped frame -> input frame: the mean position of each edge. With separable warps both
+  are exact and invert each other. A non-separable warp shears boxes, and the bounding box of a sheared box loses
+  information: on random non-separable warps a round trip kept only 0.81 (strength 0.1) / 0.64 (0.25) IoU, against
+  1.00 for separable ones. Hence `separable: true` for the input warp.
+- **Consistency loss** (`lse_canon`, `utils/local_scale.py`). For a random warp A, an image x and `x' = warp(x, A)` have
+  the same canonical image when `G(x) = A o G(x')`. The loss is the squared difference of the two position grids, in
+  coarse grid cells, averaged over the warps. It runs the canonicalizers only (cheap) and has no trivial solution, so
+  it trains the canonicalizer to canonicalize. A stage warp after a canonicalized input sees the canonical frame, where
+  the relation is `G(x) = G(x')`.
+- **Equivariance loss** (`lse_equi`). The paper's output equivariance loss compares segmentation maps; detection
+  outputs are not equivariant under local scaling (a scaled object moves to other anchors or levels). The loss
+  therefore compares a scale-free map: the maximum objectness over anchors and levels, in the input frame. The map of
+  `warp(x, A)` must equal the map of x warped by A (Bernoulli KL divergence). The batch and its warped copy run as one
+  forward (one DDP forward, BatchNorm sees both), and the detection loss uses the first half.
+- **Augmentation** (`lse_aug`). Random warps of the same family on a fraction of each batch, on the GPU after the data
+  loader, labels warped with them. `train_batch*.jpg` shows the warped images and labels.
+- **Evaluation** (`test.py --lse-warp S`). Every val batch is warped by random non-separable warps of strength S
+  (grid 8), seeded by batch index, with its labels.
+- **Logs**: per epoch `lse loss (canon, equi, prior)` and TensorBoard `train/lse_*`. `prior` is the mean squared
+  distance of the warps from the identity in coarse cells, logged even with `lse_prior: 0`: it shows how much the
+  canonicalizers warp.
+
+### Differences from the reference implementation
+
+- `F.grid_sample` instead of the gather-based bilinear sampler. The reference needs that for double backward through
+  its inner optimization mode, which DEQ mode does not use.
+- Exact inverse warps (bisection + Newton) instead of the per-axis approximation of `inv_deform`.
+- No torchdeq: a built-in Anderson solver with a fixed maximum number of iterations, then one gradient step.
+- Warps start at the identity (final norm weight 0, the reference uses 1).
+- The canonicalizers see the image in [0, 1], resized with antialiasing to `dem_size`. They do not see the ImageNet-normalized 224 x 224
+  image (YOLO inputs are letterboxed, unnormalized, and not 224 x 224).
+- Losses adapted to detection (above). The reference's `unique_optima_loss` is not ported.
+
+### Implementation
+
+- `models/local_scale.py`: warps, inversion, box mapping, `Canonicalizer`, `LocalScale` (the `lse:` section),
+  `canonical_targets`.
+- `models/yolo.py: Model`: builds `self.lse` from the yaml; `forward_once` calls `lse.begin` before the first layer,
+  `stage_in` / `stage_out` around stages, `lse.end` on the detection output. Stock yamls and older checkpoints have no
+  `lse` and run exactly as before.
+- `utils/local_scale.py: LocalScaleLoss`: augmentation, losses. `train.py`: the canonicalizers' own optimizer group
+  (no `--freeze` effect), the losses and logs. `test.py`: `--lse-warp` and validation-loss targets.
+- `LocalScale` keeps the last batch's warps (`grids`) for the losses; they are dropped when the model is copied or
+  saved.
+
+### Notes
+
+- **Cost.** Each canonicalizer net runs `iters + 1` times per warp at `dem_size` x `dem_size`. That dominates; the
+  warps themselves are cheap. With the tiny configs (`dem_size: 160`) on CPU, batch 4 at 320 x 416, relative to stock
+  yolov7-tiny: input 1.4x per training step and 2.1x in eval, latent 1.8x and 2.6x. At `dem_size: 256` the eval cost
+  was 3.4x / 6.0x. GPU ratios will differ: measure with the speed line of `test.py`.
+- **Loss balance.** At initialization the detection loss's gradient on the canonicalizers was ~100x that of the
+  consistency loss (synthetic data). With `lse_canon: 1` the canonicalizers therefore mostly learn warps that help
+  detection (a learned zoom) rather than a canonical form. Raise `lse_canon` if canonicalization is the goal, and
+  watch `lse loss (canon, ...)` in the log.
+- **Not supported with lse models**: `export.py` (data-dependent solver loop, `grid_sample`: refused), `train_aux.py`
+  (refused), DataParallel (training falls back to one GPU; DDP works), `--teacher` with input canonicalization (the
+  student would predict in another frame than the teacher; refused). `--teacher` with latent canonicalization works.
+- Random non-separable warps fold, i.e. stop being invertible, above strength ~0.25 (2.5% of the area at 0.5).
+  Keep `lse_strength` <= 0.25, or use separable warps.
+
+**Checked** (CPU, synthetic data):
+- Stock yamls unchanged: a seeded 2-epoch stock run gives the same `results.txt` as before the change; seeded lse runs
+  (input canonicalization with all losses and augmentation) are reproducible.
+- At initialization an lse model loaded with stock weights gives the stock outputs (raw outputs within 1e-6, boxes
+  within 2e-4 px), for input and latent canonicalization.
+- Warped labels match the bounding box of the warped object mask within ~1 px. Separable warps: inversion residual <
+  3e-5 at any strength, box round trips exact. Non-separable warps: 99% of points invert to < 1e-7 at strength 0.25.
+  Failures coincide with folds, i.e. points where the warp has no inverse (0.001% of the area at 0.25, 2.5% at 0.5).
+- Gradients reach the canonicalizers from the detection loss and from the consistency loss. Trained on the consistency
+  loss alone (Adam, synthetic images), the canonicalizers learned to canonicalize: the loss fell 0.069 -> 0.035
+  (input) and 0.100 -> 0.021 (latent) in 120 steps.
+- Training (with `lse_canon`, `lse_equi`, `lse_aug`), checkpoints, `--resume` (the canonicalizers' optimizer
+  group included), `test.py` (with and without `--lse-warp`), `detect.py`, fine-tuning an lse model from stock
+  weights (all stock weights transferred).
+
+---
+
 ## What was tested
 
 All on CPU with synthetic data (generated frames with known objects; real camera data and GPUs were not available):
@@ -707,6 +863,7 @@ All on CPU with synthetic data (generated frames with known objects; real camera
   zoom; ~50% of training frames inverted at `px_inversion_prob: 0.5`; val untouched except with `--invert`; missing /
   bad borders refused. `to_gray`: 27% of frames gray at 0.3, every train and val frame at 1.0; gray then inverted
   composes correctly.
+- Local scale canonicalization: see [section 14](#14-local-scale-canonicalization), "Checked".
 
 ## Known limitations
 
@@ -717,6 +874,8 @@ All on CPU with synthetic data (generated frames with known objects; real camera
 - Resumed runs are not bit-identical to uninterrupted ones (fp16 checkpoints).
 - `--evolve` is untested with the new options, and `--fitness-area-weights` is refused with it.
 - Repeat-factor sampling is only available through a multi-source data yaml (a single source works).
+- Local scale canonicalization (section 14) is experimental: untuned defaults; no export, `train_aux.py` or
+  DataParallel support.
 
 ## Citation
 

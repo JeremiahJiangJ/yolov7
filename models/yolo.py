@@ -13,6 +13,7 @@ from utils.general import make_divisible, check_file, set_logging
 from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
     select_device, copy_attr
 from utils.loss import SigmoidBin
+from models.local_scale import LocalScale
 
 try:
     import thop  # for FLOPS computation
@@ -573,6 +574,9 @@ class Model(nn.Module):
             self._initialize_biases_kpt()  # only run once
             # print('Strides: %s' % m.stride.tolist())
 
+        # Local scale canonicalization (optional): `lse:` in the model yaml, see models/local_scale.py
+        self.lse = LocalScale(self.yaml['lse'], self.model) if self.yaml.get('lse') else None
+
         # Init weights, biases
         initialize_weights(self)
         self.info()
@@ -600,9 +604,14 @@ class Model(nn.Module):
 
     def forward_once(self, x, profile=False):
         y, dt = [], []  # outputs
+        lse = getattr(self, 'lse', None)  # local scale canonicalization; None in stock models and older checkpoints
+        if lse is not None:
+            x = lse.begin(x)
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if lse is not None and m.i in lse.starts:
+                x = lse.stage_in(m.i, x)
 
             if not hasattr(self, 'traced'):
                 self.traced=False
@@ -623,12 +632,14 @@ class Model(nn.Module):
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
+            if lse is not None and m.i in lse.ends:
+                x = lse.stage_out(m.i, x)
             
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
-        return x
+        return lse.end(x) if lse is not None else x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3

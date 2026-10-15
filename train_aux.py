@@ -33,6 +33,7 @@ from utils.google_utils import attempt_download
 from utils.metrics import area_fitness, area_bins, DEFAULT_FITNESS_WEIGHTS
 from utils.loss import ComputeLoss, ComputeLossAuxOTA
 from utils.distill import Distiller
+from models.local_scale import get_lse
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel, \
     torch_load
@@ -101,6 +102,8 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    assert get_lse(model) is None, 'models with an lse: section (local scale canonicalization) are only supported ' \
+                                   'by train.py'
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
