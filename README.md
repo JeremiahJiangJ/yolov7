@@ -861,7 +861,12 @@ tracking in `utils/datasets.py`).**
   with the same weights (canonicalizers randomised, so the warps are far from the identity), mosaic tiles, warp
   augmentation and the size target, the training outputs, warped labels, losses, statistics, every gradient and the
   inference boxes are bit-identical, for `input`, `P3`, `P3-P5`, `input` + `P1-P5`, an explicit span, `P3+`, `input` +
-  `P3+`, `P2+` (yolov7-tiny), `input` + `P3-P5` (yolov7) and `input` + `P3-P4` (no pyramid).
+  `P3+`, `P2+` (yolov7-tiny), `input` + `P3-P5` (yolov7) and `input` + `P3-P4` (no pyramid). In training runs the
+  same LSE configs give the same optimizer groups, the same weights loaded from a plain checkpoint and comparable
+  warps (not bit-identical runs: the DEC layers are now created before the detector's, which changes the random
+  initialisation order); a run without DECs is bit-identical to before. A `cfg/training/dec/` yaml loads plain weights
+  into its plain layers; training continues from a DEC checkpoint without flags (all weights restored); `test.py`
+  (also `--warp-test`) and `detect.py` run on DEC checkpoints.
 - At initialisation, every placement (`input`, `P3`, `P3-P5`, `input` + `P1-P5`, explicit spans, `P3+`, `input` +
   `P3+`, `P2+`; yolov7-tiny and yolov7) gives the plain detector's outputs (within 1.8e-4), also with mosaic tiles; the
   stock pipeline (no `--lse`) is unchanged; after one step every canonicalizer parameter receives gradients; invalid
