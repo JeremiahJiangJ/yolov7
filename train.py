@@ -30,6 +30,8 @@ from utils.datasets import letterbox
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
 from utils.lse import plot_warps
+from models.dec import DEC, ARCH_KEYS as DEC_ARCH_KEYS, dec_parameters, dec_yaml, map_plain_weights, \
+    preview as dec_preview, write_yaml as write_dec_yaml
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
     usage_report, measure_sources
 from utils.distill import Distiller
@@ -100,35 +102,41 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Model
     pretrained = weights.endswith('.pt')
+    dec_notes = []  # --lse: a comment per layer of the DEC model yaml
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        lse_cfg = opt.lse or (getattr(ckpt['model'], 'lse', None) and ckpt['model'].lse.cfg)  # --lse, else the ckpt's
-        if lse_cfg:  # attach before loading, so a checkpoint's canonicalizer weights are restored too
-            model.attach_lse(lse_cfg)
+        cfg = opt.cfg or ckpt['model'].yaml  # a checkpoint of a DEC model rebuilds its DEC layers
+        if opt.lse:  # the architecture with deep equilibrium canonicalizer layers (models/dec.py)
+            cfg = dec_yaml(cfg, opt.lse, dec_notes)
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
+        state_dict = map_plain_weights(state_dict, ckpt['model'], model)  # plain checkpoint -> DEC model layers
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        if opt.lse:
-            model.attach_lse(opt.lse)
-    lse = getattr(model, 'lse', None)  # local scale equivariance (README.md, section 14)
-    if lse is not None:
-        logger.info(colorstr('lse: ') + f"canonicalizers {lse.names} (stage spans {lse.spans}): " +
-                    ', '.join(f'{k}={v}' for k, v in lse.cfg.items() if k != 'decs'))
-        assert not (opt.teacher and lse.frame), \
+        model = Model(dec_yaml(opt.cfg, opt.lse, dec_notes) if opt.lse else opt.cfg, ch=3, nc=nc,
+                      anchors=hyp.get('anchors')).to(device)  # create
+    dec_ctx = model.dec_ctx  # deep equilibrium canonicalizer layers (local scale equivariance, README.md section 14)
+    if dec_ctx is not None:
+        decs = [m for m in model.model if isinstance(m, DEC)]
+        logger.info(colorstr('dec: ') + 'canonicalizers ' + ', '.join(
+            f"{m.name} (layer {m.i}, {'frame' if m.frame else 'closed'})" for m in decs) + '; ' +
+                    ', '.join(f'{k}={v}' for k, v in dec_ctx.cfg.items() if k not in ('decs',) + DEC_ARCH_KEYS))
+        if opt.lse and rank in [-1, 0]:
+            write_dec_yaml(model.yaml, save_dir / 'dec_model.yaml', f'# DEC model of this run (--cfg / checkpoint '
+                                                                    f'architecture with --lse {opt.lse})\n\n', dec_notes)
+        assert not (opt.teacher and any(m.frame for m in decs)), \
             '--teacher with an input / open-ended (Pk+) canonicalizer is not supported (the student predicts in the ' \
             'canonical frame)'
         if hyp.get('mixup', 0) > 0:
-            logger.warning(colorstr('lse: ') + 'mixup blends two scenes: those samples are canonicalized as one image '
+            logger.warning(colorstr('dec: ') + 'mixup blends two scenes: those samples are canonicalized as one image '
                                                '(set mixup: 0 for one warp per frame throughout)')
         if any(hyp.get(k, 0) for k in ('degrees', 'shear', 'perspective')):
-            logger.warning(colorstr('lse: ') + 'rotation / shear / perspective augmentation: frame tiles are '
+            logger.warning(colorstr('dec: ') + 'rotation / shear / perspective augmentation: frame tiles are '
                                                'approximated by their bounding rectangles')
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
@@ -156,8 +164,9 @@ def train(hyp, opt, device, tb_writer=None):
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    dec_params = {id(p) for p in dec_parameters(model)} if dec_ctx is not None else set()
     for k, v in model.named_modules():
-        if k.startswith('lse'):  # canonicalizers: own group below (lr_scale)
+        if any(id(p) in dec_params for p in v.parameters(recurse=False)):  # DEC layers: own group below (lr_scale)
             continue
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
             pg2.append(v.bias)  # biases
@@ -229,11 +238,11 @@ def train(hyp, opt, device, tb_writer=None):
 
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    if lse is not None:  # canonicalizers, at lr0 x lr_scale
-        optimizer.add_param_group({'params': list(lse.parameters()), 'lr': hyp['lr0'] * lse.cfg['lr_scale'],
+    if dec_ctx is not None:  # DEC layers (canonicalizers, head scale convs), at lr0 x lr_scale
+        optimizer.add_param_group({'params': dec_parameters(model), 'lr': hyp['lr0'] * dec_ctx.cfg['lr_scale'],
                                    'weight_decay': hyp['weight_decay']})
     logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)) +
-                (f', {len(list(lse.parameters()))} canonicalizer (lr x {lse.cfg["lr_scale"]})' if lse is not None else ''))
+                (f', {len(dec_parameters(model))} DEC (lr x {dec_ctx.cfg["lr_scale"]})' if dec_ctx is not None else ''))
     del pg0, pg1, pg2
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
@@ -388,7 +397,7 @@ def train(hyp, opt, device, tb_writer=None):
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
-    if lse is not None and rank in [-1, 0] and plots:
+    if dec_ctx is not None and rank in [-1, 0] and plots:
         ims, rects = [], []
         for f in getattr(testloader.dataset, 'img_files', [])[:4]:
             im = cv2.imread(f)
@@ -477,8 +486,8 @@ def train(hyp, opt, device, tb_writer=None):
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        if lse is not None:
-            (model.module if is_parallel(model) else model).lse.epoch = epoch  # det_grad_epochs warm-up
+        if dec_ctx is not None:
+            (model.module if is_parallel(model) else model).dec_ctx.epoch = epoch  # det_grad_epochs warm-up
         for i, (imgs, targets, paths, extras) in pbar:  # batch -------------------------------------------------------------
             if not opt.quad:  # per-source usage (quad batches merge images)
                 n_obj = np.bincount(targets[:, 0].long().numpy(), minlength=len(paths))
@@ -509,7 +518,7 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward
             with amp.autocast(enabled=cuda):
-                if lse is not None:  # targets come back in the frame of the predictions (warped in input mode)
+                if dec_ctx is not None:  # targets come back in the frame of the predictions (frame DECs)
                     tiles = list(extras) if all(torch.is_tensor(t) for t in extras) else None  # frame rectangles
                     pred, targets_l, loss_lse, lse_stats = model(imgs, lse_targets=targets.to(device), lse_tiles=tiles)
                 else:
@@ -518,7 +527,7 @@ def train(hyp, opt, device, tb_writer=None):
                     loss, loss_items = compute_loss_ota(pred, targets_l, imgs)  # loss scaled by batch_size
                 else:
                     loss, loss_items = compute_loss(pred, targets_l)  # loss scaled by batch_size
-                if lse is not None:  # consistency + prior, scaled by batch size like the detection loss
+                if dec_ctx is not None:  # consistency + prior + size, scaled by batch size like the detection loss
                     loss = loss + loss_lse * imgs.shape[0]
                     for k, v in lse_stats.items():  # running means (a key can be missing from a batch)
                         c = nlse[k] = nlse.get(k, 0) + 1
@@ -558,11 +567,11 @@ def train(hyp, opt, device, tb_writer=None):
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-                    if lse is not None and lse.has_input and ni < 3:  # what the detector sees, with its labels
-                        ci, ct = (model.module if is_parallel(model) else model).lse.preview(imgs, targets.to(device),
-                                                                                             tiles)
-                        Thread(target=plot_images, args=(ci.cpu(), ct.cpu(), paths, save_dir / f'train_batch{ni}_lse.jpg'),
-                               daemon=True).start()
+                    pv = dec_preview(model.module if is_parallel(model) else model, imgs, targets.to(device),
+                                     tiles) if dec_ctx is not None and ni < 3 else None  # what the detector sees
+                    if pv is not None:  # (input DEC), with its labels
+                        Thread(target=plot_images, args=(pv[0].cpu(), pv[1].cpu(), paths,
+                                                         save_dir / f'train_batch{ni}_lse.jpg'), daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
@@ -582,9 +591,9 @@ def train(hyp, opt, device, tb_writer=None):
             with open(save_dir / 'data_usage.txt', 'a') as f:
                 f.write(f'epoch {epoch}/{epochs - 1}\n{usage}\n')
 
-        if lse is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
+        if dec_ctx is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
-            logger.info(colorstr('lse: ') + f'{line} (obj_px median object size the detector sees; per '
+            logger.info(colorstr('dec: ') + f'{line} (obj_px median object size the detector sees; per '
                                              f'canonicalizer: eq consistency, size target, obj_px in its canonical '
                                              f'frame, disp mean warp displacement, zoom_in / zoom_out strongest local '
                                              f'magnification / shrinking)')
@@ -596,7 +605,7 @@ def train(hyp, opt, device, tb_writer=None):
                 if wandb_logger.wandb:
                     wandb_logger.log({f'lse/{k}': v})
             if plots and lse_vis is not None:  # warp progression on fixed validation images: lse/<dec>/epoch_*.jpg
-                for name, (panel, overlay) in plot_warps(ema.ema.lse, lse_vis[0].to(device), lse_vis[1]).items():
+                for name, (panel, overlay) in plot_warps(ema.ema, lse_vis[0].to(device), lse_vis[1]).items():
                     d = save_dir / 'lse' / name
                     d.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(d / f'epoch_{epoch:03d}.jpg'), panel)
@@ -834,8 +843,9 @@ if __name__ == '__main__':
     parser.add_argument('--deterministic', action='store_true',
                         help='reproducible training: cudnn.benchmark off, cudnn.deterministic on')
     parser.add_argument('--lse', type=str, default='',
-                        help='local scale equivariance config yaml (data/lse/*.yaml, README.md section 14); a '
-                             'checkpoint trained with LSE keeps it without this flag')
+                        help='local scale equivariance config yaml (data/lse/*.yaml, README.md section 14): adds deep '
+                             'equilibrium canonicalizer layers to the --cfg (or checkpoint) architecture. A DEC model '
+                             'yaml (--cfg) or checkpoint has them already, without this flag')
     parser.add_argument('--teacher', type=str, default='',
                         help='distill from this larger model (weights .pt with the same classes), see utils/distill.py')
     parser.add_argument('--distill-weight', type=float, default=1.0,

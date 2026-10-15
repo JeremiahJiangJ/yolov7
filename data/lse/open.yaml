@@ -4,6 +4,9 @@
 # predicted boxes are mapped back to the image, but the stem (P1, P2) still sees the original image, and features are
 # warped instead of pixels (no resampling blur of the image). Starts as the identity.
 #   python train.py --lse data/lse/open.yaml ...   (test.py / detect.py: nothing to add, the checkpoint keeps it)
+# --lse adds deep equilibrium canonicalizer layers to the --cfg architecture (models/dec.py); the run directory's
+# dec_model.yaml is that architecture (usable as --cfg). Written without training: python -m models.dec --cfg <yaml>
+# --lse data/lse/open.yaml --out <yaml>. Ready-made DEC models: cfg/training/dec/.
 
 # --- Where ------------------------------------------------------------------------------------------------------------
 decs: [P3+]        # input | P1..P6 (closed backbone stages, data/lse/stages.yaml) | P1+..P6+ (open-ended, from that stage

@@ -39,6 +39,8 @@ class Distiller:
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
+        assert not any(getattr(m, 'frame', False) for m in self.teacher.model), \
+            'teacher with an input / open-ended (Pk+) canonicalizer: its outputs are in its canonical frame'
         t, s = _head(self.teacher), _head(student)
         assert t.nc == s.nc, f'teacher predicts {t.nc} classes, student {s.nc}: they must predict the same classes'
         assert t.na == s.na, f'teacher has {t.na} anchors per level, student {s.na}'

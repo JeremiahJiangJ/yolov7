@@ -52,7 +52,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | A bigger model to guide tiny | `--teacher yolov7.pt` | [11](#11-knowledge-distillation) |
 | IR white-hot and black-hot | `px_inversion_prob:` + `inversion_border:` in the data yaml, `test.py --invert` | [12](#12-ir-polarity-inversion-and-grayscale) |
 | RGB data supplementing IR | `to_gray: 1.0` on the RGB source | [12](#12-ir-polarity-inversion-and-grayscale) |
-| Objects whose apparent size changes as they move (near / far) | `--lse data/lse/input.yaml` | [14](#14-local-scale-equivariance) |
+| Objects whose apparent size changes as they move (near / far) | `--cfg cfg/training/dec/yolov7-tiny-dec-input.yaml` or `--lse data/lse/input.yaml` | [14](#14-local-scale-equivariance) |
 
 ## Contents
 
@@ -71,7 +71,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
 | 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
-| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--lse data/lse/{input,open,stages}.yaml`, `test.py --warp-test`, `--cfg cfg/training/yolov7-tiny-nofpn-p*.yaml` | `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py`, `scripts/*_lse_experiments.sh` |
+| 14 | [Local scale equivariance](#14-local-scale-equivariance) | `--cfg cfg/training/dec/*.yaml` or `--lse data/lse/{input,open,stages}.yaml`, `test.py --warp-test`, `--cfg cfg/training/yolov7-tiny-nofpn-p*.yaml` | `models/dec.py`, `utils/lse.py`, `models/yolo.py`, `train.py`, `test.py`, `detect.py`, `scripts/*_lse_experiments.sh` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
@@ -699,10 +699,41 @@ ICCV 2025) adds **deep equilibrium canonicalizers (DECs)**: small networks that 
 rescales parts of the frame differently, so the detector sees objects at a more uniform, "canonical" scale. Boxes are
 always reported in image pixels.
 
-**Usage.** `train.py --lse data/lse/input.yaml` (or `open.yaml`, `stages.yaml`, `exp/*.yaml`, or your own). The
-checkpoint keeps the canonicalizers: `test.py`, `detect.py` and fine-tuning from it need no flag. Every DEC starts as
-the identity (its output layer is zero), so `--weights yolov7-tiny.pt --lse ...` starts from exactly the pretrained
-detector. Experiments: `scripts/train_lse_experiments.sh` and `scripts/test_lse_experiments.sh` (below).
+**Usage.** DECs are layers of the model architecture (yolov7-DEC models, `models/dec.py`), in either of two ways:
+- a DEC model yaml: `train.py --cfg cfg/training/dec/yolov7-tiny-dec-input.yaml --weights yolov7-tiny.pt ...`. Ready
+  ones in `cfg/training/dec/`: `yolov7-tiny-dec-input`, `-p3open`, `-p345`, `yolov7-tiny-nofpn-p4-dec-input`,
+  `yolov7-dec-input`. Write others with `python -m models.dec --cfg <plain model yaml> --lse <LSE config> --out <yaml>`,
+  or edit one by hand (layers below);
+- `train.py --cfg <plain model yaml> --lse data/lse/input.yaml` (or `open.yaml`, `stages.yaml`, `exp/*.yaml`, or your
+  own): builds that DEC model yaml at the start (saved as `dec_model.yaml` in the run directory).
+
+The checkpoint is a DEC model: `test.py`, `detect.py` and fine-tuning from it need no flag. A plain checkpoint
+(`--weights yolov7-tiny.pt`) loads into the plain layers (matched in order), and every DEC starts as the identity
+(its output layer is zero), so training starts from exactly the pretrained detector. Experiments:
+`scripts/train_lse_experiments.sh` and `scripts/test_lse_experiments.sh` (below).
+
+**Architecture (yolov7-DEC).** Five layer types, used in the model yaml like any other layer:
+
+| Layer | `from` | Does |
+|---|---|---|
+| `DECInput` | `-1` (layer 0) | the input image, so that later layers can read it |
+| `DEC` | an image layer | a canonicalizer: its args `[name, grid, max_zoom, canon_size, channels, iters, grad_iters]`; outputs the warps of its regions |
+| `DECWarp` | `[x, dec]` | x (the image or a feature map) warped into that DEC's canonical frame |
+| `DECUnwarp` | `[x, dec]` | x warped back to the image frame |
+| `DECScale` | `[x, dec, ...]` | x + zero-initialised 1x1 conv of the listed DECs' local log magnification (tells a head what was rescaled) |
+
+A DEC that no `DECUnwarp` reads is a *frame* DEC: the predictions are in its canonical frame, so the DEC layer warps
+the training labels into it and the model maps the predicted boxes back (in reverse layer order). The yaml's
+top-level `dec:` holds the training settings (the loss, warp augmentation and learning-rate keys below). An input DEC
+in yaml form:
+
+```yaml
+backbone:
+  [[-1, 1, DECInput, []],                                  # 0: the image
+   [0, 1, DEC, [input, 8, 4.0, 224, [16, 32, 64], 4, 2]],  # 1: canonicalizer
+   [[0, 1], 1, DECWarp, []],                               # 2: the canonical image
+   [2, 1, Conv, [32, 3, 2, None, 1, nn.LeakyReLU(0.1)]],   # 3: yolov7-tiny's layer 0, and so on
+```
 
 **Where (`decs`).** Each entry gets its own canonicalizer:
 
@@ -800,7 +831,11 @@ at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-poin
 `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`, `det_grad_epochs`, `min_conf` (predictions with a lower
 objectness are not mapped back, 0.001 = test.py's default `--conf-thres`; NMS drops them).
 
-**Implementation (`utils/lse.py`, hooks in `models/yolo.py`, tile tracking in `utils/datasets.py`).**
+**Implementation (`models/dec.py` layers and yaml generator, `utils/lse.py` geometry, canonicalizer and plots, tile
+tracking in `utils/datasets.py`).**
+- The DEC layers of a model share a context for each forward pass (`Model.forward_once` starts and ends it): the
+  regions, each DEC's warps, the labels in the current frame, the auxiliary losses and statistics, cached sampling
+  grids. Otherwise the model runs its layers as any yolov7 model.
 - Warp family: a coarse grid of monotone knots per region (cell widths = softmax of bounded parameters; `max_zoom`
   bounds the local zoom). A canonical point (u, v) samples the input at y = gy(u, v), x = gx(u, y). Evaluating gx at
   the input row y (rather than at v, as in the paper's family) makes the Jacobian determinant gx_u * gy_v positive
@@ -815,11 +850,18 @@ objectness are not mapped back, 0.001 = test.py's default `--conf-thres`; NMS dr
   nothing), so the parameters do not drift into the flat part of tanh. It runs in fp32 outside autocast.
 - Regions: per image, the frame rectangles of the sample (or the whole image); crops resized to canon_size go to the
   canonicalizer, the sampling grid is assembled region by region. Boxes belong to the region containing their centre.
-- Stage spans are found from each backbone layer's output stride (a dummy forward). Inside a span, inputs from earlier
-  layers are warped on entry (so blocks that read several earlier layers, as in yolov7's downsampling blocks, work).
-- `test.py` / `detect.py` do not trace LSE models (the canonicalizers are data dependent).
+- `--lse` / `python -m models.dec`: stage spans are found from each backbone layer's output stride (a dummy forward of
+  the plain model). Every input of a span from before it gets a `DECWarp` (so blocks that read several earlier layers,
+  as in yolov7's downsampling blocks, work); a closed span ends with a `DECUnwarp`; the detection head's inputs get a
+  `DECScale` per closed DEC set.
+- `test.py` / `detect.py` do not trace DEC models (the canonicalizers are data dependent).
 
 **Checked** (CPU, synthetic data)
+- The DEC layers reproduce the earlier implementation (canonicalizers attached to the model at run time) exactly:
+  with the same weights (canonicalizers randomised, so the warps are far from the identity), mosaic tiles, warp
+  augmentation and the size target, the training outputs, warped labels, losses, statistics, every gradient and the
+  inference boxes are bit-identical, for `input`, `P3`, `P3-P5`, `input` + `P1-P5`, an explicit span, `P3+`, `input` +
+  `P3+`, `P2+` (yolov7-tiny), `input` + `P3-P5` (yolov7) and `input` + `P3-P4` (no pyramid).
 - At initialisation, every placement (`input`, `P3`, `P3-P5`, `input` + `P1-P5`, explicit spans, `P3+`, `input` +
   `P3+`, `P2+`; yolov7-tiny and yolov7) gives the plain detector's outputs (within 1.8e-4), also with mosaic tiles; the
   stock pipeline (no `--lse`) is unchanged; after one step every canonicalizer parameter receives gradients; invalid
@@ -839,7 +881,8 @@ objectness are not mapped back, 0.001 = test.py's default `--conf-thres`; NMS dr
 
 **Limitations.** Not supported: `train_aux.py`, `--teacher` with an `input` or open-ended DEC (the student predicts in
 the canonical frame; closed stage DECs work), `--quad`, test-time augmentation with the validation loss, `export.py`.
-Closed stage DECs need a `Detect` / `IDetect` head. Mapping predictions back costs ~1 ms per box on CPU (batched on
+Closed stage DECs need a `Detect` / `IDetect` head. `--freeze` counts the DEC layers too (the plain layers' indices
+shift). Checkpoints of the earlier run-time version of this branch (`model.lse`) do not load. Mapping predictions back costs ~1 ms per box on CPU (batched on
 GPU), for the boxes above `min_conf`. Not yet tested on GPU or real data: whether and how much it helps is an
 experiment.
 

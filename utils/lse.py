@@ -1,9 +1,10 @@
 # Local scale equivariance (LSE) for YOLOv7, after "Local Scale Equivariance with Latent Deep Equilibrium
-# Canonicalizer" (Rahman et al., ICCV 2025). See README.md, section 14.
+# Canonicalizer" (Rahman et al., ICCV 2025). See README.md, section 14. This file: the LSE config, the warp geometry,
+# the canonicalizer network and plots; the model layers that use them (DEC models) are in models/dec.py.
 #
 # Deep equilibrium canonicalizers (DECs) pick, per frame, a smooth monotone warp that rescales parts of the frame
 # differently, so objects whose apparent size varies (e.g. with distance) are seen at a more uniform, "canonical" scale.
-# Each DEC has its own canonicalizer network; `decs` lists where they are inserted:
+# Each DEC has its own canonicalizer network; `decs` lists where models/dec.py dec_yaml() inserts them:
 #   input:  the detector runs on the warped (canonical) image; labels are warped into it for training and predicted
 #           boxes are mapped back. The detector itself is unchanged.
 #   P1..P6: the backbone stage starting at the stride-2^k downsampling layer runs in a canonical frame: its inputs are
@@ -488,154 +489,6 @@ class Canonicalizer(nn.Module):
         return make_grid(phi_x, phi_y, self.max_zoom), phi_x, phi_y
 
 
-class LSE(nn.Module):
-    """Deep equilibrium canonicalizers attached to a Model as model.lse (see Model.attach_lse)."""
-
-    def __init__(self, cfg, stages=None, head_channels=(), layer_from=None):
-        super().__init__()
-        self.cfg = cfg = load_lse_cfg(cfg)
-        self.epoch = 0  # set by train.py (det_grad_epochs)
-        self.names = [dec_name(d) for d in cfg['decs']]
-        self.spans = {}  # latent DEC name -> [first, last] layer (last None: open-ended, never warped back)
-        for d, name in zip(cfg['decs'], self.names):
-            if name == 'input':
-                continue
-            if isinstance(d, str):
-                k = d.rstrip('+')
-                assert stages and k in stages, f'LSE dec {d}: this model has backbone stages {sorted(stages or {})}'
-                self.spans[name] = [stages[k][0], None] if d.endswith('+') else stages[k]
-            else:
-                self.spans[name] = d
-        validate_spans([v for v in self.spans.values() if v[1] is not None], layer_from)
-        self.canon = nn.ModuleDict({n: Canonicalizer(cfg['grid'], cfg['channels'], cfg['max_zoom'], cfg['canon_size'],
-                                                     cfg['iters'], cfg['grad_iters']) for n in self.names})
-        self.has_input = 'input' in self.names
-        self.latent = [n for n in self.names if n != 'input']  # stage DECs (they see the detector input)
-        self.closed = [n for n in self.latent if self.spans[n][1] is not None]  # warped back at the end of the stage
-        self.frame = [n for n in self.names if n == 'input' or n.endswith('+')]  # DECs the predictions are made in
-        n_layers = len(layer_from) if layer_from is not None else 0
-        self.layer_dec = {i: n for n, (a, b) in self.spans.items()  # layer -> stage DEC
-                          for i in range(a, (b if b is not None else n_layers - 1) + 1)}
-        if self.closed:  # local scale of every closed stage DEC -> head features (zero-initialised: no effect at start)
-            self.cond = nn.ModuleList(nn.Conv2d(2 * len(self.closed), c, 1) for c in head_channels)
-            for m in self.cond:
-                nn.init.zeros_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def _solve(self, name, s):
-        return self.canon[name].solve(s)
-
-    def forward_input(self, x, tiles=None, targets=None):
-        """Canonicalize a batch x (B, 3, H, W) in [0, 1]. Returns the detector input (randomly rescaled by warp_aug,
-        then warped by the input DEC if any), the regions with their warps per DEC, the targets in the frame of the
-        predictions (None if no targets), the auxiliary loss and statistics (training; else None)."""
-        cfg, n, (h, w) = self.cfg, x.shape[0], x.shape[-2:]
-        R, mz = cfg['grid'], cfg['max_zoom']
-        regs, loss, stats = {}, None, None
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            xf = x.float()
-            base = Regions.make(n, tiles if self.training and cfg['per_tile'] else None, x.device)
-            if self.training and cfg['warp_aug'] > 0:  # rescale some regions at random (labels follow)
-                K = len(base.b)
-                tx, ty = random_phi(K, R, cfg['warp_aug_strength'], x.device)
-                on = (torch.rand(K, 1, 1, device=x.device) < cfg['warp_aug']).float()
-                aug = base.with_grid(make_grid(tx * on, ty * on, mz))
-                with torch.no_grad():
-                    xf = aug.warp(xf)
-                    if targets is not None:
-                        targets = warp_targets(targets, aug, h, w)
-            if self.training:
-                loss, stats = xf.new_zeros(()), {'regions/img': len(base.b) / n}
-                if targets is not None and len(targets):  # median object size the detector sees (for target_size)
-                    stats['obj_px'] = torch.sqrt(targets[:, 4].float() * w * targets[:, 5].float() * h).median().item()
-            warm = self.training and self.epoch < cfg['det_grad_epochs']
-            for name in (['input'] if self.has_input else []) + self.latent:  # input first: the stages see its output
-                s = base.crops(xf, cfg['canon_size'])
-                G, phi_x, phi_y = self._solve(name, s)
-                reg = base.with_grid(G)
-                if self.training:
-                    l, st = self._aux(name, s, G, phi_x, phi_y, reg, targets, h, w)
-                    loss = loss + l
-                    stats.update({f'{name}/{k}': v for k, v in st.items()})
-                regs[name] = base.with_grid(G.detach()) if warm else reg  # warm-up: no detection gradient yet
-                if name in self.frame and targets is not None:  # with gradients: content and its boxes move together
-                    targets = warp_targets(targets, regs[name], h, w)
-                if name == 'input':
-                    xf = regs[name].warp(xf)
-        return xf.to(x.dtype), regs, targets, loss, stats
-
-    def _aux(self, name, s, G, phi_x, phi_y, reg, targets, h, w):
-        """Consistency, prior and size losses of one DEC, and its statistics."""
-        cfg = self.cfg
-        if s.shape[0] > cfg['eq_regions']:  # a random subset of the regions: the second solve is the costly part
-            idx = torch.randperm(s.shape[0], device=s.device)[:cfg['eq_regions']]
-            s_eq, G_eq = s[idx], G[idx]
-        else:
-            s_eq, G_eq = s, G
-        tx, ty = random_phi(s_eq.shape[0], cfg['grid'], cfg['eq_strength'], s.device)
-        c = self.canon[name]
-        s_t = c.warp_crops(s_eq, make_grid(tx, ty, cfg['max_zoom']))
-        G_t, _, _ = c.solve(s_t)
-        eq = F.mse_loss(c.warp_crops(s_t, G_t), c.warp_crops(s_eq, G_eq))
-        prior = (torch.tanh(phi_x) ** 2).mean() + (torch.tanh(phi_y) ** 2).mean()
-        loss = cfg['eq_weight'] * eq + cfg['prior_weight'] * prior
-        stats = {'eq': eq.item(), 'prior': prior.item()}
-        if targets is not None and len(targets):
-            t = targets.float()
-            z, m = reg.zoom_at(t[:, 0].long(), t[:, 2], t[:, 3])
-            if m.any():
-                size = torch.sqrt(t[m, 4] * w * t[m, 5] * h).clamp_min(1)
-                stats['obj_px'] = (size * z.detach()).median().item()  # median object size in the canonical frame
-                if cfg['size_weight'] > 0:
-                    want = torch.log(cfg['target_size'] / size).clamp(-math.log(cfg['max_zoom']),
-                                                                      math.log(cfg['max_zoom']))
-                    size_loss = ((torch.log(z) - want) ** 2).mean()
-                    loss = loss + cfg['size_weight'] * size_loss
-                    stats['size'] = size_loss.item()
-        stats.update(warp_stats(G.detach()))
-        return loss, stats
-
-    def warp_feat(self, x, reg):
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            return reg.warp(x.float()).to(x.dtype)
-
-    def unwarp_feat(self, x, reg, cache):
-        key = tuple(x.shape[-2:])
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            if key not in cache:
-                cache[key] = reg.inverse_grid(x.shape[0], *key)
-            return F.grid_sample(x.float(), cache[key][0], mode='bilinear', padding_mode='border',
-                                 align_corners=False).to(x.dtype)
-
-    def condition(self, x, regs, caches):
-        """Head inputs (list of (B, C_i, h_i, w_i)) + a learned function of every latent DEC's local log magnification."""
-        out = []
-        for t, conv in zip(x, self.cond):
-            key = tuple(t.shape[-2:])
-            maps = []
-            for name in self.closed:
-                cache = caches.setdefault(name, {})
-                if key not in cache:
-                    with torch.autocast(device_type=t.device.type, enabled=False):
-                        cache[key] = regs[name].inverse_grid(t.shape[0], *key)
-                maps.append(cache[key][1])
-            out.append(t + conv(torch.cat(maps, 1).to(conv.weight.dtype)).to(t.dtype))
-        return out + list(x[len(self.cond):])
-
-    @torch.no_grad()
-    def preview(self, imgs, targets, tiles=None):
-        """What the detector sees for a training batch (input DEC; no random rescaling), with its targets, for plots."""
-        training = self.training
-        self.train(False)
-        try:
-            reg = Regions.make(imgs.shape[0], tiles if self.cfg['per_tile'] else None, imgs.device)
-            G, _, _ = self._solve('input', reg.crops(imgs.float(), self.cfg['canon_size']))
-            reg = reg.with_grid(G)
-            return reg.warp(imgs.float()), warp_targets(targets, reg, *imgs.shape[-2:])
-        finally:
-            self.train(training)
-
-
 def stage_spans(model):
     """Backbone stages of a Model: {'P1': [first, last], ...}. Stage k starts at the first layer whose output stride
     is 2^k and ends before the next stage starts (the last stage at the end of the backbone)."""
@@ -687,30 +540,33 @@ def validate_spans(spans, layer_from):
 # Visualisation
 # ----------------------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def plot_warps(lse, imgs, tiles=None, lines=8):
-    """Per DEC, a panel with one row per image: the image the DEC sees with its canonical grid drawn on it (where each
-    canonical cell samples from), the local zoom (red: magnified, blue: shrunk, full scale = max_zoom) and the canonical
-    image. imgs: (n, 3, H, W) in [0, 1] (RGB); tiles: per image the content rectangle(s) (e.g. without letterbox bars).
-    Returns {dec name: (panel, grid overlay of the first image)}, uint8 BGR."""
-    training = lse.training
-    lse.train(False)
+def plot_warps(model, imgs, tiles=None, lines=8):
+    """Per DEC layer of a DEC model (models/dec.py), a panel with one row per image: the image the DEC sees with its
+    canonical grid drawn on it (where each canonical cell samples from), the local zoom (red: magnified, blue: shrunk,
+    full scale = max_zoom) and the canonical image. imgs: (n, 3, H, W) in [0, 1] (RGB); tiles: per image the content
+    rectangle(s) (e.g. without letterbox bars). Returns {dec name: (panel, grid overlay of the first image)}, uint8 BGR."""
+    from models.dec import DEC
+    ctx, training = model.dec_ctx, model.training
+    model.eval()
+    ctx.keep = True  # keep the warps and the images the DECs see
     try:
-        cfg = lse.cfg
         x = imgs.float()
         n, _, H, W = x.shape
-        base = Regions.make(n, tiles, x.device)
-        lim = math.log(cfg['max_zoom'])
+        model(x, lse_tiles=tiles)
+        base = ctx.base
         t = torch.linspace(0, 1, 200, device=x.device)
         out = {}
-        for name in (['input'] if lse.has_input else []) + lse.latent:
-            G, _, _ = lse._solve(name, base.crops(x, cfg['canon_size']))
-            reg = base.with_grid(G)
-            canon = reg.warp(x)
+        for m in model.model:
+            if not isinstance(m, DEC):
+                continue
+            reg, seen, lim = ctx.regs[m.i], ctx.seen[m.i], math.log(m.canon.max_zoom)
+            G = reg.G
+            canon = reg.warp(seen)
             _, logm = reg.inverse_grid(n, max(H // 4, 1), max(W // 4, 1))
             zoom = logm.mean(1)  # log geometric magnification at each image location
             rows, first = [], None
             for i in range(n):
-                im = np.ascontiguousarray((x[i].permute(1, 2, 0).cpu().numpy()[:, :, ::-1] * 255).clip(0, 255)
+                im = np.ascontiguousarray((seen[i].permute(1, 2, 0).cpu().numpy()[:, :, ::-1] * 255).clip(0, 255)
                                           .astype(np.uint8))
                 ov = im.copy()
                 for k in torch.nonzero(base.b == i)[:, 0].tolist():  # each region of the image
@@ -727,13 +583,13 @@ def plot_warps(lse, imgs, tiles=None, lines=8):
                 heat = cv2.addWeighted(im, 0.4, heat, 0.6, 0)
                 cv = np.ascontiguousarray((canon[i].permute(1, 2, 0).cpu().numpy()[:, :, ::-1] * 255).clip(0, 255)
                                           .astype(np.uint8))
-                for p, label in ((ov, f'{name}: warp grid'), (heat, 'local zoom'), (cv, 'canonical')):
+                for p, label in ((ov, f'{m.name}: warp grid'), (heat, 'local zoom'), (cv, 'canonical')):
                     cv2.putText(p, label, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 rows.append(np.hstack([ov, heat, cv]))
                 first = ov if first is None else first
-            out[name] = (np.vstack(rows), first)
-            if name == 'input':
-                x = canon  # the stage DECs see the input DEC's canonical image
+            out[m.name] = (np.vstack(rows), first)
         return out
     finally:
-        lse.train(training)
+        ctx.keep = False
+        ctx.clear()
+        model.train(training)

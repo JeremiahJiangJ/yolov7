@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 import torch
 from models.common import *
 from models.experimental import *
+from models import dec as dec_layers
+from models.dec import DECInput, DEC, DECWarp, DECUnwarp, DECScale
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging
 from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
@@ -526,6 +528,7 @@ class Model(nn.Module):
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        self.dec_ctx = dec_layers.setup(self)  # deep equilibrium canonicalizer layers, if any (models/dec.py)
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
@@ -578,27 +581,10 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def attach_lse(self, cfg):
-        """Local scale equivariance (utils/lse.py, README.md section 14): adds self.lse, deep equilibrium canonicalizers
-        at the input and / or backbone stages. Starts as the identity: the model's outputs are unchanged until trained."""
-        from utils.lse import LSE, load_lse_cfg, stage_spans
-        cfg = load_lse_cfg(cfg)
-        if hasattr(self, 'lse'):
-            del self.lse  # re-attach: stage detection runs the plain model
-        head = self.model[-1]
-        latent = any(d != 'input' for d in cfg['decs'])
-        closed = any(d != 'input' and not (isinstance(d, str) and d.endswith('+')) for d in cfg['decs'])
-        assert not closed or isinstance(head, (Detect, IDetect)), 'LSE closed stage canonicalizers need Detect / IDetect'
-        ch = [m.in_channels for m in head.m] if isinstance(head, (Detect, IDetect)) else []
-        layer_from = [[m.f] if isinstance(m.f, int) else list(m.f) for m in self.model]
-        stages = stage_spans(self) if latent else {}
-        self.lse = LSE(cfg, stages=stages, head_channels=ch, layer_from=layer_from).to(next(self.parameters()).device)
-        return self.lse
-
     def forward(self, x, augment=False, profile=False, lse_targets=None, lse_tiles=None):
-        # lse_targets: with LSE, also return the targets in the frame of the predictions (warped by the input DEC) and
-        # the LSE auxiliary loss and statistics (training): (out, targets, lse_loss, lse_stats). lse_tiles: per image,
-        # the frame rectangles of a mosaic sample (training batches), canonicalized one by one
+        # DEC models (models/dec.py, README.md section 14). lse_targets: also return the targets in the frame of the
+        # predictions and the DEC auxiliary loss and statistics (training): (out, targets, dec_loss, dec_stats).
+        # lse_tiles: per image, the frame rectangles of a mosaic sample (training batches), canonicalized one by one
         if lse_targets is not None or lse_tiles is not None:
             assert not augment, 'lse_targets / lse_tiles are not supported with test-time augmentation'
             return self.forward_once(x, profile, lse_targets=lse_targets, lse_tiles=lse_tiles)
@@ -623,14 +609,11 @@ class Model(nn.Module):
 
     def forward_once(self, x, profile=False, lse_targets=None, lse_tiles=None):
         y, dt = [], []  # outputs
-        lse = getattr(self, 'lse', None)
-        dec = None
-        if lse is not None:  # local scale equivariance: canonicalizer warps (and the input DEC's warped image)
+        ctx = getattr(self, 'dec_ctx', None)
+        if ctx is not None:  # DEC layers: regions, warp augmentation and labels for this pass
             img_hw = x.shape[-2:]
-            x, regs, lse_targets, lse_loss, lse_stats = lse.forward_input(x, lse_tiles, lse_targets)
-            caches, entered = {}, {}  # inverse grids per DEC and size; inputs warped into a stage, per (DEC, layer)
+            x = ctx.begin(x, lse_tiles, lse_targets, self.training)
         for m in self.model:
-            prev = x
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
@@ -640,23 +623,6 @@ class Model(nn.Module):
             if self.traced:
                 if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
                     break
-
-            if lse is not None:
-                dec = lse.layer_dec.get(m.i)
-                if dec is not None:  # inside a stage canonicalizer's span: inputs from before the span are warped
-                    a = lse.spans[dec][0]
-                    ts = []
-                    for f in ([m.f] if isinstance(m.f, int) else list(m.f)):
-                        j = m.i - 1 if f == -1 else (f if f >= 0 else m.i + f)
-                        t = prev if f == -1 else y[j]
-                        if j < a:
-                            if (dec, j) not in entered:
-                                entered[(dec, j)] = lse.warp_feat(t, regs[dec])
-                            t = entered[(dec, j)]
-                        ts.append(t)
-                    x = ts[0] if isinstance(m.f, int) else ts
-                elif lse.closed and isinstance(m, (Detect, IDetect)):
-                    x = lse.condition(x, regs, caches)  # tell the head every stage's local scale
 
             if profile:
                 c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
@@ -671,24 +637,13 @@ class Model(nn.Module):
 
             x = m(x)  # run
 
-            if dec is not None and m.i == lse.spans[dec][1]:  # closed stage (open ones are never warped back)
-                x = lse.unwarp_feat(x, regs[dec], caches.setdefault(dec, {}))  # back to the image frame
-
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
-        if lse is not None:
-            if lse.frame and not self.training and isinstance(x, tuple) and torch.is_tensor(x[0]) \
-                    and x[0].dim() == 3:  # decoded boxes: canonical -> image pixels (open stage first, then input)
-                from utils.lse import unwarp_predictions
-                z = x[0]
-                for name in reversed(lse.frame):
-                    z = unwarp_predictions(z, regs[name], *img_hw, lse.cfg['min_conf'])
-                x = (z,) + tuple(x[1:])
-            if lse_targets is not None or lse_tiles is not None:
-                return x, lse_targets, lse_loss, lse_stats
-        elif lse_targets is not None or lse_tiles is not None:
+        if ctx is not None:  # boxes back to image pixels; extras
+            return dec_layers.finish(self, ctx, x, img_hw, lse_targets is not None or lse_tiles is not None)
+        if lse_targets is not None or lse_tiles is not None:
             return x, lse_targets, None, None
         return x
 
@@ -805,6 +760,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
+            if m is DEC:  # deep equilibrium canonicalizer: its first argument is its name (models/dec.py)
+                break
             try:
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
             except:
@@ -853,6 +810,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
+        elif m is DEC:  # reads an image, outputs warp grids (models/dec.py)
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m in [DECWarp, DECUnwarp]:  # [x, DEC]
+            c2 = ch[f[0]]
+        elif m is DECScale:  # [x, DEC, ...]
+            c2 = ch[f[0]]
+            args = [c2, len(f) - 1]
         elif m is ReOrg:
             c2 = ch[f] * 4
         elif m is Contract:

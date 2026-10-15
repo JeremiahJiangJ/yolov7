@@ -1,0 +1,113 @@
+# yolov7-tiny-dec-p3open: yolov7-tiny with deep equilibrium canonicalizer (DEC) layers (README.md, section 14).
+# An open-ended P3+ DEC: from the stride-8 stage on, everything (head included) runs in the
+# canonical frame; the stem sees the image.
+#   python train.py --cfg cfg/training/dec/yolov7-tiny-dec-p3open.yaml --weights yolov7-tiny.pt ...
+# (no --lse: the DEC layers are part of this architecture; the plain layers load the plain weights).
+# dec: holds the training settings (losses, warp augmentation, learning rate; explained in data/lse/input.yaml).
+# DEC layer arguments: [name, grid, max_zoom, canon_size, channels, iters, grad_iters]. Generated with
+#   python -m models.dec --cfg cfg/training/yolov7-tiny.yaml --lse data/lse/open.yaml --out <this file>
+
+nc: 80
+depth_multiple: 1.0
+width_multiple: 1.0
+anchors: [[10, 13, 16, 30, 33, 23], [30, 61, 62, 45, 59, 119], [116, 90, 156, 198, 373, 326]]
+
+dec:  # training settings of the DEC layers (utils/lse.py DEFAULTS, data/lse/input.yaml)
+  decs: ["P3+"]
+  per_tile: true
+  eq_weight: 1.0
+  eq_strength: 1.0
+  eq_regions: 32
+  size_weight: 0.0
+  target_size: 96
+  prior_weight: 0.0
+  warp_aug: 0.0
+  warp_aug_strength: 1.0
+  det_grad_epochs: 0
+  lr_scale: 10.0
+  min_conf: 0.001
+
+backbone:
+  [[-1, 1, DECInput, []],  # 0: the input image
+   [0, 1, DEC, [P3+, 8, 4.0, 224, [16, 32, 64], 4, 2]],  # 1: canonicalizer P3+: looks at the detector input
+   [0, 1, Conv, [32, 3, 2, None, 1, nn.LeakyReLU(0.1)]],  # 2: plain layer 0
+   [2, 1, Conv, [64, 3, 2, None, 1, nn.LeakyReLU(0.1)]],  # 3: plain layer 1
+   [3, 1, Conv, [32, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 4: plain layer 2
+   [3, 1, Conv, [32, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 5: plain layer 3
+   [5, 1, Conv, [32, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 6: plain layer 4
+   [6, 1, Conv, [32, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 7: plain layer 5
+   [[7, 6, 5, 4], 1, Concat, [1]],  # 8: plain layer 6
+   [8, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 9: plain layer 7
+   [[9, 1], 1, DECWarp, []],  # 10: into P3+: layer 9 warped
+   [10, 1, MP, []],  # 11: plain layer 8 (in P3+)
+   [11, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 12: plain layer 9 (in P3+)
+   [11, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 13: plain layer 10 (in P3+)
+   [13, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 14: plain layer 11 (in P3+)
+   [14, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 15: plain layer 12 (in P3+)
+   [[15, 14, 13, 12], 1, Concat, [1]],  # 16: plain layer 13 (in P3+)
+   [16, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 17: plain layer 14 (in P3+)
+   [17, 1, MP, []],  # 18: plain layer 15 (in P3+)
+   [18, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 19: plain layer 16 (in P3+)
+   [18, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 20: plain layer 17 (in P3+)
+   [20, 1, Conv, [128, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 21: plain layer 18 (in P3+)
+   [21, 1, Conv, [128, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 22: plain layer 19 (in P3+)
+   [[22, 21, 20, 19], 1, Concat, [1]],  # 23: plain layer 20 (in P3+)
+   [23, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 24: plain layer 21 (in P3+)
+   [24, 1, MP, []],  # 25: plain layer 22 (in P3+)
+   [25, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 26: plain layer 23 (in P3+)
+   [25, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 27: plain layer 24 (in P3+)
+   [27, 1, Conv, [256, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 28: plain layer 25 (in P3+)
+   [28, 1, Conv, [256, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 29: plain layer 26 (in P3+)
+   [[29, 28, 27, 26], 1, Concat, [1]],  # 30: plain layer 27 (in P3+)
+   [30, 1, Conv, [512, 1, 1, None, 1, nn.LeakyReLU(0.1)]]]  # 31: plain layer 28 (in P3+)
+
+head:
+  [[31, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 32: plain layer 29 (in P3+)
+   [31, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 33: plain layer 30 (in P3+)
+   [33, 1, SP, [5]],  # 34: plain layer 31 (in P3+)
+   [33, 1, SP, [9]],  # 35: plain layer 32 (in P3+)
+   [33, 1, SP, [13]],  # 36: plain layer 33 (in P3+)
+   [[36, 35, 34, 33], 1, Concat, [1]],  # 37: plain layer 34 (in P3+)
+   [37, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 38: plain layer 35 (in P3+)
+   [[38, 32], 1, Concat, [1]],  # 39: plain layer 36 (in P3+)
+   [39, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 40: plain layer 37 (in P3+)
+   [40, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 41: plain layer 38 (in P3+)
+   [41, 1, nn.Upsample, [None, 2, nearest]],  # 42: plain layer 39 (in P3+)
+   [24, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 43: plain layer 40 (in P3+)
+   [[43, 42], 1, Concat, [1]],  # 44: plain layer 41 (in P3+)
+   [44, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 45: plain layer 42 (in P3+)
+   [44, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 46: plain layer 43 (in P3+)
+   [46, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 47: plain layer 44 (in P3+)
+   [47, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 48: plain layer 45 (in P3+)
+   [[48, 47, 46, 45], 1, Concat, [1]],  # 49: plain layer 46 (in P3+)
+   [49, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 50: plain layer 47 (in P3+)
+   [50, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 51: plain layer 48 (in P3+)
+   [51, 1, nn.Upsample, [None, 2, nearest]],  # 52: plain layer 49 (in P3+)
+   [17, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 53: plain layer 50 (in P3+)
+   [[53, 52], 1, Concat, [1]],  # 54: plain layer 51 (in P3+)
+   [54, 1, Conv, [32, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 55: plain layer 52 (in P3+)
+   [54, 1, Conv, [32, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 56: plain layer 53 (in P3+)
+   [56, 1, Conv, [32, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 57: plain layer 54 (in P3+)
+   [57, 1, Conv, [32, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 58: plain layer 55 (in P3+)
+   [[58, 57, 56, 55], 1, Concat, [1]],  # 59: plain layer 56 (in P3+)
+   [59, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 60: plain layer 57 (in P3+)
+   [60, 1, Conv, [128, 3, 2, None, 1, nn.LeakyReLU(0.1)]],  # 61: plain layer 58 (in P3+)
+   [[61, 50], 1, Concat, [1]],  # 62: plain layer 59 (in P3+)
+   [62, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 63: plain layer 60 (in P3+)
+   [62, 1, Conv, [64, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 64: plain layer 61 (in P3+)
+   [64, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 65: plain layer 62 (in P3+)
+   [65, 1, Conv, [64, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 66: plain layer 63 (in P3+)
+   [[66, 65, 64, 63], 1, Concat, [1]],  # 67: plain layer 64 (in P3+)
+   [67, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 68: plain layer 65 (in P3+)
+   [68, 1, Conv, [256, 3, 2, None, 1, nn.LeakyReLU(0.1)]],  # 69: plain layer 66 (in P3+)
+   [[69, 40], 1, Concat, [1]],  # 70: plain layer 67 (in P3+)
+   [70, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 71: plain layer 68 (in P3+)
+   [70, 1, Conv, [128, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 72: plain layer 69 (in P3+)
+   [72, 1, Conv, [128, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 73: plain layer 70 (in P3+)
+   [73, 1, Conv, [128, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 74: plain layer 71 (in P3+)
+   [[74, 73, 72, 71], 1, Concat, [1]],  # 75: plain layer 72 (in P3+)
+   [75, 1, Conv, [256, 1, 1, None, 1, nn.LeakyReLU(0.1)]],  # 76: plain layer 73 (in P3+)
+   [60, 1, Conv, [128, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 77: plain layer 74 (in P3+)
+   [68, 1, Conv, [256, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 78: plain layer 75 (in P3+)
+   [76, 1, Conv, [512, 3, 1, None, 1, nn.LeakyReLU(0.1)]],  # 79: plain layer 76 (in P3+)
+   [[77, 78, 79], 1, IDetect, [nc, anchors]]]  # 80: plain layer 77 (in P3+)
