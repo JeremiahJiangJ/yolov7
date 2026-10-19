@@ -72,7 +72,9 @@ class DECContext:
         cfg, n, (h, w) = self.cfg, x.shape[0], x.shape[-2:]
         self.clear()
         self.training, self.n = training, n
-        self.base = Regions.make(n, tiles if (training and cfg['per_tile']) or self.keep else None, x.device)
+        # regions: the frame rectangles given (training: mosaic tiles / letterbox content; inference: letterbox content,
+        # so that both canonicalize the same thing), with per_tile; else (or none given) whole images
+        self.base = Regions.make(n, tiles if cfg['per_tile'] else None, x.device)
         if training and cfg['warp_aug'] > 0:  # rescale some regions at random (labels follow)
             K = len(self.base.b)
             tx, ty = random_phi(K, cfg['grid'], cfg['warp_aug_strength'], x.device)
@@ -123,12 +125,13 @@ class DEC(_DECLayer):
         with torch.autocast(device_type=x.device.type, enabled=False):
             xf = x.float()
             h, w = xf.shape[-2:]
-            s = ctx.base.crops(xf, c.canon_size)
+            s, scale = ctx.base.crops(xf, c.canon_size), ctx.base.log_scale(h, w, c.canon_size)
             c.checkpoint = ctx.training and ctx.cfg['checkpoint'] and torch.is_grad_enabled()
-            G, phi_x, phi_y = c.solve(s)
+            G, phi_x, phi_y, step = c.solve(s, scale)
             reg = ctx.base.with_grid(G)
             if ctx.training:
-                loss, stats = self._aux(s, G, phi_x, phi_y, reg, ctx.targets, h, w)
+                loss, stats = self._aux(s, scale, G, phi_x, phi_y, reg, ctx.targets, h, w)
+                stats['step'] = step  # size of the solver's last update: ~0 when it has converged
                 ctx.loss = ctx.loss + loss
                 ctx.stats.update({f'{self.name}/{k}': v for k, v in stats.items()})
             if ctx.training and ctx.epoch < ctx.cfg['det_grad_epochs']:  # warm-up: no detection gradient yet
@@ -137,14 +140,22 @@ class DEC(_DECLayer):
             if ctx.keep:
                 ctx.seen[self.i] = xf
             if self.frame and ctx.targets is not None:  # with gradients: content and its boxes move together
-                ctx.targets = warp_targets(ctx.targets, reg, h, w)
+                ctx.targets = warp_targets(ctx.targets, reg, h, w, drop_shrunk=False)
         return reg.G
 
     def _eq(self, s_t, G_t, s_eq, G_eq):
-        """Consistency: the canonical frames of the rescaled crops and of the crops, compared."""
-        return F.mse_loss(self.canon.warp_crops(s_t, G_t), self.canon.warp_crops(s_eq, G_eq))
+        """Consistency: the canonical frames of the rescaled crops and of the crops, compared. With eq_area, each
+        canonical pixel is weighted by the input area it shows (detached), so every part of a crop counts by its size in
+        the crop, not by how much the warp magnifies it: shrinking detailed content cannot lower the loss."""
+        d = (self.canon.warp_crops(s_t, G_t) - self.canon.warp_crops(s_eq, G_eq)) ** 2
+        if not self.ctx.cfg['eq_area']:
+            return d.mean()
+        with torch.no_grad():
+            a = self.canon.crop_area(G_eq, s_eq.shape[-2:])
+            a = a / a.mean((1, 2), keepdim=True)
+        return (d * a[:, None]).mean()
 
-    def _aux(self, s, G, phi_x, phi_y, reg, targets, h, w):
+    def _aux(self, s, scale, G, phi_x, phi_y, reg, targets, h, w):
         """Consistency (skipped, with its second solve, when eq_weight is 0), prior and size losses, and statistics
         (0-dim tensors: no host sync per step)."""
         cfg, c = self.ctx.cfg, self.canon
@@ -152,12 +163,12 @@ class DEC(_DECLayer):
         if cfg['eq_weight'] > 0:  # the canonical frame of a randomly rescaled crop must be that of the crop
             if s.shape[0] > cfg['eq_regions']:  # a random subset of the regions: the second solve is the costly part
                 idx = torch.randperm(s.shape[0], device=s.device)[:cfg['eq_regions']]
-                s_eq, G_eq = s[idx], G[idx]
+                s_eq, G_eq, sc_eq = s[idx], G[idx], scale[idx]
             else:
-                s_eq, G_eq = s, G
+                s_eq, G_eq, sc_eq = s, G, scale
             tx, ty = random_phi(s_eq.shape[0], c.grid, cfg['eq_strength'], s.device)
             s_t = c.warp_crops(s_eq, make_grid(tx, ty, c.max_zoom))
-            G_t, _, _ = c.solve(s_t)
+            G_t = c.solve(s_t, sc_eq)[0]
             eq = (_checkpoint(self._eq, s_t, G_t, s_eq, G_eq, use_reentrant=False) if c.checkpoint
                   else self._eq(s_t, G_t, s_eq, G_eq))
             loss, stats['eq'] = cfg['eq_weight'] * eq, eq.detach()

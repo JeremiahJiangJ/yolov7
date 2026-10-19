@@ -20,6 +20,7 @@ max_zoom: 4.0      # largest ratio between the most magnified and the most shrun
 
 # --- Canonicalizer ----------------------------------------------------------------------------------------------------
 canon_size: 224    # it sees each frame (tile) resized to canon_size x canon_size
+                   #   or [height, width] in the frames' aspect ratio, e.g. [252, 448] for 16:9 (no squashing)
 channels: [16, 32, 64]
 iters: 4           # fixed-point iterations (phi <- phi + delta(canonical frame))
 grad_iters: 2      # last iterations backpropagated
@@ -31,6 +32,8 @@ checkpoint: true   # training: recompute canonicalizer / warp activations in bac
 eq_weight: 1.0     # consistency: a randomly rescaled frame must give the same canonical frame
 eq_strength: 1.0   # strength of those random rescalings
 eq_regions: 32     # at most this many frames (tiles) per batch in it, at random (it doubles the canonicalizer cost)
+eq_area: true      # consistency weighted by the input area each canonical pixel shows (shrinking detail cannot
+                   #   lower it); false: plain MSE
 size_weight: 0.0   # size target: pull objects towards target_size pixels (sqrt(w * h)) in the canonical frame (labels
 target_size: 96    #   needed; at test time the warp is predicted from the image alone). Try 0.1 - 1. Set target_size to
                    #   your median object size: obj_px in lse.txt (the size the detector sees) after one epoch

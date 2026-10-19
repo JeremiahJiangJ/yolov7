@@ -51,7 +51,8 @@ DEFAULTS = dict(
     decs=['input'],        # canonicalizers: input, P1..P6 (backbone stages) and / or [first, last] layer spans
     grid=8,                # knots per axis of the coarse warp grid (R): R - 1 cells per axis
     max_zoom=4.0,          # largest ratio between the most magnified and the most shrunk cell of a row / column
-    canon_size=224,        # a canonicalizer sees each region resized to canon_size x canon_size
+    canon_size=224,        # a canonicalizer sees each region resized to canon_size x canon_size, or [height, width]
+                           #   (e.g. [252, 448] for 16:9 frames: no squashing); it is also told each region's scale
     channels=[16, 32, 64],  # canonicalizer conv widths (stride 2 each)
     iters=4,               # fixed-point iterations
     grad_iters=2,          # of which the last grad_iters are backpropagated (truncated fixed-point gradient)
@@ -59,6 +60,7 @@ DEFAULTS = dict(
     eq_weight=1.0,         # consistency loss weight
     eq_strength=1.0,       # strength of the random rescalings used by the consistency loss (in units of phi)
     eq_regions=32,         # at most this many regions per batch (random) in the consistency loss (bounds its cost)
+    eq_area=True,          # consistency weighted by the input area each canonical pixel shows (False: plain MSE)
     size_weight=0.0,       # size target loss weight (0: off)
     target_size=96,        # size target: objects' sqrt(w * h) in pixels in the canonical frame
     prior_weight=0.0,      # pull of the warps towards the identity
@@ -128,7 +130,7 @@ def random_phi(n, grid, strength, device):
     return [(torch.rand(n, grid, grid - 1, device=device) * 2 - 1) * strength for _ in range(2)]
 
 
-_BASE_GRIDS = {}  # (S, R, device, dtype) -> warp_crops' base sampling points (built once, not per call)
+_BASE_GRIDS = {}  # (H, W, R, device, dtype) -> warp_crops' base sampling points (built once, not per call)
 
 
 def _dense_base(us, vs, R):
@@ -239,14 +241,21 @@ class Regions:
         return Regions(self.b, self.rect, G)
 
     def crops(self, x, size):
-        """Each region of images x (B, C, H, W) resized to size x size: (K, C, size, size), in region order."""
-        r = self.rect
+        """Each region of images x (B, C, H, W) resized to size (int: square, or (height, width)): (K, C, height, width),
+        in region order."""
+        r, (ch, cw) = self.rect, canon_hw(size)
         theta = torch.zeros(len(r), 2, 3, device=x.device, dtype=x.dtype)
         theta[:, 0, 0], theta[:, 0, 2] = r[:, 2] - r[:, 0], r[:, 0] + r[:, 2] - 1
         theta[:, 1, 1], theta[:, 1, 2] = r[:, 3] - r[:, 1], r[:, 1] + r[:, 3] - 1
-        grid = F.affine_grid(theta, (len(r), x.shape[1], size, size), align_corners=False)
+        grid = F.affine_grid(theta, (len(r), x.shape[1], ch, cw), align_corners=False)
         src = x if len(r) == x.shape[0] else x.index_select(0, self.b)  # one region per image: region k is image k
         return F.grid_sample(src, grid, mode='bilinear', padding_mode='border', align_corners=False)
+
+    def log_scale(self, h, w, size):
+        """Log resampling factor (K, 2: x, y) of each region's crop: region pixels on an h x w image / crop pixels."""
+        ch, cw = canon_hw(size)
+        rw, rh = (self.rect[:, 2] - self.rect[:, 0]) * w, (self.rect[:, 3] - self.rect[:, 1]) * h
+        return torch.stack([torch.log(rw.clamp_min(1) / cw), torch.log(rh.clamp_min(1) / ch)], 1)
 
     def _blocks(self, h, w):
         """The pixels of every region on an h x w map (those whose centre is inside its rectangle), padded to a
@@ -431,16 +440,43 @@ class Regions:
         return 1 / torch.sqrt(sx * sy).clamp_min(1e-6), m
 
 
-def warp_targets(targets, regions, h, w, min_px=2.0):
-    """YOLO targets (n, 6) [image, class, x, y, w, h] normalised -> the same boxes in the canonical frame (boxes smaller
-    than min_px on a side are dropped). Differentiable in the warp."""
+def letterbox_region(h0, w0, h, w):
+    """Normalised xyxy rectangle (1, 4) of an h0 x w0 image letterboxed (centred, aspect kept) into h x w: the region
+    to canonicalize at inference, as training does (README.md section 14)."""
+    r = min(h / h0, w / w0)
+    nw, nh = round(w0 * r), round(h0 * r)
+    x1, y1 = (w - nw) / 2, (h - nh) / 2
+    return torch.tensor([[x1 / w, y1 / h, (x1 + nw) / w, (y1 + nh) / h]]).clamp(0, 1)
+
+
+def letterbox_regions(shapes, h, w):
+    """Per image, the letterbox content rectangle (1, 4) of a test.py batch, from the dataset's shapes
+    ((h0, w0), ((gain_h, gain_w), (pad_w, pad_h))) on the h x w batch."""
+    out = []
+    for (h0, w0), ((gh, gw), (pw, ph)) in shapes:
+        out.append(torch.tensor([[pw / w, ph / h, (pw + w0 * gw) / w, (ph + h0 * gh) / h]]).clamp(0, 1))
+    return out
+
+
+def warp_targets(targets, regions, h, w, min_px=2.0, drop_shrunk=True):
+    """YOLO targets (n, 6) [image, class, x, y, w, h] normalised -> the same boxes in the canonical frame.
+    Differentiable in the warp. Boxes below min_px on a side after the warp: dropped (drop_shrunk, for random warps:
+    augmentation, --warp-test), else kept at min_px around their centre (learned warps: a canonicalizer must not be
+    able to remove a hard label from the loss by shrinking its object; boxes already below min_px are dropped)."""
     if not len(targets):
         return targets
     t = targets.float()
     xyxy = torch.cat([t[:, 2:4] - t[:, 4:6] / 2, t[:, 2:4] + t[:, 4:6] / 2], -1)
     q = regions.map_boxes(t[:, 0].long(), xyxy, to_canonical=True).clamp(0, 1)
-    keep = (((q[:, 2] - q[:, 0]) * w) >= min_px) & (((q[:, 3] - q[:, 1]) * h) >= min_px)
-    out = torch.cat([t[:, :2], (q[:, :2] + q[:, 2:]) / 2, q[:, 2:] - q[:, :2]], -1)
+    if drop_shrunk:
+        keep = (((q[:, 2] - q[:, 0]) * w) >= min_px) & (((q[:, 3] - q[:, 1]) * h) >= min_px)
+        c, wh = (q[:, :2] + q[:, 2:]) / 2, q[:, 2:] - q[:, :2]
+    else:
+        keep = (t[:, 4] * w >= min_px) & (t[:, 5] * h >= min_px)
+        c = (q[:, :2] + q[:, 2:]) / 2
+        wh = torch.maximum(q[:, 2:] - q[:, :2], q.new_tensor([min_px / w, min_px / h]))
+        c = torch.minimum(torch.maximum(c, wh / 2), 1 - wh / 2)  # inside the image
+    out = torch.cat([t[:, :2], c, wh], -1)
     return out[keep].to(targets.dtype)
 
 
@@ -473,23 +509,33 @@ def warp_stats(G):
 # ----------------------------------------------------------------------------------------------------------------------
 # Canonicalizer and the LSE module attached to a Model
 # ----------------------------------------------------------------------------------------------------------------------
+def canon_hw(canon_size):
+    """canon_size (an int: square, or [height, width]) -> (height, width) of the canonicalizer's view of a region."""
+    return (int(canon_size), int(canon_size)) if isinstance(canon_size, (int, float)) else tuple(int(v) for v in canon_size)
+
+
 class Canonicalizer(nn.Module):
     def __init__(self, grid=8, channels=(16, 32, 64), max_zoom=4.0, canon_size=320, iters=4, grad_iters=2):
         super().__init__()
-        self.grid, self.max_zoom, self.canon_size = grid, max_zoom, canon_size
+        self.grid, self.max_zoom, self.canon_size = grid, max_zoom, canon_hw(canon_size)
         self.iters, self.grad_iters = iters, grad_iters
         self.checkpoint = False  # set per forward pass by the DEC layer (training with the checkpoint setting)
-        layers, c_in = [], 3
+        # input: the region crop (3 channels) and 2 constant channels, the log resampling factor of the crop per axis
+        # (region pixels / crop pixels): the region's absolute scale and aspect ratio, which resizing to canon_size hides
+        layers, c_in = [], 3 + 2
         for c in channels:
             layers += [nn.Conv2d(c_in, c, 3, 2, 1), nn.GroupNorm(min(8, c), c), nn.SiLU()]
             c_in = c
+        nn.init.zeros_(layers[0].weight[:, 3:])  # scale channels start without effect
         self.features = nn.Sequential(*layers)
         self.head = nn.Conv2d(c_in, 2, 1)
         nn.init.zeros_(self.head.weight)  # delta = 0: identity warp, the model starts as the plain detector
         nn.init.zeros_(self.head.bias)
 
-    def delta(self, c):
+    def delta(self, c, scale):
+        """Parameter update from canonical crops c (K, 3, H, W) and their log resampling factors scale (K, 2)."""
         R = self.grid
+        c = torch.cat([c, scale[:, :, None, None].expand(-1, -1, *c.shape[-2:]).to(c.dtype)], 1)
         f = self.head(self.features(c.to(self.head.weight.dtype))).float()
         dx = F.adaptive_avg_pool2d(f[:, :1], (R, R - 1))[:, 0]  # [k, row knot, x cell]
         dy = F.adaptive_avg_pool2d(f[:, 1:], (R - 1, R))[:, 0].transpose(1, 2)  # [k, column knot, y cell]
@@ -498,19 +544,21 @@ class Canonicalizer(nn.Module):
         return dx - dx.mean(-1, keepdim=True), dy - dy.mean(-1, keepdim=True)
 
     def warp_crops(self, s, G):
-        """Warp whole crops s (K, C, S, S) by G (K, 2, R, R)."""
-        S, R = s.shape[-1], G.shape[-1]
-        key = (S, R, str(s.device), G.dtype)
+        """Warp whole crops s (K, C, H, W) by G (K, 2, R, R)."""
+        (H, W), R = s.shape[-2:], G.shape[-1]
+        key = (H, W, R, str(s.device), G.dtype)
         if key not in _BASE_GRIDS:  # the same points every call: build them once
-            c = (torch.arange(S, device=s.device, dtype=G.dtype) + 0.5) / S
-            _BASE_GRIDS[key] = _dense_base(c, c, R)
+            cu = (torch.arange(W, device=s.device, dtype=G.dtype) + 0.5) / W
+            cv = (torch.arange(H, device=s.device, dtype=G.dtype) + 0.5) / H
+            _BASE_GRIDS[key] = _dense_base(cu, cv, R)
         gx, gy = dense_local(G, None, None, _BASE_GRIDS[key])
         return F.grid_sample(s, torch.stack([gx, gy], -1) * 2 - 1, mode='bilinear', padding_mode='border',
                              align_corners=False)
 
-    def solve(self, s):
-        """Fixed point phi = phi + delta(warp(s, phi)) for region crops s: the warp grids. Only the last grad_iters
-        iterations are backpropagated."""
+    def solve(self, s, scale):
+        """Fixed point phi = phi + delta(warp(s, phi)) for region crops s (log resampling factors scale (K, 2)): the warp
+        grids, the parameters and the size of the last update (mean |delta|, a convergence check). Only the last
+        grad_iters iterations are backpropagated."""
         R = self.grid
         phi_x = torch.zeros(s.shape[0], R, R - 1, device=s.device)
         phi_y = torch.zeros_like(phi_x)
@@ -519,17 +567,35 @@ class Canonicalizer(nn.Module):
             track = grad and k >= self.iters - self.grad_iters
             if track and k == self.iters - self.grad_iters:
                 phi_x, phi_y = phi_x.detach(), phi_y.detach()
+            prev = phi_x.detach(), phi_y.detach()
             with torch.set_grad_enabled(track):
                 if track and self.checkpoint:  # activations recomputed in backward, not stored
-                    phi_x, phi_y = _checkpoint(self._step, phi_x, phi_y, s, use_reentrant=False)
+                    phi_x, phi_y = _checkpoint(self._step, phi_x, phi_y, s, scale, use_reentrant=False)
                 else:
-                    phi_x, phi_y = self._step(phi_x, phi_y, s)
-        return make_grid(phi_x, phi_y, self.max_zoom), phi_x, phi_y
+                    phi_x, phi_y = self._step(phi_x, phi_y, s, scale)
+        step = torch.cat([(phi_x.detach() - prev[0]).abs().flatten(1), (phi_y.detach() - prev[1]).abs().flatten(1)],
+                         1).mean() if self.iters else phi_x.new_zeros(())
+        return make_grid(phi_x, phi_y, self.max_zoom), phi_x, phi_y, step
 
-    def _step(self, phi_x, phi_y, s):
+    def _step(self, phi_x, phi_y, s, scale):
         """One fixed-point iteration."""
-        dx, dy = self.delta(self.warp_crops(s, make_grid(phi_x, phi_y, self.max_zoom)))
+        dx, dy = self.delta(self.warp_crops(s, make_grid(phi_x, phi_y, self.max_zoom)), scale)
         return phi_x + dx, phi_y + dy
+
+    def crop_area(self, G, hw):
+        """Input area (in crop pixels) covered by each canonical pixel of crops of size hw warped by G: (K, H, W), the
+        Jacobian determinant of the canonical -> input map, by finite differences."""
+        (H, W), R = hw, G.shape[-1]
+        key = (H, W, R, str(G.device), G.dtype)
+        if key not in _BASE_GRIDS:
+            cu = (torch.arange(W, device=G.device, dtype=G.dtype) + 0.5) / W
+            cv = (torch.arange(H, device=G.device, dtype=G.dtype) + 0.5) / H
+            _BASE_GRIDS[key] = _dense_base(cu, cv, R)
+        gx, gy = dense_local(G, None, None, _BASE_GRIDS[key])
+        gx, gy = gx * W, gy * H  # crop pixels
+        xu, yu = torch.gradient(gx, dim=2)[0], torch.gradient(gy, dim=2)[0]
+        xv, yv = torch.gradient(gx, dim=1)[0], torch.gradient(gy, dim=1)[0]
+        return (xu * yv - xv * yu).clamp_min(1e-6)
 
 
 def stage_spans(model):

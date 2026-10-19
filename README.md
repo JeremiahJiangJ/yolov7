@@ -795,9 +795,23 @@ non-rectangles: keep them 0. Alternatively train in two stages: stage 1 without 
 with `--lse` and `--hyp data/hyp.finetune.lse.yaml` (no mosaic, mixup, paste-in). `data/hyp.finetune.noaug.yaml` turns
 every augmentation off.
 
+**Regions at inference.** Training canonicalizes the letterbox content of a frame (or each mosaic tile), not the grey
+padding; `test.py` and `detect.py` do the same at inference (`lse_tiles` = the letterbox content rectangle,
+`utils/lse.py: letterbox_region(s)`). Calling the model directly without `lse_tiles` canonicalizes the whole input,
+padding included: pass `lse_tiles=[letterbox_region(h0, w0, h, w)]` per image for the trained behaviour.
+
+**What a canonicalizer sees.** Each region resized to `canon_size` (an int: square, or `[height, width]`), plus two
+constant input channels: the log resampling factor per axis (region pixels / crop pixels). Resizing hides a region's
+absolute scale and aspect ratio (mosaic tiles differ in size and shape); those channels give them back, so a decision
+that depends on object size in pixels (the size target) is learnable. For non-square frames set `canon_size` to their
+aspect ratio, e.g. `[252, 448]` for 16:9: each region is then resized without squashing. The detector itself always
+sees the full-resolution (warped) image; only the canonicalizer works from this small view, so objects below
+~4 px in it (e.g. < ~25 px at 1280 with `[252, 448]`) are hard for it to see.
+
 **Losses.** Detection loss (gradients reach the canonicalizers through the warps; with `input` / `Pk+`, labels are
 warped *with* gradients, so moving content together with its boxes costs nothing and only the effect of scale on
-detection remains) + `eq_weight` x consistency (the canonical frame of a randomly rescaled frame must equal that of
+detection remains; a box the learned warp shrinks below 2 px is kept at 2 px rather than dropped, so a
+canonicalizer cannot remove a hard label from the loss by shrinking its object) + `eq_weight` x consistency (the canonical frame of a randomly rescaled frame must equal that of
 the frame: this defines the canonical form, and the identity does not minimise it) + `size_weight` x size target
 (optional: objects at `target_size` pixels, sqrt(w * h), in the canonical frame, a canonical form defined by the
 labels; at test time the warp is still predicted from the image alone; set `target_size` to the median object size,
@@ -809,7 +823,8 @@ config: `warp_aug` (randomly rescale frames of the detector input, labels follow
 penalised by warps; try 0.5), `det_grad_epochs` (first epochs: canonicalizers learn from their own losses only),
 `lr_scale` (canonicalizer learning rate = lr0 x lr_scale; the templates use 10, as the paper's DEM), `size_weight`
 (a direct signal towards a useful warp), `prior_weight: 0`. Check the warp plots and `lse.txt` (`zoom_in` /
-`zoom_out` above 1, `disp` above 0) before judging the detector.
+`zoom_out` above 1, `disp` above 0) before judging the detector. `step` (the size of the solver's last update) should be small:
+large values mean the fixed point is not reached in `iters` iterations.
 
 **Box mapping.** A box goes into the canonical frame as the bounding box of its warped outline: the extent of the
 warped object (median 0.6-1 px from the warped object's pixels in tests, up to ~3x local zoom). Predictions are mapped
@@ -888,7 +903,8 @@ at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-poin
 `lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`,
 `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`, `det_grad_epochs`, `min_conf` (predictions with a lower
 objectness are not mapped back when the model maps its own output, i.e. without `lse_defer_map`: 0.001 =
-test.py's default `--conf-thres`; NMS drops them)), `checkpoint` (training: canonicalizer and warp activations recomputed in backward instead of
+test.py's default `--conf-thres`; NMS drops them)), `eq_area` (consistency weighted by the input area each canonical pixel shows, default on: otherwise a
+warp could lower the loss by shrinking detailed content and magnifying flat areas), `checkpoint` (training: canonicalizer and warp activations recomputed in backward instead of
 stored; same gradients; default on: the DEC's extra activation memory falls from ~1 GiB to ~50 MiB for `input` at
 batch 8, 320, mosaic tiles, and from ~2.8 GiB to ~130 MiB for `P3-P5`, for ~5-20% more step time on CPU).
 
@@ -949,7 +965,8 @@ tracking in `utils/datasets.py`).**
 - Labels warped with gradients are the correct gradient; a test on a weakly trained detector found no measurable pull
   towards the identity with detached labels either, so they are not shown to cause the identity basin.
 
-**Limitations.** Not supported: `train_aux.py`, `--teacher` with an `input` or open-ended DEC (the student predicts in
+**Limitations.** DEC checkpoints from before the scale input channels (`canon_size` section above) do not load: the
+canonicalizer's first conv has 5 input channels. Not supported: `train_aux.py`, `--teacher` with an `input` or open-ended DEC (the student predicts in
 the canonical frame; closed stage DECs work), `--quad`, test-time augmentation with the validation loss, `export.py`.
 Closed stage DECs need a `Detect` / `IDetect` head. `--freeze` counts the DEC layers too (the plain layers' indices
 shift). Checkpoints of the earlier run-time version of this branch (`model.lse`) do not load. Mapping predictions back costs ~1 ms per box on CPU (batched on

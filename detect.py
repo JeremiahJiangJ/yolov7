@@ -8,6 +8,7 @@ import torch.backends.cudnn as cudnn
 from numpy import random
 
 from models.dec import map_detections
+from utils.lse import letterbox_region
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
@@ -44,6 +45,7 @@ def detect(save_img=False):
     # DEC model with a frame DEC: NMS in the canonical frame, then the kept boxes are mapped back (map_detections)
     defer = {'lse_defer_map': True} if not opt.augment and getattr(model, 'dec_ctx', None) is not None and any(
         getattr(m, 'frame', False) for m in model.model) else {}
+    lse_regions = not opt.augment and getattr(model, 'dec_ctx', None) is not None
 
     if half:
         model.half()  # to FP16
@@ -92,6 +94,9 @@ def detect(save_img=False):
         # Inference
         t1 = time_synchronized()
         with torch.no_grad():   # Calculating gradients would cause a GPU memory leak
+            if lse_regions:  # canonicalize the letterbox content, as training does (README.md section 14)
+                defer['lse_tiles'] = [letterbox_region(*im.shape[:2], *img.shape[2:])
+                                      for im in (im0s if isinstance(im0s, list) else [im0s])]
             pred = model(img, augment=opt.augment, **defer)[0]
         t2 = time_synchronized()
 

@@ -584,8 +584,10 @@ class Model(nn.Module):
     def forward(self, x, augment=False, profile=False, lse_targets=None, lse_tiles=None, lse_defer_map=False):
         # DEC models (models/dec.py, README.md section 14). lse_targets: also return the targets in the frame of the
         # predictions and the DEC auxiliary loss and statistics (training): (out, targets, dec_loss, dec_stats).
-        # lse_tiles: per image, the frame rectangles of a mosaic sample (training batches), canonicalized one by one.
-        # lse_defer_map (inference): boxes stay in the canonical frame for NMS; then models/dec.py map_detections()
+        # lse_tiles: per image, the frame rectangles canonicalized one by one (training: mosaic tiles / letterbox content;
+        # inference: letterbox content, utils/lse.py letterbox_regions); extras are returned only with lse_targets or in
+        # training. lse_defer_map (inference): boxes stay in the canonical frame for NMS; then models/dec.py
+        # map_detections()
         if lse_targets is not None or lse_tiles is not None:
             assert not augment, 'lse_targets / lse_tiles are not supported with test-time augmentation'
             return self.forward_once(x, profile, lse_targets=lse_targets, lse_tiles=lse_tiles,
@@ -643,10 +645,10 @@ class Model(nn.Module):
 
         if profile:
             print('%.1fms total' % sum(dt))
+        extras = lse_targets is not None or (lse_tiles is not None and self.training)
         if ctx is not None:  # boxes back to image pixels; extras
-            return dec_layers.finish(self, ctx, x, img_hw, lse_targets is not None or lse_tiles is not None,
-                                     lse_defer_map)
-        if lse_targets is not None or lse_tiles is not None:
+            return dec_layers.finish(self, ctx, x, img_hw, extras, lse_defer_map)
+        if extras:
             return x, lse_targets, None, None
         return x
 

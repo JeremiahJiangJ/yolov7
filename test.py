@@ -10,6 +10,7 @@ import yaml
 from tqdm import tqdm
 
 from models.dec import map_detections
+from utils.lse import letterbox_regions
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader, parse_resize, delete_label_caches_at_exit, DEFAULT_LABEL_FOLDER
 from utils.mixed_data import MixedConfig, is_mixed, train_class_frames
@@ -157,6 +158,8 @@ def test(data,
                 getattr(m, 'frame', False) for m in model.model)
             # NMS in the canonical frame, then the kept boxes mapped back (autolabelling labels are in image pixels)
             defer = {'lse_defer_map': True} if dec_frame and not augment and not save_hybrid else {}
+            if getattr(model, 'dec_ctx', None) is not None and not augment:  # canonicalize the letterbox content, as
+                defer['lse_tiles'] = letterbox_regions(shapes, height, width)  # training does (README.md section 14)
             if compute_loss and dec_frame and not augment:  # raw outputs are in the canonical frame: so are the targets
                 (out, train_out), loss_targets, _, _ = model(img, lse_targets=targets, **defer)
             else:
