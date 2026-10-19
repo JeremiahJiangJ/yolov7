@@ -1,5 +1,7 @@
 # Multi-source training template: target camera C, supplementary cameras A and B.
 # Replace the paths, nc and names; everything else has a working default. See README.md, section 8.
+# Weights for a purpose (generalist, balanced, finetune, specialist) from the sources' frame counts:
+#      python tools/propose_weights.py --data data/mixed/template.yaml --purpose finetune --target camC --epochs 150
 #
 # 1. Check the exposure plan (no training):
 #      python -m utils.mixed_data --data data/mixed/template.yaml --epochs 150 --img-size 1280 --close-mosaic 10 \

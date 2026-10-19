@@ -48,6 +48,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | Metrics per object size | `--area-int 64 256 1024` | [6](#6-evaluation-and-fitness) |
 | Select `best.pt` on mAP@.5 | `--fitness-metric-weights 0 0 1 0` | [6](#6-evaluation-and-fitness) |
 | Keep small objects at their pixel size | `resize: native` in the data yaml, `scale_min` / `scale_max` in the hyp | [9](#9-native-scale-loading-and-augmentation) |
+| Weights for a generalist / fine-tuning mix | `tools/propose_weights.py --purpose ...` | [8](#proposing-weights-toolspropose_weightspy) |
 | Rare classes | `tools/class_audit.py`, then `repeat_factor_threshold:` in the data yaml, `--freq-groups` to evaluate | [10](#10-repeat-factor-sampling), [13](#13-tools-scripts-and-example-configs) |
 | A bigger model to guide tiny | `--teacher yolov7.pt` | [11](#11-knowledge-distillation) |
 | IR white-hot and black-hot | `px_inversion_prob:` + `inversion_border:` in the data yaml, `test.py --invert` | [12](#12-ir-polarity-inversion-and-grayscale) |
@@ -69,7 +70,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 10 | [Repeat-factor sampling for rare classes](#10-repeat-factor-sampling) | `repeat_factor_threshold:` in the data yaml | `utils/mixed_data.py`, `utils/datasets.py` |
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
-| 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `scripts/`, `data/mixed/` |
+| 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `tools/propose_weights.py`, `scripts/`, `data/mixed/` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
@@ -364,6 +365,31 @@ give them their own source (with its own `weight`) instead.
 
 Not supported with `train_sources`: `--image-weights`, `--rect` (train), `train_aux.py`.
 
+### Proposing weights: `tools/propose_weights.py`
+
+Weights for a purpose, computed from the sources' frame counts (no training; the data yaml needs `train_sources` with
+`name` and `path`, weights and `target` are not needed):
+
+```bash
+python tools/propose_weights.py --data data.yaml --purpose generalist --epochs 100
+python tools/propose_weights.py --data data.yaml --purpose generalist --max-repeat 300 --epochs 100
+python tools/propose_weights.py --data data.yaml --purpose finetune --target camC --epochs 40 --out camC_ft.yaml
+python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --frames camA=12285 camB=40048
+```
+
+| `--purpose` | For | Weights | `epoch_size` |
+|---|---|---|---|
+| `generalist` | one model for every source | shares ~ frames ^ `--power` (0.5, the square root: large sources lead, small ones are boosted without being repeated excessively); `--max-repeat N` caps any source at N samples per frame over the run, the rest of its share going to the others | `total` |
+| `balanced` | every source trained as much | equal shares (small sources repeated most) | `total` |
+| `finetune` (`--target` required) | fine-tuning from a model that already knows the domain (e.g. a generalist) | fixed: the target gets 90% (20k+ frames), 80% (5k+) or 70% (smaller), or `--target-share`; the others split the rest ~ frames ^ `--power` | `target` |
+| `specialist` (`--target` required) | training for one source from a generic start (`yolov7-tiny.pt`) | the generalist mix first, then a linear `weight_schedule` to the finetune mix at 60% of `--epochs` | `target` |
+
+It prints each source's weight, mean training share and samples per frame over `--epochs` (with a warning above 500),
+and the yaml to merge; `--out` writes the whole data yaml with them (comments are not kept). `--frames name=N ...`
+skips scanning the folders. For `generalist` / `balanced` without `--target`, the smallest source is marked target
+(its val picks `best.pt`). These are starting points: shares are of training samples, so check frames and objects
+per source with the dry run (`--measure 64`) and each source's val in `source_results.txt`, and adjust.
+
 ### Epoch size
 
 With weighted sampling there is no natural "one pass over the data", so `epoch_size` sets the epoch length (fixed
@@ -650,6 +676,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
+| `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose: generalist, balanced, finetune, specialist (section 8) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
 | `data/mixed/1_...` to `6_...` | Experiment ladder (below) |
