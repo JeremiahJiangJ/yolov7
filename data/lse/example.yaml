@@ -1,0 +1,74 @@
+# Local scale equivariance (LSE), every setting, with values for objects whose apparent size changes as they move towards
+# or away from the camera, on 16:9 frames (e.g. 1920 x 1080) trained at --img-size 1280 (README.md, section 14).
+# Used by scripts/train_lse_example.sh. Settings marked ★ are the ones to look at first; the rest have sound defaults.
+#
+# Architecture settings (decs, grid, max_zoom, canon_size, channels, iters, grad_iters) are fixed once a run starts:
+# they become layers of the model (models/dec.py) and are stored in its checkpoint. The others are training settings.
+#
+# What to watch while training (lse.txt, TensorBoard lse/*, and --lse-debug's lse_debug/status.txt + triplets):
+#   - verdict ok, zoom_in / zoom_out above 1, disp above 0: the warps left the identity (else: identity basin, below)
+#   - step small: the fixed-point solve converges in `iters` iterations
+#   - <dec>/obj_px moving towards target_size: the size target works
+#   - anchor_bpr near 1: the anchors fit the object sizes the detector now sees (else reanchor_epoch)
+
+# --- Where ------------------------------------------------------------------------------------------------------------
+decs: [input]          # ★ where canonicalizers go. input: the image is warped and the unchanged (pretrained) detector runs
+                       #   on it; boxes are mapped back. The recommended placement: it keeps the pretrained detector and is
+                       #   the only one equivariant in principle. Alternatives (ablations): [P3+] (open-ended, features from
+                       #   stride 8 on), [P3, P4, P5] (closed backbone stages), [input, P3+], [first, last] layer spans
+per_tile: true         # mosaic samples: canonicalize every frame tile on its own (a warp assumes one scene); also makes
+                       #   the regions the letterbox content (not the grey bars), in training and at inference
+
+# --- Warp -------------------------------------------------------------------------------------------------------------
+grid: 8                # ★ knots per axis: (grid - 1)^2 cells, each rescaled on its own; at 1280, 8 -> ~180 px cells.
+                       #   Objects about a cell apart get independent zooms. Check with your labels:
+                       #   python tools/grid_capacity.py --data <data.yaml> --img-size 1280 --target-size <obj_px>
+                       #   Try 12 for dense scenes (with a larger canon_size)
+max_zoom: 2.5          # ★ largest magnified / shrunk ratio within a row (column). Above ~2x local zoom box mapping is less
+                       #   exact and shrunk regions lose detail; 2 - 2.5 is a good range (4 is the code default)
+
+# --- Canonicalizer (the small network that predicts the warp) ---------------------------------------------------------
+canon_size: [252, 448] # ★ its view of each region: [height, width] in your frames' aspect ratio (16:9 here), so nothing
+                       #   is squashed. The detector always sees the full-resolution warped image; only the warp is
+                       #   predicted from this view, so objects below ~4 px in it (~25 px at 1280 here) are hard for it to
+                       #   see. Larger (e.g. [360, 640]) sees smaller objects at more cost; it is also told each region's
+                       #   scale (2 input channels), so mosaic tiles of any size are fine
+channels: [16, 32, 64] # conv widths (stride 2 each)
+iters: 4               # fixed-point iterations: phi <- phi + delta(canonical view). Raise (6 - 8) if `step` stays large
+grad_iters: 2          # of which the last ones are backpropagated (truncated deep-equilibrium gradient)
+lr_scale: 10.0         # ★ canonicalizer learning rate = lr0 x lr_scale. It starts at zero (identity warp) and must move
+                       #   faster than the fine-tuned detector: 10 - 30. 0 freezes it (the warp-augmentation control)
+checkpoint: true       # recompute canonicalizer / warp activations in backward instead of storing them: same gradients,
+                       #   ~20x less extra memory, ~5 - 20% more step time. Keep on
+antialias: true        # image warps blur before they shrink (no aliasing in shrunk regions). Keep on
+
+# --- Losses (added to the detection loss) -----------------------------------------------------------------------------
+eq_weight: 1.0         # consistency: a randomly rescaled region must give the same canonical view (defines a canonical
+                       #   form; the identity does not minimise it). It needs a second solve: the costly part of training
+eq_strength: 1.0       # strength of those random rescalings (1.0: strongest local zoom ~1.5x at max_zoom 2.5, ~1.9x
+                       #   at 4)
+eq_regions: 16         # ★ regions per batch used in the consistency loss (random subset). Same expected loss, fewer is
+                       #   cheaper but noisier: 8 - 32
+eq_area: true          # weight it by the image area each canonical pixel shows (shrinking detail cannot lower it)
+size_weight: 0.5       # ★ size target: pull every object towards target_size pixels in the canonical frame, the canonical
+                       #   form "objects at one size" this use case wants. Labels define it in training; at test time the
+                       #   warp still comes from the image alone. 0.1 - 1; 0 turns it off
+target_size: 64        # ★ the size it pulls towards, sqrt(w * h) in pixels at --img-size. Set it to your median object
+                       #   size (obj_px in lse.txt after one epoch) or near the geometric mean of your anchors
+prior_weight: 0.0      # pull towards the identity warp: only if warps become extreme (verdict saturated)
+
+# --- Against the identity basin (a detector pretrained on unwarped images resists any warp) ---------------------------
+warp_aug: 0.5          # ★ chance a region of the detector input is randomly rescaled first (labels follow): the detector
+                       #   becomes robust to warps, so warping stops costing it. Main remedy if the verdict is STUCK
+warp_aug_strength: 1.0 #   strength of those rescalings (1.0: strongest local zoom ~1.5x at max_zoom 2.5; 0.5: ~1.25x)
+det_grad_epochs: 2     # ★ first epochs in which canonicalizers learn from their own losses only (consistency, size), not
+                       #   from the detection loss, which pulls them back to the identity at first
+
+# --- Anchors ----------------------------------------------------------------------------------------------------------
+reanchor_epoch: -1     # at the end of this epoch, re-fit the anchors to the object sizes in the canonical frame if they
+                       #   fit badly (anchor_bpr < 0.98). Set it once the warps have settled (a few epochs after the
+                       #   verdict turns ok); -1: never (the fit is logged every epoch either way)
+
+# --- Inference --------------------------------------------------------------------------------------------------------
+min_conf: 0.001        # only when the model maps its own boxes (direct calls; test.py / detect.py map after NMS):
+                       #   predictions below this objectness are not mapped back

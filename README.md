@@ -690,6 +690,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
+| `scripts/train_lse_example.sh`, `data/lse/example.yaml` | LSE end to end with every setting exposed and the important ones marked (★): stage 1, size probe, LSE stage 2 with `--lse-debug`, baseline and warp-augmentation control, tests per size and under local warps, detect (section 14) |
 | `tools/grid_capacity.py` | What LSE warps of each `grid` / `max_zoom` can express, on synthetic scenes or your labels' object layouts (section 14) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
@@ -734,6 +735,10 @@ Local scale equivariance (after Rahman et al., "Local Scale Equivariance with La
 ICCV 2025) adds **deep equilibrium canonicalizers (DECs)**: small networks that pick, per frame, a smooth warp that
 rescales parts of the frame differently, so the detector sees objects at a more uniform, "canonical" scale. Boxes are
 always reported in image pixels.
+
+**Start here:** `scripts/train_lse_example.sh` with `data/lse/example.yaml`: every LSE setting and training option in
+one place, ★ on the ones to look at first, values for objects that change size with distance on 16:9 frames at
+1280, and the comparison runs (baseline, warp-augmentation control) and tests that tell whether LSE helps.
 
 **Usage.** DECs are layers of the model architecture (yolov7-DEC models, `models/dec.py`), in either of two ways:
 - a DEC model yaml: `train.py --cfg cfg/training/dec/yolov7-tiny-dec-input.yaml --weights yolov7-tiny.pt ...`. Ready
