@@ -540,8 +540,8 @@ def train(hyp, opt, device, tb_writer=None):
                     loss, loss_items = compute_loss(pred, targets_l)  # loss scaled by batch_size
                 if dec_ctx is not None:  # consistency + prior + size, scaled by batch size like the detection loss
                     loss = loss + loss_lse * imgs.shape[0]
-                    for k, v in lse_stats.items():  # running means (a key can be missing from a batch)
-                        c = nlse[k] = nlse.get(k, 0) + 1
+                    for k, v in lse_stats.items():  # running means (a key can be missing from a batch); tensors stay
+                        c = nlse[k] = nlse.get(k, 0) + 1  # on the device until the epoch's log (no sync per step)
                         mlse[k] = mlse.get(k, 0.0) + (v - mlse.get(k, 0.0)) / c
                 if distiller:
                     loss_kd, kd_items = distiller(imgs, pred)
@@ -603,6 +603,7 @@ def train(hyp, opt, device, tb_writer=None):
                 f.write(f'epoch {epoch}/{epochs - 1}\n{usage}\n')
 
         if dec_ctx is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
+            mlse = {k: float(v) for k, v in mlse.items()}
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
             logger.info(colorstr('dec: ') + f'{line} (obj_px median object size the detector sees; per '
                                              f'canonicalizer: eq consistency, size target, obj_px in its canonical '

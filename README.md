@@ -857,7 +857,7 @@ Judge by the mean over seeds and its spread (section 6), per size, clean and war
 that the warps actually left the identity.
 
 **Monitoring.** Per epoch (`lse.txt`, TensorBoard `lse/*`): `obj_px`, the median object size the detector sees, and
-per DEC: consistency, size and prior losses, `obj_px` in its canonical frame, mean warp displacement and the strongest
+per DEC: consistency (not with `eq_weight: 0`, which also skips its second solve), size and prior losses, `obj_px` in its canonical frame, mean warp displacement and the strongest
 local zoom in / out. Warp plots on 4 fixed validation images, `lse/<dec>/epoch_*.jpg` (the image with the canonical
 grid drawn on it, the local zoom (red magnified, blue shrunk) and the canonical image; also in TensorBoard), and
 `lse/<dec>_progress.jpg`, the first image's warp grid over the epochs. `train_batch*_lse.jpg`: what the detector sees
@@ -895,6 +895,10 @@ tracking in `utils/datasets.py`).**
   as in yolov7's downsampling blocks, work); a closed span ends with a `DECUnwarp`; the detection head's inputs get a
   `DECScale` per closed DEC set.
 - `test.py` / `detect.py` do not trace DEC models (the canonicalizers are data dependent).
+- Launch and sync overhead (the cost on GPUs at small batches): every region is warped by one batched evaluation
+  (no loop over regions or images), the canonicalizer's base sampling points are built once, and the per-step
+  statistics stay on the device until the epoch's log. A training step of `input` with mosaic tiles runs ~35% fewer
+  operators and ~100 fewer host syncs; results are unchanged (forward bit-identical, gradients to ~1e-6 relative).
 
 **Checked** (CPU, synthetic data)
 - The DEC layers reproduce the earlier implementation (canonicalizers attached to the model at run time) exactly:

@@ -125,15 +125,31 @@ def random_phi(n, grid, strength, device):
     return [(torch.rand(n, grid, grid - 1, device=device) * 2 - 1) * strength for _ in range(2)]
 
 
-def dense_local(G, us, vs):
-    """Warps G (K, 2, R, R) evaluated on the region grid us (w,) x vs (h,): input coordinates gx, gy (K, h, w)."""
-    K, R = G.shape[0], G.shape[-1]
+_BASE_GRIDS = {}  # (S, R, device, dtype) -> warp_crops' base sampling points (built once, not per call)
+
+
+def _dense_base(us, vs, R):
+    """grid_sample points of dense_local for region grids us x vs: (u, v) points and (u, row knot) points. us (w,) and
+    vs (h,) are shared by every region (shapes (1, h, w, 2), (1, R, w, 2)); us (K, w) and vs (K, h) are per region."""
     gu, gv = us * 2 - 1, vs * 2 - 1
-    pts = torch.stack(torch.meshgrid(gv, gu, indexing='ij')[::-1], -1).unsqueeze(0).expand(K, -1, -1, -1)
-    gy = F.grid_sample(G[:, 1:], pts, mode='bilinear', align_corners=True)[:, 0]  # y = gy(u, v)
-    kv = torch.linspace(-1, 1, R, device=G.device, dtype=G.dtype)
-    rp = torch.stack(torch.meshgrid(kv, gu, indexing='ij')[::-1], -1).unsqueeze(0).expand(K, -1, -1, -1)
-    rows = F.grid_sample(G[:, :1], rp, mode='bilinear', align_corners=True)[:, 0]  # (K, R, w): row x knots at u
+    kv = torch.linspace(-1, 1, R, device=us.device, dtype=us.dtype)
+    if us.dim() == 1:
+        pts = torch.stack(torch.meshgrid(gv, gu, indexing='ij')[::-1], -1).unsqueeze(0)
+        rp = torch.stack(torch.meshgrid(kv, gu, indexing='ij')[::-1], -1).unsqueeze(0)
+    else:
+        K, h, w = us.shape[0], vs.shape[1], us.shape[1]
+        pts = torch.stack([gu[:, None, :].expand(K, h, w), gv[:, :, None].expand(K, h, w)], -1)
+        rp = torch.stack([gu[:, None, :].expand(K, R, w), kv[None, :, None].expand(K, R, w)], -1)
+    return pts, rp
+
+
+def dense_local(G, us, vs, base=None):
+    """Warps G (K, 2, R, R) evaluated on the region grid us x vs (shared (w,), (h,) or per region (K, w), (K, h)):
+    input coordinates gx, gy (K, h, w). base: _dense_base(us, vs, R), if already built."""
+    K, R = G.shape[0], G.shape[-1]
+    pts, rp = base if base is not None else _dense_base(us, vs, R)
+    gy = F.grid_sample(G[:, 1:], pts.expand(K, -1, -1, -1), mode='bilinear', align_corners=True)[:, 0]  # y = gy(u, v)
+    rows = F.grid_sample(G[:, :1], rp.expand(K, -1, -1, -1), mode='bilinear', align_corners=True)[:, 0]  # (K, R, w)
     f = gy * (R - 1)
     r0 = f.detach().floor().clamp(0, R - 2).long()
     t = f - r0
@@ -220,31 +236,35 @@ class Regions:
         return Regions(self.b, self.rect, G)
 
     def crops(self, x, size):
-        """Each region of images x (B, C, H, W) resized to size x size: (K, C, size, size)."""
-        out = []
-        for i in range(x.shape[0]):
-            m = self.b == i
-            if not m.any():
-                continue
-            r = self.rect[m]
-            theta = torch.zeros(len(r), 2, 3, device=x.device, dtype=x.dtype)
-            theta[:, 0, 0], theta[:, 0, 2] = r[:, 2] - r[:, 0], r[:, 0] + r[:, 2] - 1
-            theta[:, 1, 1], theta[:, 1, 2] = r[:, 3] - r[:, 1], r[:, 1] + r[:, 3] - 1
-            grid = F.affine_grid(theta, (len(r), x.shape[1], size, size), align_corners=False)
-            out.append(F.grid_sample(x[i:i + 1].expand(len(r), -1, -1, -1), grid, mode='bilinear',
-                                     padding_mode='border', align_corners=False))
-        return torch.cat(out)
+        """Each region of images x (B, C, H, W) resized to size x size: (K, C, size, size), in region order."""
+        r = self.rect
+        theta = torch.zeros(len(r), 2, 3, device=x.device, dtype=x.dtype)
+        theta[:, 0, 0], theta[:, 0, 2] = r[:, 2] - r[:, 0], r[:, 0] + r[:, 2] - 1
+        theta[:, 1, 1], theta[:, 1, 2] = r[:, 3] - r[:, 1], r[:, 1] + r[:, 3] - 1
+        grid = F.affine_grid(theta, (len(r), x.shape[1], size, size), align_corners=False)
+        src = x if len(r) == x.shape[0] else x.index_select(0, self.b)  # one region per image: region k is image k
+        return F.grid_sample(src, grid, mode='bilinear', padding_mode='border', align_corners=False)
 
-    def _pixels(self, k, h, w):
-        """Pixel index ranges of region k on an h x w map (pixel centres inside the rectangle) and their region
-        coordinates."""
-        x1, y1, x2, y2 = self.rect[k].tolist()
-        j0, j1 = max(math.ceil(x1 * w - 0.5), 0), min(math.ceil(x2 * w - 0.5), w)
-        i0, i1 = max(math.ceil(y1 * h - 0.5), 0), min(math.ceil(y2 * h - 0.5), h)
+    def _blocks(self, h, w):
+        """The pixels of every region on an h x w map (those whose centre is inside its rectangle), padded to a
+        (K, Hm, Wm) layout: flat indices into (n, h, w), a mask of the real pixels, and region coordinates us (K, Wm),
+        vs (K, Hm). None if no region has a pixel. One host sync (the padded size), whatever the number of regions."""
+        r = self.rect.double()  # float64: pixel ranges exact at the rectangle edges
+        j0, j1 = torch.ceil(r[:, 0] * w - 0.5).clamp(min=0).long(), torch.ceil(r[:, 2] * w - 0.5).clamp(max=w).long()
+        i0, i1 = torch.ceil(r[:, 1] * h - 0.5).clamp(min=0).long(), torch.ceil(r[:, 3] * h - 0.5).clamp(max=h).long()
+        nh, nw = (i1 - i0).clamp(min=0), (j1 - j0).clamp(min=0)
+        Hm, Wm = torch.stack([nh.max(), nw.max()]).tolist()
+        if Hm <= 0 or Wm <= 0:
+            return None
         dev = self.rect.device
-        us = ((torch.arange(j0, j1, device=dev) + 0.5) / w - x1) / max(x2 - x1, 1e-9)
-        vs = ((torch.arange(i0, i1, device=dev) + 0.5) / h - y1) / max(y2 - y1, 1e-9)
-        return i0, i1, j0, j1, us, vs
+        a, c = torch.arange(Hm, device=dev), torch.arange(Wm, device=dev)
+        valid = (a[None, :, None] < nh[:, None, None]) & (c[None, None, :] < nw[:, None, None])
+        rows, cols = (i0[:, None] + a).clamp(max=h - 1), (j0[:, None] + c).clamp(max=w - 1)
+        flat = (self.b[:, None, None] * h + rows[:, :, None]) * w + cols[:, None, :]
+        rf = self.rect
+        us = ((cols + 0.5) / w - rf[:, :1]) / (r[:, 2] - r[:, 0]).clamp(min=1e-9).float()[:, None]
+        vs = ((rows + 0.5) / h - rf[:, 1:2]) / (r[:, 3] - r[:, 1]).clamp(min=1e-9).float()[:, None]
+        return flat, valid, us, vs
 
     def sampling_grid(self, n, h, w, dtype):
         """grid_sample grid (n, h, w, 2) (align_corners=False) warping every region: canonical pixel -> input."""
@@ -252,13 +272,13 @@ class Regions:
         ys, xs = (torch.arange(h, device=dev) + 0.5) / h, (torch.arange(w, device=dev) + 0.5) / w
         grid = torch.stack(torch.meshgrid(ys, xs, indexing='ij')[::-1], -1) * 2 - 1
         grid = grid.unsqueeze(0).repeat(n, 1, 1, 1).to(self.G.dtype)
-        for k in range(len(self.b)):
-            i0, i1, j0, j1, us, vs = self._pixels(k, h, w)
-            if i1 <= i0 or j1 <= j0:
-                continue
-            gx, gy = dense_local(self.G[k:k + 1], us.to(self.G.dtype), vs.to(self.G.dtype))
-            x1, y1, x2, y2 = self.rect[k]
-            grid[self.b[k], i0:i1, j0:j1] = torch.stack([x1 + gx[0] * (x2 - x1), y1 + gy[0] * (y2 - y1)], -1) * 2 - 1
+        blocks = self._blocks(h, w) if len(self.b) else None
+        if blocks is not None:  # every region at once (regions do not overlap)
+            flat, valid, us, vs = blocks
+            gx, gy = dense_local(self.G, us.to(self.G.dtype), vs.to(self.G.dtype))
+            x1, y1, x2, y2 = (v[:, None, None] for v in self.rect.unbind(1))
+            vals = torch.stack([x1 + gx * (x2 - x1), y1 + gy * (y2 - y1)], -1) * 2 - 1
+            grid.view(-1, 2)[flat[valid]] = vals[valid]
         return grid.to(dtype)
 
     def inverse_grid(self, n, h, w):
@@ -266,16 +286,16 @@ class Regions:
         (n, 2, h, w) at each image location (x, y; > 0 where the canonical frame magnifies)."""
         dev = self.rect.device
         idx = torch.full((n, h, w), -1, device=dev, dtype=torch.long)
-        for k in range(len(self.b)):
-            i0, i1, j0, j1, _, _ = self._pixels(k, h, w)
-            if i1 > i0 and j1 > j0:
-                idx[self.b[k], i0:i1, j0:j1] = k
+        blocks = self._blocks(h, w) if len(self.b) else None
+        if blocks is not None:
+            flat, valid = blocks[:2]
+            idx.view(-1)[flat[valid]] = torch.arange(len(self.b), device=dev)[:, None, None].expand_as(flat)[valid]
         ys, xs = (torch.arange(h, device=dev) + 0.5) / h, (torch.arange(w, device=dev) + 0.5) / w
         py, px = [t.reshape(1, h, w).expand(n, h, w) for t in torch.meshgrid(ys, xs, indexing='ij')]
         grid = torch.stack([px, py], -1).clone().to(self.G.dtype)
         logm = torch.zeros(n, 2, h, w, device=dev, dtype=self.G.dtype)
         m = idx >= 0
-        if m.any():
+        if blocks is not None and m.any():
             k = idx[m]
             r = self.rect[k].to(self.G.dtype)
             tx, ty = (px[m] - r[:, 0]) / (r[:, 2] - r[:, 0]), (py[m] - r[:, 1]) / (r[:, 3] - r[:, 1])
@@ -428,14 +448,14 @@ def unwarp_predictions(z, regions, h, w, min_conf=1e-3):
 
 def warp_stats(G):
     """Mean displacement from the identity (fraction of the region) and the strongest local magnification and
-    shrinking of a set of warps."""
+    shrinking of a set of warps (0-dim tensors)."""
     R = G.shape[-1]
     ident = torch.linspace(0, 1, R, device=G.device)
     disp = torch.cat([(G[:, 0] - ident.view(1, 1, R)).abs().flatten(), (G[:, 1] - ident.view(1, R, 1)).abs().flatten()])
     sx = (G[:, 0, :, 1:] - G[:, 0, :, :-1]) * (R - 1)  # slopes: < 1 magnifies
     sy = (G[:, 1, 1:, :] - G[:, 1, :-1, :]) * (R - 1)
     s = torch.cat([sx.flatten(), sy.flatten()])
-    return {'disp': disp.mean().item(), 'zoom_in': (1 / s.min()).item(), 'zoom_out': s.max().item()}
+    return {'disp': disp.mean(), 'zoom_in': 1 / s.min(), 'zoom_out': s.max()}  # tensors: no host sync per step
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -466,9 +486,12 @@ class Canonicalizer(nn.Module):
 
     def warp_crops(self, s, G):
         """Warp whole crops s (K, C, S, S) by G (K, 2, R, R)."""
-        S = s.shape[-1]
-        c = (torch.arange(S, device=s.device, dtype=G.dtype) + 0.5) / S
-        gx, gy = dense_local(G, c, c)
+        S, R = s.shape[-1], G.shape[-1]
+        key = (S, R, str(s.device), G.dtype)
+        if key not in _BASE_GRIDS:  # the same points every call: build them once
+            c = (torch.arange(S, device=s.device, dtype=G.dtype) + 0.5) / S
+            _BASE_GRIDS[key] = _dense_base(c, c, R)
+        gx, gy = dense_local(G, None, None, _BASE_GRIDS[key])
         return F.grid_sample(s, torch.stack([gx, gy], -1) * 2 - 1, mode='bilinear', padding_mode='border',
                              align_corners=False)
 

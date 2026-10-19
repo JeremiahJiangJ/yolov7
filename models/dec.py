@@ -84,7 +84,7 @@ class DECContext:
         if training:
             self.loss, self.stats = torch.zeros((), device=x.device), {'regions/img': len(self.base.b) / n}
             if targets is not None and len(targets):  # median object size the detector sees (for target_size)
-                self.stats['obj_px'] = torch.sqrt(targets[:, 4].float() * w * targets[:, 5].float() * h).median().item()
+                self.stats['obj_px'] = torch.sqrt(targets[:, 4].float() * w * targets[:, 5].float() * h).median()
         self.targets = targets
         return x
 
@@ -139,31 +139,35 @@ class DEC(_DECLayer):
         return reg.G
 
     def _aux(self, s, G, phi_x, phi_y, reg, targets, h, w):
-        """Consistency, prior and size losses, and statistics."""
+        """Consistency (skipped, with its second solve, when eq_weight is 0), prior and size losses, and statistics
+        (0-dim tensors: no host sync per step)."""
         cfg, c = self.ctx.cfg, self.canon
-        if s.shape[0] > cfg['eq_regions']:  # a random subset of the regions: the second solve is the costly part
-            idx = torch.randperm(s.shape[0], device=s.device)[:cfg['eq_regions']]
-            s_eq, G_eq = s[idx], G[idx]
-        else:
-            s_eq, G_eq = s, G
-        tx, ty = random_phi(s_eq.shape[0], c.grid, cfg['eq_strength'], s.device)
-        s_t = c.warp_crops(s_eq, make_grid(tx, ty, c.max_zoom))
-        G_t, _, _ = c.solve(s_t)
-        eq = F.mse_loss(c.warp_crops(s_t, G_t), c.warp_crops(s_eq, G_eq))
+        loss, stats = torch.zeros((), device=s.device), {}
+        if cfg['eq_weight'] > 0:  # the canonical frame of a randomly rescaled crop must be that of the crop
+            if s.shape[0] > cfg['eq_regions']:  # a random subset of the regions: the second solve is the costly part
+                idx = torch.randperm(s.shape[0], device=s.device)[:cfg['eq_regions']]
+                s_eq, G_eq = s[idx], G[idx]
+            else:
+                s_eq, G_eq = s, G
+            tx, ty = random_phi(s_eq.shape[0], c.grid, cfg['eq_strength'], s.device)
+            s_t = c.warp_crops(s_eq, make_grid(tx, ty, c.max_zoom))
+            G_t, _, _ = c.solve(s_t)
+            eq = F.mse_loss(c.warp_crops(s_t, G_t), c.warp_crops(s_eq, G_eq))
+            loss, stats['eq'] = cfg['eq_weight'] * eq, eq.detach()
         prior = (torch.tanh(phi_x) ** 2).mean() + (torch.tanh(phi_y) ** 2).mean()
-        loss = cfg['eq_weight'] * eq + cfg['prior_weight'] * prior
-        stats = {'eq': eq.item(), 'prior': prior.item()}
+        loss = loss + cfg['prior_weight'] * prior
+        stats['prior'] = prior.detach()
         if targets is not None and len(targets):
             t = targets.float()
             z, m = reg.zoom_at(t[:, 0].long(), t[:, 2], t[:, 3])
             if m.any():
                 size = torch.sqrt(t[m, 4] * w * t[m, 5] * h).clamp_min(1)
-                stats['obj_px'] = (size * z.detach()).median().item()  # median object size in the canonical frame
+                stats['obj_px'] = (size * z.detach()).median()  # median object size in the canonical frame
                 if cfg['size_weight'] > 0:
                     want = torch.log(cfg['target_size'] / size).clamp(-math.log(c.max_zoom), math.log(c.max_zoom))
                     size_loss = ((torch.log(z) - want) ** 2).mean()
                     loss = loss + cfg['size_weight'] * size_loss
-                    stats['size'] = size_loss.item()
+                    stats['size'] = size_loss.detach()
         stats.update(warp_stats(G.detach()))
         return loss, stats
 
