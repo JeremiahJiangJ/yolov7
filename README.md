@@ -690,6 +690,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
+| `tools/grid_capacity.py` | What LSE warps of each `grid` / `max_zoom` can express, on synthetic scenes or your labels' object layouts (section 14) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
 | `data/mixed/1_...` to `6_...` | Experiment ladder (below) |
@@ -827,6 +828,24 @@ boxes 20-100 x 15-70 px in a 240 x 160 region (`zoom_in` = strongest local magni
 
 So when the learned warps stay below ~2x the mapping is practically exact; stronger warps cost some localisation
 accuracy (visible in mAP@.5:.95 more than mAP@.5). `max_zoom` bounds the warps, `prior_weight` pulls them back.
+
+**Grid size (`tools/grid_capacity.py`).** Fits warp parameters directly to target local zooms: an upper bound on
+what a canonicalizer with that `grid` / `max_zoom` can do. On one 640 x 640 region with `max_zoom` 4 (share of points
+within 20% of the target zoom):
+
+| Target | grid 4 (213 px cells) | grid 8 (91 px) | grid 16 (42 px) | grid 32 (20 px) |
+|---|---|---|---|---|
+| 6 objects (32 px) >= 150 px apart, each its own zoom (0.5-2x) | 100% | 100% | 100% | 100% |
+| 20 objects >= 80 px apart | 47% | 100% | 100% | 100% |
+| 40 objects >= 40 px apart | 30% | 74% | 95% | 100% |
+| perspective ramp, 2x (top) to 0.5x (bottom) everywhere | 49% | 71% | 74% | 70% |
+
+Objects about a cell apart get independent zooms; denser ones share them. The ramp stays near 70% whatever the grid:
+a warp maps its region onto itself, so along every row the horizontal magnification averages 1x (a whole row cannot
+be magnified), which with `max_zoom` caps it. A finer grid also needs a larger `canon_size` (the canonicalizer pools a
+28 x 28 feature map at 224 into the grid's parameters) and makes sharper warps (box mapping is less exact above ~2x).
+With your data: `python tools/grid_capacity.py --data data.yaml --target-size <obj_px> --grids 8 16` (each object's
+target zoom is the size target's, target_size / sqrt(w * h), as training sees the frame).
 
 **Experiments** (`scripts/train_lse_experiments.sh`, `data/lse/exp/`). Fine-tune yolov7-tiny from `yolov7-tiny.pt`,
 3 seeds each, same budget, baselines with the same hyp file:
