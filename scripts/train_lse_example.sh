@@ -11,8 +11,10 @@
 #   control  the same as stage2 with the canonicalizer frozen at the identity (random warps only): is the gain
 #            canonicalization, or just warp augmentation?
 #   test     all three on the clean validation set and with random local warps (--warp-test), per object size
+#   stability  track stability of base2 / control / stage2 on sequences (SEQ; made from the validation images with
+#            tools/zoom_sequences.py if SEQ does not exist), then stage2 and control compared with base2
 #   detect   stage 2 on a folder of images / a video
-#   all      stage1 base2 stage2 control test (default)
+#   all      stage1 base2 stage2 control test (default; add stability for sequences)
 #
 #   DATA=data/your_data.yaml bash scripts/train_lse_example.sh
 #   DATA=data/your_data.yaml EPOCHS2=10 bash scripts/train_lse_example.sh stage2 test
@@ -61,7 +63,10 @@ EXTRA=${EXTRA:-}                        # extra train.py flags for every run, e.
 
 # --- Inference --------------------------------------------------------------------------------------------------------
 SOURCE=${SOURCE:-inference/images}      # detect: images / video / folder
-CONF=${CONF:-0.25}                      # detect: confidence threshold
+CONF=${CONF:-0.25}                      # detect / stability: confidence threshold
+SEQ=${SEQ:-$PROJECT/zoom_seq}           # ★ stability: sequences (<SEQ>/images/<sequence>/, labels with track ids). Use
+                                        #   real video of approaching / receding objects when you have it
+VAL_IMAGES=${VAL_IMAGES:-}              # stability: images to make synthetic sequences from if SEQ does not exist
 
 COMMON="--cfg $CFG --data $DATA --img-size $IMG $IMG --batch-size $BS --device $DEVICE --workers $WORKERS
         --label-folder-name $LABELS --project $PROJECT --exist-ok --seed $SEED --area-int $AREA_INT $EXTRA"
@@ -112,10 +117,26 @@ for STAGE in $STAGES; do
       python test.py $T --name ${RUN}_clean
       for WT in $WARP_TESTS; do python test.py $T --name ${RUN}_warp$WT --warp-test $WT; done
     done ;;
+  stability)
+    if [ ! -d "$SEQ/images" ]; then
+      [ -n "$VAL_IMAGES" ] || { echo "set SEQ (sequences) or VAL_IMAGES (images to make them from)"; exit 1; }
+      python tools/zoom_sequences.py --images $VAL_IMAGES --labels-folder $LABELS --out $SEQ --frames 30 --zoom 3
+    fi
+    for RUN in base2 control stage2; do
+      W=$PROJECT/$RUN/weights/best.pt
+      [ -f "$W" ] || { echo "skip $RUN: $W not found"; continue; }
+      python tools/track_stability.py --weights $W --source $SEQ --labels $LABELS --img-size $IMG --conf-thres $CONF \
+        --device $DEVICE --out $PROJECT/stability_$RUN.json
+    done
+    for RUN in control stage2; do
+      if [ -f $PROJECT/stability_$RUN.json ] && [ -f $PROJECT/stability_base2.json ]; then
+        python tools/track_stability.py --compare $PROJECT/stability_base2.json $PROJECT/stability_$RUN.json
+      fi
+    done ;;
   detect)
     python detect.py --weights $PROJECT/stage2/weights/best.pt --source $SOURCE --img-size $IMG --conf-thres $CONF \
       --device $DEVICE --project $PROJECT/detect --name stage2 --exist-ok ;;
   *)
-    echo "unknown stage $STAGE (stage1 probe stage2 base2 control test detect all)"; exit 1 ;;
+    echo "unknown stage $STAGE (stage1 probe stage2 base2 control test stability detect all)"; exit 1 ;;
   esac
 done

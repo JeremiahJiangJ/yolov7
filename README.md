@@ -692,6 +692,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
 | `scripts/train_lse_latent_example.sh`, `data/lse/example_latent.yaml` | The same with latent canonicalization: a canonicalizer at every backbone stage P1 - P5 (closed spans, as the paper's latent canonicalization), for comparison with input canonicalization (section 14) |
 | `scripts/train_lse_example.sh`, `data/lse/example.yaml` | LSE end to end with every setting exposed and the important ones marked (★): stage 1, size probe, LSE stage 2 with `--lse-debug`, baseline and warp-augmentation control, tests per size and under local warps, detect (section 14) |
+| `tools/zoom_sequences.py`, `tools/track_stability.py`, `utils/stability.py` | Track stability over sequences (objects approaching / receding / crossing): scale and centre jitter against the ground-truth trajectory, continuity, worst IoU drop, frame-to-frame consistency, and a two-arm comparison with a noise bar; synthetic zoom sequences from labelled stills until real video is available (section 14) |
 | `tools/grid_capacity.py` | What LSE warps of each `grid` / `max_zoom` can express, on synthetic scenes or your labels' object layouts (section 14) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
@@ -995,6 +996,29 @@ tracking in `utils/datasets.py`).**
   (training process and data workers; 11.5 GB at canon_size 320).
 - Labels warped with gradients are the correct gradient; a test on a weakly trained detector found no measurable pull
   towards the identity with detached labels either, so they are not shown to cause the identity basin.
+
+**Track stability (`tools/track_stability.py`, `utils/stability.py`; after equivdet's metrics, reimplemented).** mAP
+on stills does not show whether a box follows an object steadily while its size changes. On sequences
+(`<source>/images/<sequence>/*.jpg`, labels in `<source>/<labels>/<sequence>/*.txt`, a 6th column = track id; one
+unlabelled object per frame is one track), per ground-truth track, on frames where the prediction hits it (IoU >= 0.5):
+S1 scale jitter (std of log sqrt(area) residuals, constant bias removed), S2 centre jitter (centre residuals / box
+diagonal), S3 continuity (share of frames hit), S4 worst frame-to-frame IoU drop. All are residuals against the
+ground-truth trajectory, so a frozen box does not look steady. Tracks are grouped by motion: toward / away (size
+changes >= 1.65x, monotone), across (constant size: the control), mixed. Also frame-to-frame consistency without
+labels (survival of matched detections, centre jitter, runs). `--compare A.json B.json` (comma-separated seeds are
+averaged per sequence) counts a difference only beyond 2x the pooled sd over sequences; also compare it with the A/A
+floor (two seeds of the same configuration). Without video, `tools/zoom_sequences.py` makes toward / away / across
+sequences by zooming / panning a window over labelled stills (upsampled: no new detail as an object approaches).
+
+```shell
+python tools/zoom_sequences.py --images data/val/images --labels-folder labels --out data/zoom_seq --frames 30 --zoom 3
+python tools/track_stability.py --weights runs/lse/base2/weights/best.pt --source data/zoom_seq --img-size 1280 --out base.json
+python tools/track_stability.py --weights runs/lse/stage2/weights/best.pt --source data/zoom_seq --img-size 1280 --out lse.json
+python tools/track_stability.py --compare base.json lse.json
+```
+
+Checked on the synthetic data (CPU): perfect, constantly biased and gapped tracks give the expected values; toward and
+away sequences (the same frames reversed) give identical S1 - S3; both example checkpoints run end to end.
 
 **Limitations.** DEC checkpoints from before the scale input channels (`canon_size` section above) do not load: the
 canonicalizer's first conv has 5 input channels. Not supported: `train_aux.py`, `--teacher` with an `input` or open-ended DEC (the student predicts in
