@@ -690,8 +690,8 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
-| `scripts/train_lse_latent_example.sh`, `data/lse/example_latent.yaml` | The same with latent canonicalization: a canonicalizer at every backbone stage P1 - P5 (closed spans, as the paper's latent canonicalization), for comparison with input canonicalization (section 14) |
-| `scripts/train_lse_example.sh`, `data/lse/example.yaml` | LSE end to end with every setting exposed and the important ones marked (★): stage 1, size probe, LSE stage 2 with `--lse-debug`, baseline and warp-augmentation control, tests per size and under local warps, detect (section 14) |
+| `scripts/train_lse_example.sh`, `data/lse/example.yaml` | LSE end to end with every setting exposed and the important ones marked (★), with latent canonicalization (a canonicalizer at every backbone stage P1 - P5, as in the paper): stage 1, size probe, LSE stage 2 with `--lse-debug`, baseline and warp-augmentation control, tests per size and under local warps, track stability, detect (section 14) |
+| `scripts/train_lse_input_example.sh`, `data/lse/example_input.yaml` | The same with input canonicalization (the image is warped, boxes mapped back): the ablation (section 14) |
 | `tools/zoom_sequences.py`, `tools/track_stability.py`, `utils/stability.py` | Track stability over sequences (objects approaching / receding / crossing): scale and centre jitter against the ground-truth trajectory, continuity, worst IoU drop, frame-to-frame consistency, and a two-arm comparison with a noise bar; synthetic zoom sequences from labelled stills until real video is available (section 14) |
 | `tools/grid_capacity.py` | What LSE warps of each `grid` / `max_zoom` can express, on synthetic scenes or your labels' object layouts (section 14) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
@@ -740,9 +740,20 @@ always reported in image pixels.
 
 **Start here:** `scripts/train_lse_example.sh` with `data/lse/example.yaml`: every LSE setting and training option in
 one place, ★ on the ones to look at first, values for objects that change size with distance on 16:9 frames at
-1280, and the comparison runs (baseline, warp-augmentation control) and tests that tell whether LSE helps. Latent canonicalization at every
-stage P1 - P5: `scripts/train_lse_latent_example.sh` with `data/lse/example_latent.yaml` (same stages; reuse a stage 1 with
-`STAGE1=`).
+1280, and the comparison runs (baseline, warp-augmentation control) and tests that tell whether LSE helps. It uses
+latent canonicalization, a closed canonicalizer at every backbone stage P1 - P5 (also the code default for `decs`).
+Input canonicalization, the ablation: `scripts/train_lse_input_example.sh` with `data/lse/example_input.yaml` (same
+stages; reuse a stage 1 with `STAGE1=`).
+
+**Why latent by default.** The paper finds input canonicalization degrades accuracy (section 5.1: segmentation mIoU
+79.4 / 83.9 against 82.2 / 86.7 with augmentation for ViT / Swin; section 5.3: ImageNet below the plain model) while
+latent canonicalization improves it (83.1 / 88.6), and gives the reason (section 4.3): a monotone grid warp only
+approximates real local scale change. Warping the input imposes the approximation's errors, and the detail lost where
+it shrinks, on the whole detector, head included; a closed stage is warped and warped back, so the layers after it see
+the image frame and absorb the errors. equivdet (moodoki/lse_objdet) saw the same in detection: its input-style variant
+(warp, then map boxes back) collapsed, its closed latent placement did not. `input` stays as the ablation: it keeps the
+detector and export unchanged, and our losses (consistency, size target) differ from the paper's input baseline, so
+compare the two on your data rather than assume.
 
 **Usage.** DECs are layers of the model architecture (yolov7-DEC models, `models/dec.py`), in either of two ways:
 - a DEC model yaml: `train.py --cfg cfg/training/dec/yolov7-tiny-dec-input.yaml --weights yolov7-tiny.pt ...`. Ready
@@ -792,8 +803,10 @@ backbone:
 
 Combinations: closed stages with each other and with `input` (`[P3]`, `[P3, P4, P5]`, `[input, P1, P2, P3, P4, P5]`);
 one open stage with `input` only (`[P3+]`, `[input, P3+]`). Stage DECs look at the detector's input image (after the
-input DEC, if any), as in the paper. `input` keeps the detector, its pretrained weights and export unchanged; stage
-DECs warp feature maps (no resampling blur of the image) and closed ones add head inputs.
+input DEC, if any), as in the paper. Closed stages (`[P1, P2, P3, P4, P5]`, the default) are the paper's latent
+canonicalization; they warp feature maps (no resampling blur of the image) and add head inputs. `input` keeps the
+detector, its pretrained weights and export unchanged, but warps the whole detector's view (the ablation, see *Why
+latent by default*).
 
 **Mosaic.** A warp assumes one scene. The data loaders record each frame's rectangle in a sample (through mosaic,
 mosaic9, the native-scale mosaic and crops, the affine augmentation and flips), and with `per_tile: true` (default)
@@ -926,7 +939,7 @@ grid drawn on it, the local zoom (red magnified, blue shrunk) and the canonical 
 `lse/<dec>_progress.jpg`, the first image's warp grid over the epochs. `train_batch*_lse.jpg`: what the detector sees
 with an input DEC, with its labels.
 
-Config keys (`data/lse/*.yaml`, commented): `decs`, `per_tile`, `grid` (knots per axis, 8: 7 x 7 cells), `max_zoom`
+Config keys (`data/lse/*.yaml`, commented): `decs` (default `[P1, P2, P3, P4, P5]`), `per_tile`, `grid` (knots per axis, 8: 7 x 7 cells), `max_zoom`
 (largest ratio between the most magnified and most shrunk cell of a row / column, 4), `canon_size` (each frame is seen
 at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-point iterations, the last backpropagated),
 `lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`,

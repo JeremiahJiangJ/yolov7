@@ -48,7 +48,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 DEFAULTS = dict(
-    decs=['input'],        # canonicalizers: input, P1..P6 (backbone stages) and / or [first, last] layer spans
+    decs=['P1', 'P2', 'P3', 'P4', 'P5'],  # canonicalizers: P1..P6 (closed backbone stages, the paper's latent
+                           #   canonicalization), P1+..P6+ (open-ended), input, and / or [first, last] layer spans
     grid=8,                # knots per axis of the coarse warp grid (R): R - 1 cells per axis
     max_zoom=4.0,          # largest ratio between the most magnified and the most shrunk cell of a row / column
     canon_size=224,        # a canonicalizer sees each region resized to canon_size x canon_size, or [height, width]

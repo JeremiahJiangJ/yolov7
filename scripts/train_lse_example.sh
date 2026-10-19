@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Example: yolov7-tiny with local scale equivariance (LSE, README.md section 14) for objects whose apparent size changes
 # as they move towards or away from the camera. Every setting is exposed below; ★ marks the ones to look at first. The
-# LSE settings themselves are in data/lse/example.yaml (also ★-marked).
+# LSE settings themselves are in data/lse/example.yaml (also ★-marked): latent canonicalization, a canonicalizer at
+# every backbone stage P1 - P5, as in the paper. Input canonicalization (the ablation): scripts/train_lse_input_example.sh.
 #
 # Stages (run them all, or one at a time: bash scripts/train_lse_example.sh <stage> ...):
 #   stage1   fine-tune the plain detector on your data, full augmentation (mosaic): the starting point
 #   probe    one LSE epoch from stage 1, to read obj_px (median object size the detector sees) for target_size
 #   stage2   LSE fine-tuning from stage 1 on single frames (no mosaic), with --lse-debug
 #   base2    the same fine-tuning without LSE: the baseline stage 2 must beat
-#   control  the same as stage2 with the canonicalizer frozen at the identity (random warps only): is the gain
+#   control  the same as stage2 with the canonicalizers frozen at the identity (random warps only): is the gain
 #            canonicalization, or just warp augmentation?
 #   test     all three on the clean validation set and with random local warps (--warp-test), per object size
 #   stability  track stability of base2 / control / stage2 on sequences (SEQ; made from the validation images with
@@ -39,7 +40,8 @@ WARP_TESTS=${WARP_TESTS:-"0.5 1.0"}     # --warp-test strengths: random local wa
 # --- Model and LSE ----------------------------------------------------------------------------------------------------
 WEIGHTS=${WEIGHTS:-yolov7-tiny.pt}      # pretrained detector (loaded exactly: its anchors, implicit layers)
 CFG=${CFG:-cfg/training/yolov7-tiny.yaml}
-LSE=${LSE:-data/lse/example.yaml}       # ★ every LSE setting (★-marked inside)
+LSE=${LSE:-data/lse/example.yaml}       # ★ every LSE setting (★-marked inside); data/lse/example_input.yaml: the input
+                                        #   canonicalization ablation
 LSE_DEBUG=${LSE_DEBUG:-1}               # ★ identity-basin verdicts every epoch, warp triplets every N epochs (0: off)
 LSE_DEBUG_IMAGES=${LSE_DEBUG_IMAGES:-4} # validation images in the triplets
 FREEZE_WARMUP=${FREEZE_WARMUP:-0}       # stage 2: first N epochs train the canonicalizer(s) only (detector frozen),
@@ -85,10 +87,10 @@ print(' '.join(str(i) for i, layer in enumerate(y['backbone'] + y['head']) if la
 EOF
 }
 
-control_cfg() {  # the LSE config with the canonicalizer frozen at the identity: random warps (warp_aug) only
+control_cfg() {  # the LSE config with the canonicalizers frozen at the identity: random warps (warp_aug) only
   mkdir -p "$PROJECT"
   { cat "$LSE"; printf 'lr_scale: 0.0\neq_weight: 0.0\nsize_weight: 0.0\ndet_grad_epochs: 0\n'; } > "$PROJECT/lse_control.yaml"
-  echo "$PROJECT/lse_control.yaml"  # later keys win: same warps, canonicalizer never trains
+  echo "$PROJECT/lse_control.yaml"  # later keys win: same warps, canonicalizers never train
 }
 
 for STAGE in $STAGES; do

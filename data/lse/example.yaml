@@ -1,22 +1,36 @@
-# Local scale equivariance (LSE), every setting, with values for objects whose apparent size changes as they move towards
-# or away from the camera, on 16:9 frames (e.g. 1920 x 1080) trained at --img-size 1280 (README.md, section 14).
-# Used by scripts/train_lse_example.sh. Settings marked ★ are the ones to look at first; the rest have sound defaults.
+# Local scale equivariance (LSE), the default placement: latent canonicalization, a canonicalizer at every backbone stage
+# P1 - P5, as in the paper (Rahman et al., ICCV 2025, section 4.3). Every setting, with values for objects whose apparent
+# size changes as they move towards or away from the camera, on 16:9 frames (e.g. 1920 x 1080) trained at --img-size
+# 1280 (README.md, section 14). Used by scripts/train_lse_example.sh. Settings marked ★ first; the rest have sound
+# defaults.
 #
-# Architecture settings (decs, grid, max_zoom, canon_size, channels, iters, grad_iters) are fixed once a run starts:
-# they become layers of the model (models/dec.py) and are stored in its checkpoint. The others are training settings.
+# How it works: each stage (yolov7-tiny: P1 = layer 0, P2 = 1-7, P3 = 8-14, P4 = 15-21, P5 = 22-28) has its own
+# canonicalizer, which looks at the input image and predicts a warp; the stage's input (the image for P1, feature maps
+# after) is warped on entry and its output warped back, so the stage runs on canonicalized features while the next stage,
+# the neck and the head work in the image frame. The head is told every stage's local magnification (DECScale,
+# zero-initialised 1x1 convs). Labels and boxes stay in the image frame: no label warping, no box mapping.
 #
-# What to watch while training (lse.txt, TensorBoard lse/*, and --lse-debug's lse_debug/status.txt + triplets):
+# Why latent, not input (data/lse/example_input.yaml, the ablation): the paper finds input canonicalization degrades
+# accuracy (segmentation below augmentation, ImageNet below the plain model) while latent canonicalization improves it:
+# a monotone grid warp only approximates real local scale change, and warping and unwarping each stage lets the layers
+# after it absorb the approximation's errors, where warping the input imposes them (and the detail lost where it shrinks)
+# on the whole detector. Costs: five canonicalizers (~1.4x the step of input canonicalization at canon_size [126, 224]
+# on CPU, batch 8), five solves at inference, and each stage's warp in / warp back resamples feature maps.
+#
+# Architecture settings (decs, grid, max_zoom, canon_size, channels, iters, grad_iters) are shared by the five
+# canonicalizers, fixed once a run starts and stored in the checkpoint. The others are training settings.
+#
+# What to watch while training, per canonicalizer P1/ ... P5/ (lse.txt, TensorBoard lse/*, --lse-debug's
+# lse_debug/status.txt + triplets):
 #   - verdict ok, zoom_in / zoom_out above 1, disp above 0: the warps left the identity (else: identity basin, below)
 #   - step small: the fixed-point solve converges in `iters` iterations
 #   - <dec>/obj_px moving towards target_size: the size target works
 #   - <dec>/scale_r rising towards 1: the warp magnifies small objects and shrinks large ones (0: it ignores scale)
-#   - anchor_bpr near 1: the anchors fit the object sizes the detector now sees (else reanchor_epoch)
 
 # --- Where ------------------------------------------------------------------------------------------------------------
-decs: [input]          # ★ where canonicalizers go. input: the image is warped and the unchanged (pretrained) detector runs
-                       #   on it; boxes are mapped back. The recommended placement: it keeps the pretrained detector and is
-                       #   the only one equivariant in principle. Alternatives (ablations): [P3+] (open-ended, features from
-                       #   stride 8 on), [P3, P4, P5] (closed backbone stages), [input, P3+], [first, last] layer spans
+decs: [P1, P2, P3, P4, P5]  # ★ one closed canonicalizer per backbone stage. Subsets work too, e.g. [P3, P4, P5] (the
+                       #   stages feeding the neck; cheaper, no stride-2 / -4 feature resampling). [input]: the ablation,
+                       #   data/lse/example_input.yaml
 per_tile: true         # mosaic samples: canonicalize every frame tile on its own (a warp assumes one scene); also makes
                        #   the regions the letterbox content (not the grey bars), in training and at inference
 
@@ -25,15 +39,13 @@ grid: 8                # ★ knots per axis: (grid - 1)^2 cells, each rescaled o
                        #   Objects about a cell apart get independent zooms. Check with your labels:
                        #   python tools/grid_capacity.py --data <data.yaml> --img-size 1280 --target-size <obj_px>
                        #   Try 12 for dense scenes (with a larger canon_size)
-max_zoom: 2.5          # ★ largest magnified / shrunk ratio within a row (column). Above ~2x local zoom box mapping is less
-                       #   exact and shrunk regions lose detail; 2 - 2.5 is a good range (4 is the code default)
+max_zoom: 2.5          # ★ largest magnified / shrunk ratio within a row (column). Shrunk regions lose detail in the
+                       #   warped feature maps; 2 - 2.5 is a good range (4 is the code default)
 
 # --- Canonicalizer (the small network that predicts the warp) ---------------------------------------------------------
-canon_size: [252, 448] # ★ its view of each region: [height, width] in your frames' aspect ratio (16:9 here), so nothing
-                       #   is squashed. The detector always sees the full-resolution warped image; only the warp is
-                       #   predicted from this view, so objects below ~4 px in it (~25 px at 1280 here) are hard for it to
-                       #   see. Larger (e.g. [360, 640]) sees smaller objects at more cost; it is also told each region's
-                       #   scale (2 input channels), so mosaic tiles of any size are fine
+canon_size: [126, 224] # ★ each canonicalizer's view of a region ([height, width], 16:9 here). Five canonicalizers make
+                       #   this the main cost: at [126, 224] the step is ~1.4x that of input canonicalization at the
+                       #   same size; [252, 448] sees smaller objects (~25 instead of ~50 px at 1280) at ~2x this cost
 channels: [16, 32, 64] # conv widths (stride 2 each)
 iters: 4               # fixed-point iterations: phi <- phi + delta(canonical view). Raise (6 - 8) if `step` stays large
 grad_iters: 2          # of which the last ones are backpropagated (truncated deep-equilibrium gradient)
@@ -48,8 +60,8 @@ eq_weight: 1.0         # consistency: a randomly rescaled region must give the s
                        #   form; the identity does not minimise it). It needs a second solve: the costly part of training
 eq_strength: 1.0       # strength of those random rescalings (1.0: strongest local zoom ~1.5x at max_zoom 2.5, ~1.9x
                        #   at 4)
-eq_regions: 16         # ★ regions per batch used in the consistency loss (random subset). Same expected loss, fewer is
-                       #   cheaper but noisier: 8 - 32
+eq_regions: 8          # ★ regions per batch in each canonicalizer's consistency loss (five second solves): 8 keeps it
+                       #   cheap with mosaic tiles; with single frames a batch has only batch-size regions anyway
 eq_area: true          # weight it by the image area each canonical pixel shows (shrinking detail cannot lower it)
 size_weight: 0.5       # ★ size target: pull every object towards target_size pixels in the canonical frame, the canonical
                        #   form "objects at one size" this use case wants. Labels define it in training; at test time the
@@ -66,10 +78,8 @@ det_grad_epochs: 2     # ★ first epochs in which canonicalizers learn from the
                        #   from the detection loss, which pulls them back to the identity at first
 
 # --- Anchors ----------------------------------------------------------------------------------------------------------
-reanchor_epoch: -1     # at the end of this epoch, re-fit the anchors to the object sizes in the canonical frame if they
-                       #   fit badly (anchor_bpr < 0.98). Set it once the warps have settled (a few epochs after the
-                       #   verdict turns ok); -1: never (the fit is logged every epoch either way)
+reanchor_epoch: -1     # closed stages leave the labels in the image frame, so the anchors see the usual sizes: the fit
+                       #   (anchor_bpr) is logged anyway; re-fitting is rarely needed here
 
 # --- Inference --------------------------------------------------------------------------------------------------------
-min_conf: 0.001        # only when the model maps its own boxes (direct calls; test.py / detect.py map after NMS):
-                       #   predictions below this objectness are not mapped back
+min_conf: 0.001        # unused here (closed stages: boxes are predicted in the image frame, nothing is mapped back)
