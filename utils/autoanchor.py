@@ -63,7 +63,7 @@ def kmean_anchors(path='./data/coco.yaml', n=9, img_size=640, thr=4.0, gen=1000,
     """ Creates kmeans-evolved anchors from training dataset
 
         Arguments:
-            path: path to dataset *.yaml, or a loaded dataset
+            path: path to dataset *.yaml, a loaded dataset, or label widths and heights in pixels (n, 2)
             n: number of anchors
             img_size: image size used for training
             thr: anchor-label wh ratio threshold hyperparameter hyp['anchor_t'] used for training, default=4.0
@@ -100,7 +100,9 @@ def kmean_anchors(path='./data/coco.yaml', n=9, img_size=640, thr=4.0, gen=1000,
             print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
         return k
 
-    if isinstance(path, str):  # *.yaml file
+    if isinstance(path, np.ndarray):  # label widths and heights in pixels (n, 2), e.g. in a canonical frame
+        dataset = None
+    elif isinstance(path, str):  # *.yaml file
         with open(path) as f:
             data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
         from utils.datasets import LoadImagesAndLabels
@@ -109,8 +111,11 @@ def kmean_anchors(path='./data/coco.yaml', n=9, img_size=640, thr=4.0, gen=1000,
         dataset = path  # dataset
 
     # Get label wh
-    shapes = dataset.loaded_shapes(img_size)  # image sizes as loaded (resized to img_size, or native / fixed scale)
-    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
+    if dataset is None:
+        wh0 = path.astype(np.float64)
+    else:
+        shapes = dataset.loaded_shapes(img_size)  # image sizes as loaded (resized to img_size, or native / fixed scale)
+        wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
 
     # Filter
     i = (wh0 < 3.0).any(1).sum()

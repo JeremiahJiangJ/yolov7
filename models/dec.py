@@ -33,8 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-from utils.lse import (DEFAULTS, Canonicalizer, Regions, dec_name, load_lse_cfg, make_grid, random_phi, stage_spans,
-                       unwarp_predictions, validate_spans, warp_stats, warp_targets)
+from utils.lse import (DEFAULTS, Canonicalizer, Regions, antialiased_sample, dec_name, load_lse_cfg, make_grid, random_phi,
+                       stage_spans, unwarp_predictions, validate_spans, warp_stats, warp_targets)
 
 ARCH_KEYS = ('grid', 'max_zoom', 'canon_size', 'channels', 'iters', 'grad_iters')  # per DEC layer, not in `dec:`
 
@@ -81,7 +81,7 @@ class DECContext:
             on = (torch.rand(K, 1, 1, device=x.device) < cfg['warp_aug']).float()
             aug = self.base.with_grid(make_grid(tx * on, ty * on, cfg['max_zoom']))
             with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
-                x = aug.warp(x.float()).to(x.dtype)
+                x = aug.warp(x.float(), antialias=cfg['antialias']).to(x.dtype)
                 if targets is not None:
                     targets = warp_targets(targets, aug, h, w)
         if training:
@@ -198,13 +198,17 @@ def _checkpointing(ctx, dec):
 
 class DECWarp(_DECLayer):
     """[x, dec]: x warped into the canonical frame of DEC layer dec."""
+    image = False  # x is the input image (set by setup): warped with antialiasing
 
     def forward(self, x):
         t = x[0]
         with torch.autocast(device_type=t.device.type, enabled=False):
+            aa = self.image and self.ctx.cfg['antialias']  # images: blur before shrinking (no aliasing)
             if _checkpointing(self.ctx, self.srcs[0]):  # grid recomputed in backward, not stored
-                return self.ctx.regs[self.srcs[0]].warp_checkpointed(t.float()).to(t.dtype)
+                return self.ctx.regs[self.srcs[0]].warp_checkpointed(t.float(), antialias=aa).to(t.dtype)
             grid = self.ctx.grid(self.srcs[0], *t.shape[-2:], inverse=False)
+            if aa:
+                return antialiased_sample(t.float(), grid).to(t.dtype)
             return F.grid_sample(t.float(), grid, mode='bilinear', padding_mode='border',
                                  align_corners=False).to(t.dtype)
 
@@ -264,6 +268,9 @@ def setup(model):
                 f'layer {m.i} ({m.type}): from must be [input, DEC layer(s)], got {m.f}'
             assert len(srcs) == 1 or isinstance(m, DECScale), f'layer {m.i} ({m.type}) reads one DEC, got {m.f}'
             m.srcs = srcs
+            if isinstance(m, DECWarp):
+                f0 = fs[0] if fs[0] >= 0 else m.i + fs[0]
+                m.image = isinstance(layers[f0], DECInput)
             if isinstance(m, DECUnwarp):
                 unwarped.add(srcs[0])
         if isinstance(m, _DECLayer):
@@ -339,7 +346,7 @@ def preview(model, imgs, targets, tiles=None):
         x = imgs.float()
         model(x, lse_tiles=tiles if ctx.cfg['per_tile'] else None)
         reg = ctx.regs[m.i]
-        return reg.warp(x), warp_targets(targets, reg, *x.shape[-2:])
+        return reg.warp(x, antialias=ctx.cfg['antialias']), warp_targets(targets, reg, *x.shape[-2:])
     finally:
         ctx.keep = False
         ctx.clear()

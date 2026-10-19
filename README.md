@@ -908,7 +908,9 @@ that the warps actually left the identity.
 A sound warp magnifies (red) where objects are small or far, shrinks (blue) empty or near areas, keeps the grid
 smooth, and stays consistent across epochs; a field that is uniformly neutral after the warm-up is the identity basin.
 
-**Monitoring.** Per epoch (`lse.txt`, TensorBoard `lse/*`): `obj_px`, the median object size the detector sees, and
+**Monitoring.** Per epoch (`lse.txt`, TensorBoard `lse/*`): `anchor_bpr` / `anchors_per_target`, the anchors' fit
+to the label sizes in the canonical frame (the sizes the detector trains on; autoanchor at the start saw the image
+frame's), `obj_px`, the median object size the detector sees, and
 per DEC: consistency (not with `eq_weight: 0`, which also skips its second solve), size and prior losses, `obj_px` in its canonical frame, mean warp displacement and the strongest
 local zoom in / out. Warp plots on 4 fixed validation images, `lse/<dec>/epoch_*.jpg` (the image with the canonical
 grid drawn on it, the local zoom (red magnified, blue shrunk) and the canonical image; also in TensorBoard), and
@@ -921,7 +923,10 @@ at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-poin
 `lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`,
 `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`, `det_grad_epochs`, `min_conf` (predictions with a lower
 objectness are not mapped back when the model maps its own output, i.e. without `lse_defer_map`: 0.001 =
-test.py's default `--conf-thres`; NMS drops them)), `eq_area` (consistency weighted by the input area each canonical pixel shows, default on: otherwise a
+test.py's default `--conf-thres`; NMS drops them)), `antialias` (image warps blur before they shrink: copies prefiltered for 2x and 4x shrinking, blended by the
+local shrink factor; the identity warp is unchanged; default on), `reanchor_epoch` (at the end of that epoch,
+re-fit the anchors by k-means + evolution to the label sizes in the canonical frame if their best possible recall is
+below 0.98, in the model and its EMA; -1, the default: never; the fit is logged every epoch either way), `eq_area` (consistency weighted by the input area each canonical pixel shows, default on: otherwise a
 warp could lower the loss by shrinking detailed content and magnifying flat areas), `checkpoint` (training: canonicalizer and warp activations recomputed in backward instead of
 stored; same gradients; default on: the DEC's extra activation memory falls from ~1 GiB to ~50 MiB for `input` at
 batch 8, 320, mosaic tiles, and from ~2.8 GiB to ~130 MiB for `P3-P5`, for ~5-20% more step time on CPU).

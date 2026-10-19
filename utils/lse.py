@@ -69,9 +69,59 @@ DEFAULTS = dict(
     det_grad_epochs=0,     # first epochs in which the canonicalizers learn from their own losses only (not detection)
     lr_scale=1.0,          # canonicalizer learning rate = lr0 x lr_scale
     min_conf=1e-3,         # inference: only boxes with objectness above this are mapped back (test.py conf_thres)
+    antialias=True,        # image warps blur before they shrink (mip levels blended by the local shrink factor)
+    reanchor_epoch=-1,     # at the end of this epoch, re-fit the anchors to the label sizes in the canonical frame if
+                           #   they fit badly (BPR < 0.98); -1: never (the fit is still logged every epoch)
     checkpoint=True,       # training: recompute the canonicalizers' and warps' activations in backward instead of
                            # storing them (same gradients; much less memory, a little more time)
 )
+
+
+class AnchorFit:
+    """Fit of the detector's anchors to the label sizes it trains on in the canonical frame (the warped labels, after
+    augmentation): autoanchor's metric (best possible recall, anchors per target) per epoch, and a re-fit (k-means +
+    evolution on these sizes) on request. Collects on the device, no host sync per step."""
+
+    def __init__(self, thr):
+        self.thr, self.wh = thr, []
+
+    def add(self, targets, h, w):
+        """Targets (n, 6) normalised xywh in the frame of the predictions, on an h x w batch."""
+        if len(targets):
+            self.wh.append(targets[:, 4:6].detach().float() * targets.new_tensor([w, h]).float())
+
+    def _metric(self, k, wh):
+        r = wh[:, None] / k[None]
+        x = torch.min(r, 1 / r).min(2)[0]
+        return (x.max(1)[0] > 1 / self.thr).float().mean().item(), (x > 1 / self.thr).float().sum(1).mean().item()
+
+    def epoch(self, detect):
+        """(best possible recall, anchors per target, canonical sizes (n, 2) on the CPU) for this epoch's labels with the
+        anchors of a Detect / IDetect layer; resets the collection. None without labels."""
+        if not self.wh:
+            return None
+        wh = torch.cat(self.wh).cpu()
+        self.wh = []
+        bpr, aat = self._metric(detect.anchor_grid.detach().cpu().view(-1, 2).float(), wh)
+        return bpr, aat, wh
+
+    def refit(self, detects, wh, img_size):
+        """Re-fit the anchors to canonical sizes wh and set them in each Detect / IDetect layer (the model and its EMA)
+        if the fit improves. Returns (old bpr, new bpr, anchors) or None if unchanged."""
+        from utils.autoanchor import check_anchor_order, kmean_anchors
+        m = detects[0]
+        old = self._metric(m.anchor_grid.detach().cpu().view(-1, 2).float(), wh)[0]
+        k = kmean_anchors(wh.numpy(), n=m.anchor_grid.numel() // 2, img_size=img_size, thr=self.thr, gen=1000,
+                          verbose=False)
+        new = self._metric(torch.tensor(k, dtype=torch.float32), wh)[0]
+        if new <= old:
+            return None
+        for d in detects:
+            a = torch.tensor(k, device=d.anchors.device).type_as(d.anchors)
+            d.anchor_grid[:] = a.clone().view_as(d.anchor_grid)
+            check_anchor_order(d)
+            d.anchors[:] = d.anchor_grid.view_as(d.anchors) / d.stride.to(d.anchors.device).view(-1, 1, 1)
+        return old, new, k
 
 
 def dec_name(d):
@@ -220,6 +270,38 @@ def inverse_points(G, k, x, y):
 # ----------------------------------------------------------------------------------------------------------------------
 # Regions: one warp per frame tile (or per image)
 # ----------------------------------------------------------------------------------------------------------------------
+_AA_SIGMAS = (0.0, 0.5 * math.sqrt(3), 0.5 * math.sqrt(15))  # prefilter for shrinking 1x, 2x, 4x: 0.5 sqrt(s^2 - 1)
+
+
+def _gaussian_blur(t, sigma):
+    """Separable Gaussian blur of t (n, c, H, W), reflect padding."""
+    r = max(int(math.ceil(3 * sigma)), 1)
+    x = torch.arange(-r, r + 1, device=t.device, dtype=t.dtype)
+    k = torch.exp(-x ** 2 / (2 * sigma ** 2))
+    k = k / k.sum()
+    c = t.shape[1]
+    t = F.conv2d(F.pad(t, (r, r, 0, 0), mode='reflect'), k.view(1, 1, 1, -1).repeat(c, 1, 1, 1), groups=c)
+    return F.conv2d(F.pad(t, (0, 0, r, r), mode='reflect'), k.view(1, 1, -1, 1).repeat(c, 1, 1, 1), groups=c)
+
+
+def antialiased_sample(t, grid, dead=1.05):
+    """grid_sample of t (n, c, H, W) at grid (n, h, w, 2; align_corners=False, border) that blurs before it shrinks:
+    where the map takes s > dead input pixels per output pixel (the larger axis), it samples copies of t prefiltered
+    for 2x and 4x shrinking and blends them by log2(s / dead) (mipmapping). Elsewhere, e.g. for the identity warp, the
+    result is exactly plain grid_sample."""
+    n, c, H, W = t.shape
+    px, py = (grid[..., 0] + 1) * (W / 2), (grid[..., 1] + 1) * (H / 2)  # input pixels
+    s = torch.maximum(torch.gradient(px, dim=2)[0].abs(), torch.gradient(py, dim=1)[0].abs())
+    lvl = torch.log2((s / dead).clamp_min(1)).clamp(max=len(_AA_SIGMAS) - 1)[:, None]  # (n, 1, h, w)
+    out = None
+    for i, sigma in enumerate(_AA_SIGMAS):
+        w = (1 - (lvl - i).abs()).clamp_min(0)  # linear between neighbouring levels; level 0 weight exactly 1 at lvl 0
+        src = t if sigma == 0 else _gaussian_blur(t, sigma)
+        v = F.grid_sample(src, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        out = v * w if out is None else out + v * w
+    return out
+
+
 class Regions:
     """Warps of regions: G (K, 2, R, R), image index b (K,), rectangle rect (K, 4) normalised xyxy of the image."""
 
@@ -317,16 +399,22 @@ class Regions:
             logm.permute(0, 2, 3, 1)[m] = lm
         return grid * 2 - 1, logm
 
-    def warp(self, x):
+    def warp(self, x, antialias=False):
+        """x warped into the canonical frame (antialias: blur before shrinking, for images)."""
         grid = self.sampling_grid(x.shape[0], *x.shape[-2:], x.dtype)
+        if antialias:
+            return antialiased_sample(x, grid)
         return F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
 
-    def warp_checkpointed(self, x, inverse=False):
-        """x warped into the canonical frame (inverse: back to the image), building the sampling grid inside a
-        checkpoint: backward recomputes it from the warp parameters instead of storing its per-pixel intermediates."""
+    def warp_checkpointed(self, x, inverse=False, antialias=False):
+        """x warped into the canonical frame (inverse: back to the image; antialias: blur before shrinking), building the
+        sampling grid inside a checkpoint: backward recomputes it from the warp parameters instead of storing its
+        per-pixel intermediates."""
         def f(t, G):
             r, (h, w) = Regions(self.b, self.rect, G), t.shape[-2:]
             grid = r.inverse_grid(t.shape[0], h, w)[0] if inverse else r.sampling_grid(t.shape[0], h, w, t.dtype)
+            if antialias:
+                return antialiased_sample(t, grid)
             return F.grid_sample(t, grid, mode='bilinear', padding_mode='border', align_corners=False)
         return _checkpoint(f, x, self.G, use_reentrant=False)
 
@@ -670,7 +758,7 @@ def plot_warps(model, imgs, tiles=None, lines=8):
                 continue
             reg, seen, lim = ctx.regs[m.i], ctx.seen[m.i], math.log(m.canon.max_zoom)
             G = reg.G
-            canon = reg.warp(seen)
+            canon = reg.warp(seen, antialias=ctx.cfg['antialias'])
             _, logm = reg.inverse_grid(n, max(H // 4, 1), max(W // 4, 1))
             zoom = logm.mean(1)  # log geometric magnification at each image location
             rows, first = [], None

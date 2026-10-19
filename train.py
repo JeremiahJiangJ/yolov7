@@ -30,7 +30,7 @@ from utils.autoanchor import check_anchors
 from utils.datasets import letterbox
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
-from utils.lse import plot_warps
+from utils.lse import AnchorFit, plot_warps
 from utils.lse_debug import LSEDebugger, debug_images
 from models.dec import DEC, ARCH_KEYS as DEC_ARCH_KEYS, dec_parameters, dec_yaml, map_plain_weights, \
     preview as dec_preview, write_yaml as write_dec_yaml
@@ -421,6 +421,8 @@ def train(hyp, opt, device, tb_writer=None):
             rects.append(torch.tensor([[dw / W, dh / H, 1 - dw / W, 1 - dh / H]]))
         if ims:
             lse_vis = torch.from_numpy(np.stack(ims).transpose(0, 3, 1, 2).copy()).float() / 255, rects
+    anchor_fit = AnchorFit(hyp['anchor_t']) if dec_ctx is not None and rank in [-1, 0] else None  # anchors vs the
+    # label sizes in the canonical frame (the detector trains on those, autoanchor saw the image frame's)
     lse_debug = None  # identity-basin checks every epoch, warp triplets every --lse-debug epochs (utils/lse_debug.py)
     if dec_ctx is not None and rank in [-1, 0] and getattr(opt, 'lse_debug', 0) > 0:
         lse_debug = LSEDebugger(save_dir, opt.lse_debug, debug_images(testloader.dataset, imgsz_test,
@@ -539,6 +541,8 @@ def train(hyp, opt, device, tb_writer=None):
                 if dec_ctx is not None:  # targets come back in the frame of the predictions (frame DECs)
                     tiles = list(extras) if all(torch.is_tensor(t) for t in extras) else None  # frame rectangles
                     pred, targets_l, loss_lse, lse_stats = model(imgs, lse_targets=targets.to(device), lse_tiles=tiles)
+                    if anchor_fit:
+                        anchor_fit.add(targets_l, *imgs.shape[-2:])
                 else:
                     pred, targets_l = model(imgs), targets.to(device)  # forward
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
@@ -611,6 +615,20 @@ def train(hyp, opt, device, tb_writer=None):
 
         if dec_ctx is not None and rank in [-1, 0] and mlse:  # not part of results.txt, see lse.txt and TensorBoard lse/*
             mlse = {k: float(v) for k, v in mlse.items()}
+            fit = anchor_fit.epoch((model.module if is_parallel(model) else model).model[-1]) if anchor_fit else None
+            if fit:  # anchors vs canonical label sizes; re-fit once at reanchor_epoch if they fit badly
+                mlse['anchor_bpr'], mlse['anchors_per_target'] = fit[0], fit[1]
+                if epoch == dec_ctx.cfg['reanchor_epoch']:
+                    if fit[0] < 0.98:
+                        r = anchor_fit.refit([(model.module if is_parallel(model) else model).model[-1],
+                                              ema.ema.model[-1]], fit[2], imgsz)
+                        logger.info(colorstr('dec: ') + (f'anchors re-fitted to the canonical label sizes: best possible '
+                                                         f'recall {r[0]:.4f} -> {r[1]:.4f}, anchors '
+                                                         f'{np.round(r[2]).astype(int).tolist()}' if r else
+                                                         'anchor re-fit did not improve the fit: anchors kept'))
+                    else:
+                        logger.info(colorstr('dec: ') + f'anchors fit the canonical label sizes (best possible recall '
+                                                        f'{fit[0]:.4f}): kept')
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
             logger.info(colorstr('dec: ') + f'{line} (obj_px median object size the detector sees; per '
                                              f'canonicalizer: eq consistency, size target, obj_px in its canonical '

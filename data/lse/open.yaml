@@ -26,6 +26,9 @@ channels: [16, 32, 64]
 iters: 4           # fixed-point iterations (phi <- phi + delta(canonical frame))
 grad_iters: 2      # last iterations backpropagated
 lr_scale: 10.0     # canonicalizer learning rate = lr0 x lr_scale
+antialias: true    # image warps blur before they shrink (no aliasing where the warp shrinks the image)
+reanchor_epoch: -1 # re-fit the anchors to the canonical label sizes at the end of this epoch if they fit badly
+                   #   (best possible recall < 0.98, see anchor_bpr in lse.txt); -1: never
 checkpoint: true   # training: recompute canonicalizer / warp activations in backward instead of storing them
                    #   (same gradients; the DEC's extra activation memory drops ~20x for ~5-20% more step time)
 

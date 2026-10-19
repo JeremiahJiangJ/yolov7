@@ -70,7 +70,7 @@ def dec_views(model, imgs, tiles=None):
             for m in model.model:
                 if isinstance(m, DEC):
                     reg, seen = ctx.regs[m.i], ctx.seen[m.i]
-                    out.append((m.name, m, reg, seen, reg.warp(seen)))
+                    out.append((m.name, m, reg, seen, reg.warp(seen, antialias=ctx.cfg['antialias'])))
             return out
     finally:
         ctx.keep = False
