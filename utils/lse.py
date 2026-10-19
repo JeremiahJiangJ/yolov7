@@ -45,6 +45,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 DEFAULTS = dict(
     decs=['input'],        # canonicalizers: input, P1..P6 (backbone stages) and / or [first, last] layer spans
@@ -66,6 +67,8 @@ DEFAULTS = dict(
     det_grad_epochs=0,     # first epochs in which the canonicalizers learn from their own losses only (not detection)
     lr_scale=1.0,          # canonicalizer learning rate = lr0 x lr_scale
     min_conf=1e-3,         # inference: only boxes with objectness above this are mapped back (test.py conf_thres)
+    checkpoint=True,       # training: recompute the canonicalizers' and warps' activations in backward instead of
+                           # storing them (same gradients; much less memory, a little more time)
 )
 
 
@@ -309,6 +312,15 @@ class Regions:
         grid = self.sampling_grid(x.shape[0], *x.shape[-2:], x.dtype)
         return F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
 
+    def warp_checkpointed(self, x, inverse=False):
+        """x warped into the canonical frame (inverse: back to the image), building the sampling grid inside a
+        checkpoint: backward recomputes it from the warp parameters instead of storing its per-pixel intermediates."""
+        def f(t, G):
+            r, (h, w) = Regions(self.b, self.rect, G), t.shape[-2:]
+            grid = r.inverse_grid(t.shape[0], h, w)[0] if inverse else r.sampling_grid(t.shape[0], h, w, t.dtype)
+            return F.grid_sample(t, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        return _checkpoint(f, x, self.G, use_reentrant=False)
+
     def assign(self, img, cx, cy):
         """Region of each point (image index img, normalised centre cx, cy): the region of that image containing it, else
         -1."""
@@ -466,6 +478,7 @@ class Canonicalizer(nn.Module):
         super().__init__()
         self.grid, self.max_zoom, self.canon_size = grid, max_zoom, canon_size
         self.iters, self.grad_iters = iters, grad_iters
+        self.checkpoint = False  # set per forward pass by the DEC layer (training with the checkpoint setting)
         layers, c_in = [], 3
         for c in channels:
             layers += [nn.Conv2d(c_in, c, 3, 2, 1), nn.GroupNorm(min(8, c), c), nn.SiLU()]
@@ -507,9 +520,16 @@ class Canonicalizer(nn.Module):
             if track and k == self.iters - self.grad_iters:
                 phi_x, phi_y = phi_x.detach(), phi_y.detach()
             with torch.set_grad_enabled(track):
-                dx, dy = self.delta(self.warp_crops(s, make_grid(phi_x, phi_y, self.max_zoom)))
-                phi_x, phi_y = phi_x + dx, phi_y + dy
+                if track and self.checkpoint:  # activations recomputed in backward, not stored
+                    phi_x, phi_y = _checkpoint(self._step, phi_x, phi_y, s, use_reentrant=False)
+                else:
+                    phi_x, phi_y = self._step(phi_x, phi_y, s)
         return make_grid(phi_x, phi_y, self.max_zoom), phi_x, phi_y
+
+    def _step(self, phi_x, phi_y, s):
+        """One fixed-point iteration."""
+        dx, dy = self.delta(self.warp_crops(s, make_grid(phi_x, phi_y, self.max_zoom)))
+        return phi_x + dx, phi_y + dy
 
 
 def stage_spans(model):

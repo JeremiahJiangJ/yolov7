@@ -869,7 +869,9 @@ at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-poin
 `lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`,
 `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`, `det_grad_epochs`, `min_conf` (predictions with a lower
 objectness are not mapped back when the model maps its own output, i.e. without `lse_defer_map`: 0.001 =
-test.py's default `--conf-thres`; NMS drops them).
+test.py's default `--conf-thres`; NMS drops them)), `checkpoint` (training: canonicalizer and warp activations recomputed in backward instead of
+stored; same gradients; default on: the DEC's extra activation memory falls from ~1 GiB to ~50 MiB for `input` at
+batch 8, 320, mosaic tiles, and from ~2.8 GiB to ~130 MiB for `P3-P5`, for ~5-20% more step time on CPU).
 
 **Implementation (`models/dec.py` layers and yaml generator, `utils/lse.py` geometry, canonicalizer and plots, tile
 tracking in `utils/datasets.py`).**

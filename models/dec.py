@@ -31,6 +31,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from utils.lse import (DEFAULTS, Canonicalizer, Regions, dec_name, load_lse_cfg, make_grid, random_phi, stage_spans,
                        unwarp_predictions, validate_spans, warp_stats, warp_targets)
@@ -123,6 +124,7 @@ class DEC(_DECLayer):
             xf = x.float()
             h, w = xf.shape[-2:]
             s = ctx.base.crops(xf, c.canon_size)
+            c.checkpoint = ctx.training and ctx.cfg['checkpoint'] and torch.is_grad_enabled()
             G, phi_x, phi_y = c.solve(s)
             reg = ctx.base.with_grid(G)
             if ctx.training:
@@ -138,6 +140,10 @@ class DEC(_DECLayer):
                 ctx.targets = warp_targets(ctx.targets, reg, h, w)
         return reg.G
 
+    def _eq(self, s_t, G_t, s_eq, G_eq):
+        """Consistency: the canonical frames of the rescaled crops and of the crops, compared."""
+        return F.mse_loss(self.canon.warp_crops(s_t, G_t), self.canon.warp_crops(s_eq, G_eq))
+
     def _aux(self, s, G, phi_x, phi_y, reg, targets, h, w):
         """Consistency (skipped, with its second solve, when eq_weight is 0), prior and size losses, and statistics
         (0-dim tensors: no host sync per step)."""
@@ -152,7 +158,8 @@ class DEC(_DECLayer):
             tx, ty = random_phi(s_eq.shape[0], c.grid, cfg['eq_strength'], s.device)
             s_t = c.warp_crops(s_eq, make_grid(tx, ty, c.max_zoom))
             G_t, _, _ = c.solve(s_t)
-            eq = F.mse_loss(c.warp_crops(s_t, G_t), c.warp_crops(s_eq, G_eq))
+            eq = (_checkpoint(self._eq, s_t, G_t, s_eq, G_eq, use_reentrant=False) if c.checkpoint
+                  else self._eq(s_t, G_t, s_eq, G_eq))
             loss, stats['eq'] = cfg['eq_weight'] * eq, eq.detach()
         prior = (torch.tanh(phi_x) ** 2).mean() + (torch.tanh(phi_y) ** 2).mean()
         loss = loss + cfg['prior_weight'] * prior
@@ -172,12 +179,20 @@ class DEC(_DECLayer):
         return loss, stats
 
 
+def _checkpointing(ctx, dec):
+    """Whether a warp by DEC layer dec builds its grid inside a checkpoint (training, checkpoint setting, and
+    gradients to the warp)."""
+    return ctx.training and ctx.cfg['checkpoint'] and torch.is_grad_enabled() and ctx.regs[dec].G.requires_grad
+
+
 class DECWarp(_DECLayer):
     """[x, dec]: x warped into the canonical frame of DEC layer dec."""
 
     def forward(self, x):
         t = x[0]
         with torch.autocast(device_type=t.device.type, enabled=False):
+            if _checkpointing(self.ctx, self.srcs[0]):  # grid recomputed in backward, not stored
+                return self.ctx.regs[self.srcs[0]].warp_checkpointed(t.float()).to(t.dtype)
             grid = self.ctx.grid(self.srcs[0], *t.shape[-2:], inverse=False)
             return F.grid_sample(t.float(), grid, mode='bilinear', padding_mode='border',
                                  align_corners=False).to(t.dtype)
@@ -189,6 +204,8 @@ class DECUnwarp(_DECLayer):
     def forward(self, x):
         t = x[0]
         with torch.autocast(device_type=t.device.type, enabled=False):
+            if _checkpointing(self.ctx, self.srcs[0]):
+                return self.ctx.regs[self.srcs[0]].warp_checkpointed(t.float(), inverse=True).to(t.dtype)
             grid, _ = self.ctx.grid(self.srcs[0], *t.shape[-2:], inverse=True)
             return F.grid_sample(t.float(), grid, mode='bilinear', padding_mode='border',
                                  align_corners=False).to(t.dtype)
