@@ -9,6 +9,7 @@
 #   - verdict ok, zoom_in / zoom_out above 1, disp above 0: the warps left the identity (else: identity basin, below)
 #   - step small: the fixed-point solve converges in `iters` iterations
 #   - <dec>/obj_px moving towards target_size: the size target works
+#   - <dec>/scale_r rising towards 1: the warp magnifies small objects and shrinks large ones (0: it ignores scale)
 #   - anchor_bpr near 1: the anchors fit the object sizes the detector now sees (else reanchor_epoch)
 
 # --- Where ------------------------------------------------------------------------------------------------------------

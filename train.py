@@ -632,7 +632,8 @@ def train(hyp, opt, device, tb_writer=None):
             line = ', '.join(f'{k} {v:.4g}' for k, v in mlse.items())
             logger.info(colorstr('dec: ') + f'{line} (obj_px median object size the detector sees; per '
                                              f'canonicalizer: eq consistency, size target, obj_px in its canonical '
-                                             f'frame, disp mean warp displacement, zoom_in / zoom_out strongest local '
+                                             f'frame, scale_r corr(log zoom, -log object size): 1 the warp tracks object scale, 0 it does not, '
+                                             f'disp mean warp displacement, zoom_in / zoom_out strongest local '
                                              f'magnification / shrinking)')
             with open(save_dir / 'lse.txt', 'a') as f:
                 f.write(f'epoch {epoch}: {line}\n')

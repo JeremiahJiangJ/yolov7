@@ -920,7 +920,7 @@ smooth, and stays consistent across epochs; a field that is uniformly neutral af
 **Monitoring.** Per epoch (`lse.txt`, TensorBoard `lse/*`): `anchor_bpr` / `anchors_per_target`, the anchors' fit
 to the label sizes in the canonical frame (the sizes the detector trains on; autoanchor at the start saw the image
 frame's), `obj_px`, the median object size the detector sees, and
-per DEC: consistency (not with `eq_weight: 0`, which also skips its second solve), size and prior losses, `obj_px` in its canonical frame, mean warp displacement and the strongest
+per DEC: consistency (not with `eq_weight: 0`, which also skips its second solve), size and prior losses, `obj_px` in its canonical frame, `scale_r` (correlation of the log local zoom at each object with minus its log size: near 1 the warp magnifies small objects and shrinks large ones, near 0 it ignores their scale, as equivdet's learned warps did), mean warp displacement and the strongest
 local zoom in / out. Warp plots on 4 fixed validation images, `lse/<dec>/epoch_*.jpg` (the image with the canonical
 grid drawn on it, the local zoom (red magnified, blue shrunk) and the canonical image; also in TensorBoard), and
 `lse/<dec>_progress.jpg`, the first image's warp grid over the epochs. `train_batch*_lse.jpg`: what the detector sees

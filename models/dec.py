@@ -181,6 +181,11 @@ class DEC(_DECLayer):
             if m.any():
                 size = torch.sqrt(t[m, 4] * w * t[m, 5] * h).clamp_min(1)
                 stats['obj_px'] = (size * z.detach()).median()  # median object size in the canonical frame
+                if len(size) >= 3:  # does the warp track object scale: corr(log zoom, -log size), 1 ideal, 0 identity
+                    a, b = torch.log(z.detach()), -torch.log(size)
+                    a, b = a - a.mean(), b - b.mean()
+                    sd_a = a.square().mean().sqrt().clamp_min(1e-3)  # zoom spread below 0.1%: identity, reads ~0
+                    stats['scale_r'] = (a * b).mean() / (sd_a * b.square().mean().sqrt() + 1e-12)
                 if cfg['size_weight'] > 0:
                     want = torch.log(cfg['target_size'] / size).clamp(-math.log(c.max_zoom), math.log(c.max_zoom))
                     size_loss = ((torch.log(z) - want) ** 2).mean()
