@@ -31,6 +31,7 @@ from utils.datasets import letterbox
 from utils.datasets import create_dataloader, rebuild_loader, parse_resize, delete_label_caches_at_exit, \
     DEFAULT_LABEL_FOLDER
 from utils.lse import plot_warps
+from utils.lse_debug import LSEDebugger, debug_images
 from models.dec import DEC, ARCH_KEYS as DEC_ARCH_KEYS, dec_parameters, dec_yaml, map_plain_weights, \
     preview as dec_preview, write_yaml as write_dec_yaml
 from utils.mixed_data import MixedConfig, is_mixed, create_mixed_dataloader, create_val_dataloader, usage_totals, \
@@ -420,6 +421,10 @@ def train(hyp, opt, device, tb_writer=None):
             rects.append(torch.tensor([[dw / W, dh / H, 1 - dw / W, 1 - dh / H]]))
         if ims:
             lse_vis = torch.from_numpy(np.stack(ims).transpose(0, 3, 1, 2).copy()).float() / 255, rects
+    lse_debug = None  # identity-basin checks every epoch, warp triplets every --lse-debug epochs (utils/lse_debug.py)
+    if dec_ctx is not None and rank in [-1, 0] and getattr(opt, 'lse_debug', 0) > 0:
+        lse_debug = LSEDebugger(save_dir, opt.lse_debug, debug_images(testloader.dataset, imgsz_test,
+                                                                      opt.lse_debug_images), dec_ctx.cfg, logger, epochs)
 
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
@@ -453,6 +458,8 @@ def train(hyp, opt, device, tb_writer=None):
             source_of.setdefault(f, k)
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if lse_debug:
+            lse_debug.epoch_start(model.module if is_parallel(model) else model)
 
         # Unfreeze frozen layers (optional)
         if frozen and opt.unfreeze_epoch and epoch >= opt.unfreeze_epoch:
@@ -611,6 +618,8 @@ def train(hyp, opt, device, tb_writer=None):
                                              f'magnification / shrinking)')
             with open(save_dir / 'lse.txt', 'a') as f:
                 f.write(f'epoch {epoch}: {line}\n')
+            if lse_debug:  # identity basin? warp triplets every --lse-debug epochs: lse_debug/
+                lse_debug.epoch_end(epoch, model.module if is_parallel(model) else model, ema.ema, mlse)
             for k, v in mlse.items():
                 if tb_writer:
                     tb_writer.add_scalar(f'lse/{k}', v, epoch)
@@ -857,6 +866,11 @@ if __name__ == '__main__':
     parser.add_argument('--deterministic-algorithms', nargs='?', const='warn', default=None, choices=['warn', 'strict'],
                         help='also torch.use_deterministic_algorithms (slower; implies --deterministic): ops without a '
                              'deterministic version warn (default) or raise (strict)')
+    parser.add_argument('--lse-debug', type=int, default=0,
+                        help='DEC models: check every epoch whether the warps are stuck at the identity, and save warp '
+                             'triplets (input, warp field, warped input) of fixed validation images every N epochs, in '
+                             '<run>/lse_debug (utils/lse_debug.py); 0: off')
+    parser.add_argument('--lse-debug-images', type=int, default=4, help='validation images in the --lse-debug triplets')
     parser.add_argument('--lse', type=str, default='',
                         help='local scale equivariance config yaml (data/lse/*.yaml, README.md section 14): adds deep '
                              'equilibrium canonicalizer layers to the --cfg (or checkpoint) architecture. A DEC model '

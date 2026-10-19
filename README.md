@@ -890,6 +890,24 @@ it, seeded so every model sees the same warps: a direct test of robustness to lo
 Judge by the mean over seeds and its spread (section 6), per size, clean and warped; check `lse.txt` and the warp plots
 that the warps actually left the identity.
 
+**Debugging (`train.py --lse-debug N`, `utils/lse_debug.py`).** Writes `<run>/lse_debug/`:
+- `status.txt` / `status.csv`, every epoch and per canonicalizer: warp strength (training statistics, and on fixed
+  validation images from the EMA model), the solver's last update, how much its parameters moved, its output layer's
+  norm (it starts at 0), and a verdict: `ok` (the warps left the identity), `identity` (still ~identity: expected early
+  and during `det_grad_epochs`), `STUCK` (identity for 3 epochs after the warm-up: the identity basin), `frozen`
+  (parameters unchanged in the epoch; expected with `lr_scale: 0`), flags `saturated` (warps at the `max_zoom` bound)
+  and `not converged` (large last update). STUCK / frozen / saturated / not converged also go to the training log
+  with what to try. Thresholds: constants at the top of `utils/lse_debug.py`.
+- `epoch_XXX/<dec>/`, every N epochs and the last: per validation image (`--lse-debug-images`, 4) the triplet
+  `img<k>_1_input.jpg` (what the canonicalizer sees), `img<k>_2_field.jpg` (the predicted warp field: local zoom, red
+  magnified / blue shrunk, full colour at `max_zoom`; the canonical grid drawn where it samples; arrows from each
+  canonical point to the input point it samples), `img<k>_3_warped.jpg` (the input warped by the field: what the
+  detector sees), `img<k>_triplet.jpg` (side by side) and `img<k>_field.npz` (warp knots `G`, region rectangles, the
+  dense sampling map `sample_px` canonical pixel -> input pixel, `log_zoom`).
+
+A sound warp magnifies (red) where objects are small or far, shrinks (blue) empty or near areas, keeps the grid
+smooth, and stays consistent across epochs; a field that is uniformly neutral after the warm-up is the identity basin.
+
 **Monitoring.** Per epoch (`lse.txt`, TensorBoard `lse/*`): `obj_px`, the median object size the detector sees, and
 per DEC: consistency (not with `eq_weight: 0`, which also skips its second solve), size and prior losses, `obj_px` in its canonical frame, mean warp displacement and the strongest
 local zoom in / out. Warp plots on 4 fixed validation images, `lse/<dec>/epoch_*.jpg` (the image with the canonical
