@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
+from models.common import ImplicitA, ImplicitM
 from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import letterbox
@@ -111,11 +112,21 @@ def train(hyp, opt, device, tb_writer=None):
         if opt.lse:  # the architecture with deep equilibrium canonicalizer layers (models/dec.py)
             cfg = dec_yaml(cfg, opt.lse, dec_notes)
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
+        # keep the checkpoint's anchors (the ones its head was trained with, possibly autoanchor's) unless the cfg or
+        # hyp asks for other anchors than the checkpoint's yaml; autoanchor still checks them against the data
+        same_anchors = not hyp.get('anchors') and model.yaml.get('anchors') == (getattr(ckpt['model'], 'yaml', None)
+                                                                                or {}).get('anchors')
+        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume and not same_anchors else []
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = map_plain_weights(state_dict, ckpt['model'], model)  # plain checkpoint -> DEC model layers
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
+        implicit = [m for k, m in model.named_modules() if isinstance(m, (ImplicitA, ImplicitM))
+                    and f'{k}.implicit' not in state_dict]
+        for m in implicit:  # a checkpoint without them (e.g. a Detect head, as yolov7-tiny.pt): identity, not random
+            nn.init.constant_(m.implicit, 0. if isinstance(m, ImplicitA) else 1.)
+        if implicit:
+            logger.info(f'{len(implicit)} implicit layers not in {weights}: set to the identity')
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(dec_yaml(opt.cfg, opt.lse, dec_notes) if opt.lse else opt.cfg, ch=3, nc=nc,

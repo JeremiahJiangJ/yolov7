@@ -7,6 +7,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
 
+from models.dec import map_detections
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
@@ -39,6 +40,10 @@ def detect(save_img=False):
         print('DEC model: not traced (the canonicalizers are data dependent)')
     elif trace:
         model = TracedModel(model, device, opt.img_size)
+
+    # DEC model with a frame DEC: NMS in the canonical frame, then the kept boxes are mapped back (map_detections)
+    defer = {'lse_defer_map': True} if not opt.augment and getattr(model, 'dec_ctx', None) is not None and any(
+        getattr(m, 'frame', False) for m in model.model) else {}
 
     if half:
         model.half()  # to FP16
@@ -87,11 +92,12 @@ def detect(save_img=False):
         # Inference
         t1 = time_synchronized()
         with torch.no_grad():   # Calculating gradients would cause a GPU memory leak
-            pred = model(img, augment=opt.augment)[0]
+            pred = model(img, augment=opt.augment, **defer)[0]
         t2 = time_synchronized()
 
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        pred = map_detections(model, pred)  # DEC models: canonical frame -> image pixels
         t3 = time_synchronized()
 
         # Apply Classifier

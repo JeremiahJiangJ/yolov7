@@ -92,6 +92,7 @@ stock data yaml), not 4's automatic cache deletion, 7, 8, 9, 10 or 14.
 | `--adam` | Adam | AdamW | decoupled weight decay |
 | `test.test()` | returns 3 values | returns 4: `(results, maps, times, area_results)` | per-area metrics; update scripts that unpack it |
 | `attempt_load` | failed on checkpoints whose weights require grad (`epoch_*.pt`) | works | fusion now runs under `torch.no_grad()` |
+| Fine-tuning from a checkpoint with `--cfg` | the checkpoint's anchors dropped for the cfg's; implicit layers missing from the checkpoint (e.g. `yolov7-tiny.pt`, a `Detect` head) left random | the checkpoint's anchors kept when the cfg's anchors are those of the checkpoint's yaml (and no hyp `anchors`); missing implicit layers set to the identity | the run starts from exactly the checkpoint's detector (`yolov7-tiny.pt` into `cfg/training/yolov7-tiny.yaml`: boxes were up to ~120 px off at step 0); autoanchor still checks the anchors |
 | `--multi-scale` | crashed on Python >= 3.12 | works | `random.randrange` needs ints |
 
 ---
@@ -743,7 +744,8 @@ always reported in image pixels.
 
 The checkpoint is a DEC model: `test.py`, `detect.py` and fine-tuning from it need no flag. A plain checkpoint
 (`--weights yolov7-tiny.pt`) loads into the plain layers (matched in order), and every DEC starts as the identity
-(its output layer is zero), so training starts from exactly the pretrained detector. Experiments:
+(its output layer is zero), so training starts from exactly the pretrained detector (with the checkpoint's anchors
+and implicit layers, see *Behaviour changes*). Experiments:
 `scripts/train_lse_experiments.sh` and `scripts/test_lse_experiments.sh` (below).
 
 **Architecture (yolov7-DEC).** Five layer types, used in the model yaml like any other layer:
@@ -812,7 +814,10 @@ penalised by warps; try 0.5), `det_grad_epochs` (first epochs: canonicalizers le
 warped object (median 0.6-1 px from the warped object's pixels in tests, up to ~3x local zoom). Predictions are mapped
 back by solving for the image box whose warped outline is the predicted box (Newton's method from two starting
 points). The warps are sheared (each row and column rescaled on its own), so under strong warps several image boxes
-can share one outline bounding box and the solution is not always the original box. Measured on random warps,
+can share one outline bounding box and the solution is not always the original box. `test.py` and `detect.py` run NMS
+in the canonical frame and map only the kept boxes (`lse_defer_map`, `models/dec.py: map_detections`): a
+non-uniform warp changes IoUs, so NMS there decides the same for a frame and its rescaled copy, and only a few
+boxes are mapped. Measured on random warps,
 boxes 20-100 x 15-70 px in a 240 x 160 region (`zoom_in` = strongest local magnification of the warps):
 
 | `zoom_in` | 1.5x | 2.1x | 2.7x | 2.9x |
@@ -863,7 +868,8 @@ Config keys (`data/lse/*.yaml`, commented): `decs`, `per_tile`, `grid` (knots pe
 at canon_size x canon_size, 224), `channels`, `iters` / `grad_iters` (fixed-point iterations, the last backpropagated),
 `lr_scale`, `eq_weight`, `eq_strength`, `eq_regions` (frames per batch in the consistency loss, 32), `size_weight`,
 `target_size`, `prior_weight`, `warp_aug`, `warp_aug_strength`, `det_grad_epochs`, `min_conf` (predictions with a lower
-objectness are not mapped back, 0.001 = test.py's default `--conf-thres`; NMS drops them).
+objectness are not mapped back when the model maps its own output, i.e. without `lse_defer_map`: 0.001 =
+test.py's default `--conf-thres`; NMS drops them).
 
 **Implementation (`models/dec.py` layers and yaml generator, `utils/lse.py` geometry, canonicalizer and plots, tile
 tracking in `utils/datasets.py`).**
@@ -922,7 +928,8 @@ tracking in `utils/datasets.py`).**
 the canonical frame; closed stage DECs work), `--quad`, test-time augmentation with the validation loss, `export.py`.
 Closed stage DECs need a `Detect` / `IDetect` head. `--freeze` counts the DEC layers too (the plain layers' indices
 shift). Checkpoints of the earlier run-time version of this branch (`model.lse`) do not load. Mapping predictions back costs ~1 ms per box on CPU (batched on
-GPU), for the boxes above `min_conf`. Not yet tested on GPU or real data: whether and how much it helps is an
+GPU): `test.py` / `detect.py` map only the boxes NMS keeps; called directly, the model maps every box above
+`min_conf` before NMS (hundreds per image). Not yet tested on GPU or real data: whether and how much it helps is an
 experiment.
 
 ---

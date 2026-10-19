@@ -581,13 +581,15 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False, lse_targets=None, lse_tiles=None):
+    def forward(self, x, augment=False, profile=False, lse_targets=None, lse_tiles=None, lse_defer_map=False):
         # DEC models (models/dec.py, README.md section 14). lse_targets: also return the targets in the frame of the
         # predictions and the DEC auxiliary loss and statistics (training): (out, targets, dec_loss, dec_stats).
-        # lse_tiles: per image, the frame rectangles of a mosaic sample (training batches), canonicalized one by one
+        # lse_tiles: per image, the frame rectangles of a mosaic sample (training batches), canonicalized one by one.
+        # lse_defer_map (inference): boxes stay in the canonical frame for NMS; then models/dec.py map_detections()
         if lse_targets is not None or lse_tiles is not None:
             assert not augment, 'lse_targets / lse_tiles are not supported with test-time augmentation'
-            return self.forward_once(x, profile, lse_targets=lse_targets, lse_tiles=lse_tiles)
+            return self.forward_once(x, profile, lse_targets=lse_targets, lse_tiles=lse_tiles,
+                                     lse_defer_map=lse_defer_map)
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -605,9 +607,9 @@ class Model(nn.Module):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+            return self.forward_once(x, profile, lse_defer_map=lse_defer_map)  # single-scale inference, train
 
-    def forward_once(self, x, profile=False, lse_targets=None, lse_tiles=None):
+    def forward_once(self, x, profile=False, lse_targets=None, lse_tiles=None, lse_defer_map=False):
         y, dt = [], []  # outputs
         ctx = getattr(self, 'dec_ctx', None)
         if ctx is not None:  # DEC layers: regions, warp augmentation and labels for this pass
@@ -642,7 +644,8 @@ class Model(nn.Module):
         if profile:
             print('%.1fms total' % sum(dt))
         if ctx is not None:  # boxes back to image pixels; extras
-            return dec_layers.finish(self, ctx, x, img_hw, lse_targets is not None or lse_tiles is not None)
+            return dec_layers.finish(self, ctx, x, img_hw, lse_targets is not None or lse_tiles is not None,
+                                     lse_defer_map)
         if lse_targets is not None or lse_tiles is not None:
             return x, lse_targets, None, None
         return x

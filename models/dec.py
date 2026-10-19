@@ -56,6 +56,7 @@ class DECContext:
     def clear(self):
         self.base, self.regs, self.cache, self.seen, self.n = None, {}, {}, {}, 0
         self.targets, self.loss, self.stats, self.training = None, None, None, False
+        self.deferred = None  # (frame DECs' regions, last warp first; image size) for map_detections()
 
     def __getstate__(self):  # pickling / deepcopy: settings only
         return {'cfg': self.cfg, 'epoch': self.epoch}
@@ -240,19 +241,48 @@ def setup(model):
     return ctx
 
 
-def finish(model, ctx, x, img_hw, return_extras):
+def finish(model, ctx, x, img_hw, return_extras, defer_map=False):
     """End a DEC model's forward pass: map decoded boxes back from the frame DECs' canonical frames (inference) and
-    return the extras (targets in the frame of the predictions, auxiliary loss, statistics) if asked."""
+    return the extras (targets in the frame of the predictions, auxiliary loss, statistics) if asked. defer_map: leave
+    the decoded boxes in the canonical frame; NMS runs there and map_detections() maps the kept boxes afterwards."""
     frame = [m for m in model.model if isinstance(m, DEC) and m.frame]
+    deferred = None
     if frame and not model.training and isinstance(x, tuple) and torch.is_tensor(x[0]) and x[0].dim() == 3:
-        z = x[0]
-        for m in reversed(frame):  # canonical -> image pixels, the last warp first
-            z = unwarp_predictions(z, ctx.regs[m.i], *img_hw, ctx.cfg['min_conf'])
-        x = (z,) + tuple(x[1:])
+        if defer_map:
+            deferred = ([ctx.regs[m.i] for m in reversed(frame)], tuple(img_hw))
+        else:
+            z = x[0]
+            for m in reversed(frame):  # canonical -> image pixels, the last warp first
+                z = unwarp_predictions(z, ctx.regs[m.i], *img_hw, ctx.cfg['min_conf'])
+            x = (z,) + tuple(x[1:])
     out = (x, ctx.targets, ctx.loss, ctx.stats) if return_extras else x
     if not ctx.keep:
         ctx.clear()
+    ctx.deferred = deferred
     return out
+
+
+def map_detections(model, dets):
+    """Detections of a forward pass with lse_defer_map=True, after NMS (non_max_suppression's list of (n, 6) [xyxy, conf,
+    cls] per image, canonical-frame pixels) -> image pixels. NMS in the canonical frame keeps its decisions independent
+    of the warp (a non-uniform warp changes IoUs), and only the kept boxes are mapped. A no-op for other models / passes.
+    """
+    ctx = getattr(model, 'dec_ctx', None)
+    if ctx is None or ctx.deferred is None:
+        return dets
+    regs, (h, w) = ctx.deferred
+    ctx.deferred = None
+    n = [len(d) for d in dets]
+    if not sum(n):
+        return dets
+    d = torch.cat(dets)
+    img = torch.cat([torch.full((k,), i, device=d.device, dtype=torch.long) for i, k in enumerate(n)])
+    scale = torch.tensor([w, h, w, h], device=d.device, dtype=torch.float32)
+    b = d[:, :4].float() / scale
+    for reg in regs:  # canonical -> image pixels, the last warp first
+        b = reg.map_boxes(img, b, to_canonical=False)
+    d = torch.cat([(b * scale).to(d.dtype), d[:, 4:]], 1)
+    return list(d.split(n))
 
 
 def input_dec(model):
