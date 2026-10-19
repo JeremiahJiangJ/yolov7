@@ -40,9 +40,9 @@ CFG=${CFG:-cfg/training/yolov7-tiny.yaml}
 LSE=${LSE:-data/lse/example.yaml}       # ★ every LSE setting (★-marked inside)
 LSE_DEBUG=${LSE_DEBUG:-1}               # ★ identity-basin verdicts every epoch, warp triplets every N epochs (0: off)
 LSE_DEBUG_IMAGES=${LSE_DEBUG_IMAGES:-4} # validation images in the triplets
-FREEZE_WARMUP=${FREEZE_WARMUP:-0}       # stage 2: first N epochs train the canonicalizer only (detector frozen), then
-                                        #   everything. 0: off. Layer indices below assume decs: [input] on yolov7-tiny
-                                        #   (DEC layers 0-2, detector 3-80)
+FREEZE_WARMUP=${FREEZE_WARMUP:-0}       # stage 2: first N epochs train the canonicalizer(s) only (detector frozen),
+                                        #   then everything. 0: off. Works for any decs (detector layers found from
+                                        #   the DEC model built from CFG + LSE)
 
 # --- Training ---------------------------------------------------------------------------------------------------------
 DEVICE=${DEVICE:-0}                     # GPU id (or cpu)
@@ -69,6 +69,17 @@ S1=$PROJECT/stage1/weights/best.pt
 STAGES=${*:-all}
 [[ " $STAGES " == *" all "* ]] && STAGES="stage1 base2 stage2 control test"
 
+plain_layers() {  # the detector's layer indices in the DEC model built from CFG + LSE (DEC layers excluded): --freeze
+  python - "$CFG" "$LSE" <<'EOF' 2>/dev/null | tail -1
+import sys
+sys.path.insert(0, '.')
+from models.dec import DEC_LAYERS, dec_yaml
+y = dec_yaml(sys.argv[1], sys.argv[2])
+names = {c.__name__ for c in DEC_LAYERS}
+print(' '.join(str(i) for i, layer in enumerate(y['backbone'] + y['head']) if layer[2] not in names))
+EOF
+}
+
 control_cfg() {  # the LSE config with the canonicalizer frozen at the identity: random warps (warp_aug) only
   mkdir -p "$PROJECT"
   { cat "$LSE"; printf 'lr_scale: 0.0\neq_weight: 0.0\nsize_weight: 0.0\ndet_grad_epochs: 0\n'; } > "$PROJECT/lse_control.yaml"
@@ -84,7 +95,7 @@ for STAGE in $STAGES; do
     echo "obj_px (set target_size to about this):"; grep -o 'obj_px [0-9.]*' $PROJECT/probe/lse.txt | head -1 ;;
   stage2)
     FREEZE=""
-    if [ "$FREEZE_WARMUP" -gt 0 ]; then FREEZE="--freeze $(seq -s ' ' 3 80) --unfreeze-epoch $FREEZE_WARMUP"; fi
+    if [ "$FREEZE_WARMUP" -gt 0 ]; then FREEZE="--freeze $(plain_layers) --unfreeze-epoch $FREEZE_WARMUP"; fi
     python train.py $COMMON --weights $S1 --hyp $HYP2 --epochs $EPOCHS2 --name stage2 --lse $LSE \
       --lse-debug $LSE_DEBUG --lse-debug-images $LSE_DEBUG_IMAGES $FREEZE ;;
   base2)
