@@ -597,6 +597,44 @@ def measure_sources(datasets, n=64, seed=0):
     return out
 
 
+def header_frames_per_sample(cfg, files, hyp, img_size):
+    """Expected frames loaded per training sample of each source (utils.datasets.expected_images_per_sample()), with
+    the frame size estimated from up to 20 image headers per source (no labels read). files: per source, its images."""
+    from PIL import Image
+    from utils.datasets import expected_images_per_sample
+    ips = []
+    for src, f in zip(cfg.sources, files):
+        wh = []
+        for x in f[:20]:
+            try:
+                with Image.open(x) as im:
+                    wh.append(im.size)
+            except OSError:
+                pass
+        if not wh and src.resize != 'fit':
+            print(f'WARNING: could not read images of {src.name} to get its frame size, assuming img_size frames')
+        wh = np.median(wh, 0) if wh else np.array([img_size, img_size])
+        scale = 1.0 if src.resize in ('fit', 'native') else src.resize
+        ips.append(expected_images_per_sample(hyp, src.resize, img_size, wh * scale, src.mosaic_max_cells))
+    return ips
+
+
+def measure_datasets(cfg, hyp, img_size):
+    """The sources' training datasets as training builds them, for measure_sources() (scans labels; label caches are
+    deleted on exit)."""
+    from utils.datasets import LoadImagesAndLabels, delete_label_caches_at_exit
+    delete_label_caches_at_exit()
+    datasets = [LoadImagesAndLabels(src.path, img_size, 16, augment=True, hyp=hyp, prefix=f'[{src.name}] ',
+                                    label_folder_name=src.label_folder, resize=src.resize,
+                                    fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells)
+                for src in cfg.sources]
+    for d, src in zip(datasets, cfg.sources):  # partners by repeat factor, as in training
+        if src.repeat_factor_threshold > 0:
+            d.partner_cum_weights = np.cumsum(repeat_factors([l[:, 0] for l in d.labels],
+                                                             src.repeat_factor_threshold)).tolist()
+    return datasets
+
+
 def train_class_frames(data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
     """Training frames containing each class, read from the label files of a data yaml dict's training data
     (train: or train_sources:; each source's label folder)."""
@@ -666,24 +704,9 @@ if __name__ == '__main__':
         cfg = MixedConfig(yaml.safe_load(f))
     with open(opt.hyp) as f:
         hyp = yaml.safe_load(f)
-    from PIL import Image
-    from utils.datasets import expected_images_per_sample
     files = [list_images(src.path) for src in cfg.sources]
     sizes = [len(f) for f in files]
-    ips = []
-    for src, f in zip(cfg.sources, files):  # frame size from up to 20 images (headers only)
-        wh = []
-        for x in f[:20]:
-            try:
-                with Image.open(x) as im:
-                    wh.append(im.size)
-            except OSError:
-                pass
-        if not wh and src.resize != 'fit':
-            print(f'WARNING: could not read images of {src.name} to get its frame size, assuming img_size frames')
-        wh = np.median(wh, 0) if wh else np.array([opt.img_size, opt.img_size])
-        scale = 1.0 if src.resize in ('fit', 'native') else src.resize
-        ips.append(expected_images_per_sample(hyp, src.resize, opt.img_size, wh * scale, src.mosaic_max_cells))
+    ips = header_frames_per_sample(cfg, files, hyp, opt.img_size)
     repeat = []  # repeat factors from the label files
     for src, f in zip(cfg.sources, files):
         if src.repeat_factor_threshold <= 0:
@@ -709,16 +732,7 @@ if __name__ == '__main__':
             f'epoch {e}: ' + ', '.join(f'{n} {x:.0%}' for n, x in zip(cfg.names, w)) for e, w in schedule.points))
     objects = None
     if opt.measure:  # build the datasets (scans labels; caches are deleted on exit) and measure objects per sample
-        from utils.datasets import LoadImagesAndLabels, delete_label_caches_at_exit
-        delete_label_caches_at_exit()
-        datasets = [LoadImagesAndLabels(src.path, opt.img_size, 16, augment=True, hyp=hyp, prefix=f'[{src.name}] ',
-                                        label_folder_name=src.label_folder, resize=src.resize,
-                                        fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells)
-                    for src in cfg.sources]
-        for d, src in zip(datasets, cfg.sources):  # partners by repeat factor, as in training
-            if src.repeat_factor_threshold > 0:
-                d.partner_cum_weights = np.cumsum(repeat_factors([l[:, 0] for l in d.labels],
-                                                                 src.repeat_factor_threshold)).tolist()
+        datasets = measure_datasets(cfg, hyp, opt.img_size)
         objects = measure_sources(datasets, opt.measure)
     print(sampler.plan(opt.epochs, ips, opt.close_mosaic, objects))
     if not opt.measure:
