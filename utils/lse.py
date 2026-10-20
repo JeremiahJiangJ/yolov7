@@ -182,13 +182,22 @@ def random_phi(n, grid, strength, device):
 
 
 _BASE_GRIDS = {}  # (H, W, R, device, dtype) -> warp_crops' base sampling points (built once, not per call)
+_CONSTS = {}  # shape-only constants (knot positions, pixel centres, blur kernels): built once per key, not per call
+
+
+def _const(key, make):
+    """_CONSTS[key], built by make() on first use (outside inference mode, so training can reuse it)."""
+    if key not in _CONSTS:
+        with torch.inference_mode(False):
+            _CONSTS[key] = make()
+    return _CONSTS[key]
 
 
 def _dense_base(us, vs, R):
     """grid_sample points of dense_local for region grids us x vs: (u, v) points and (u, row knot) points. us (w,) and
     vs (h,) are shared by every region (shapes (1, h, w, 2), (1, R, w, 2)); us (K, w) and vs (K, h) are per region."""
     gu, gv = us * 2 - 1, vs * 2 - 1
-    kv = torch.linspace(-1, 1, R, device=us.device, dtype=us.dtype)
+    kv = _const(('kv', R, str(us.device), us.dtype), lambda: torch.linspace(-1, 1, R, device=us.device, dtype=us.dtype))
     if us.dim() == 1:
         pts = torch.stack(torch.meshgrid(gv, gu, indexing='ij')[::-1], -1).unsqueeze(0)
         rp = torch.stack(torch.meshgrid(kv, gu, indexing='ij')[::-1], -1).unsqueeze(0)
@@ -276,13 +285,16 @@ _AA_SIGMAS = (0.0, 0.5 * math.sqrt(3), 0.5 * math.sqrt(15))  # prefilter for shr
 
 def _gaussian_blur(t, sigma):
     """Separable Gaussian blur of t (n, c, H, W), reflect padding."""
-    r = max(int(math.ceil(3 * sigma)), 1)
-    x = torch.arange(-r, r + 1, device=t.device, dtype=t.dtype)
-    k = torch.exp(-x ** 2 / (2 * sigma ** 2))
-    k = k / k.sum()
-    c = t.shape[1]
-    t = F.conv2d(F.pad(t, (r, r, 0, 0), mode='reflect'), k.view(1, 1, 1, -1).repeat(c, 1, 1, 1), groups=c)
-    return F.conv2d(F.pad(t, (0, 0, r, r), mode='reflect'), k.view(1, 1, -1, 1).repeat(c, 1, 1, 1), groups=c)
+    r, c = max(int(math.ceil(3 * sigma)), 1), t.shape[1]
+
+    def kernels():
+        x = torch.arange(-r, r + 1, device=t.device, dtype=t.dtype)
+        k = torch.exp(-x ** 2 / (2 * sigma ** 2))
+        k = k / k.sum()
+        return k.view(1, 1, 1, -1).repeat(c, 1, 1, 1), k.view(1, 1, -1, 1).repeat(c, 1, 1, 1)
+    kh, kv = _const(('blur', sigma, c, str(t.device), t.dtype), kernels)
+    t = F.conv2d(F.pad(t, (r, r, 0, 0), mode='reflect'), kh, groups=c)
+    return F.conv2d(F.pad(t, (0, 0, r, r), mode='reflect'), kv, groups=c)
 
 
 def antialiased_sample(t, grid, dead=1.05):
@@ -304,10 +316,18 @@ def antialiased_sample(t, grid, dead=1.05):
 
 
 class Regions:
-    """Warps of regions: G (K, 2, R, R), image index b (K,), rectangle rect (K, 4) normalised xyxy of the image."""
+    """Warps of regions: G (K, 2, R, R), image index b (K,), rectangle rect (K, 4) normalised xyxy of the image.
+    cache: what depends only on the rectangles (pixel blocks, crop and inverse-grid geometry), per map size, shared by
+    every warp of the same regions (with_grid), so a forward pass with several DECs builds it once."""
 
-    def __init__(self, b, rect, G=None):
+    def __init__(self, b, rect, G=None, cache=None):
         self.b, self.rect, self.G = b, rect, G
+        self.cache = {} if cache is None else cache
+
+    def _cached(self, key, make):
+        if key not in self.cache:
+            self.cache[key] = make()
+        return self.cache[key]
 
     @staticmethod
     def make(n, tiles, device):
@@ -321,26 +341,36 @@ class Regions:
         return Regions(torch.cat(b), torch.cat(rects))
 
     def with_grid(self, G):
-        return Regions(self.b, self.rect, G)
+        return Regions(self.b, self.rect, G, self.cache)
 
     def crops(self, x, size):
         """Each region of images x (B, C, H, W) resized to size (int: square, or (height, width)): (K, C, height, width),
         in region order."""
         r, (ch, cw) = self.rect, canon_hw(size)
-        theta = torch.zeros(len(r), 2, 3, device=x.device, dtype=x.dtype)
-        theta[:, 0, 0], theta[:, 0, 2] = r[:, 2] - r[:, 0], r[:, 0] + r[:, 2] - 1
-        theta[:, 1, 1], theta[:, 1, 2] = r[:, 3] - r[:, 1], r[:, 1] + r[:, 3] - 1
-        grid = F.affine_grid(theta, (len(r), x.shape[1], ch, cw), align_corners=False)
+
+        def make():
+            theta = torch.zeros(len(r), 2, 3, device=x.device, dtype=x.dtype)
+            theta[:, 0, 0], theta[:, 0, 2] = r[:, 2] - r[:, 0], r[:, 0] + r[:, 2] - 1
+            theta[:, 1, 1], theta[:, 1, 2] = r[:, 3] - r[:, 1], r[:, 1] + r[:, 3] - 1
+            return F.affine_grid(theta, (len(r), x.shape[1], ch, cw), align_corners=False)
+        grid = self._cached(('crop', ch, cw, x.shape[1], x.dtype), make)
         src = x if len(r) == x.shape[0] else x.index_select(0, self.b)  # one region per image: region k is image k
         return F.grid_sample(src, grid, mode='bilinear', padding_mode='border', align_corners=False)
 
     def log_scale(self, h, w, size):
         """Log resampling factor (K, 2: x, y) of each region's crop: region pixels on an h x w image / crop pixels."""
         ch, cw = canon_hw(size)
-        rw, rh = (self.rect[:, 2] - self.rect[:, 0]) * w, (self.rect[:, 3] - self.rect[:, 1]) * h
-        return torch.stack([torch.log(rw.clamp_min(1) / cw), torch.log(rh.clamp_min(1) / ch)], 1)
+
+        def make():
+            rw, rh = (self.rect[:, 2] - self.rect[:, 0]) * w, (self.rect[:, 3] - self.rect[:, 1]) * h
+            return torch.stack([torch.log(rw.clamp_min(1) / cw), torch.log(rh.clamp_min(1) / ch)], 1)
+        return self._cached(('log_scale', h, w, ch, cw), make)
 
     def _blocks(self, h, w):
+        """_blocks_uncached(h, w), once per map size."""
+        return self._cached(('blocks', h, w), lambda: self._blocks_uncached(h, w))
+
+    def _blocks_uncached(self, h, w):
         """The pixels of every region on an h x w map (those whose centre is inside its rectangle), padded to a
         (K, Hm, Wm) layout: flat indices into (n, h, w), a mask of the real pixels, and region coordinates us (K, Wm),
         vs (K, Hm). None if no region has a pixel. One host sync (the padded size), whatever the number of regions."""
@@ -363,22 +393,42 @@ class Regions:
 
     def sampling_grid(self, n, h, w, dtype):
         """grid_sample grid (n, h, w, 2) (align_corners=False) warping every region: canonical pixel -> input."""
-        dev = self.rect.device
-        ys, xs = (torch.arange(h, device=dev) + 0.5) / h, (torch.arange(w, device=dev) + 0.5) / w
-        grid = torch.stack(torch.meshgrid(ys, xs, indexing='ij')[::-1], -1) * 2 - 1
-        grid = grid.unsqueeze(0).repeat(n, 1, 1, 1).to(self.G.dtype)
+        dev, dt = self.rect.device, self.G.dtype
+
+        def pixels():
+            ys, xs = (torch.arange(h, device=dev) + 0.5) / h, (torch.arange(w, device=dev) + 0.5) / w
+            return torch.stack(torch.meshgrid(ys, xs, indexing='ij')[::-1], -1) * 2 - 1
+        grid = _const(('pixels', h, w, str(dev)), pixels).unsqueeze(0).repeat(n, 1, 1, 1).to(dt)
         blocks = self._blocks(h, w) if len(self.b) else None
         if blocks is not None:  # every region at once (regions do not overlap)
             flat, valid, us, vs = blocks
-            gx, gy = dense_local(self.G, us.to(self.G.dtype), vs.to(self.G.dtype))
+            base, dst, src = self._cached(('dense', h, w, dt, self.G.shape[-1]), lambda: (
+                _dense_base(us.to(dt), vs.to(dt), self.G.shape[-1]), flat[valid], valid.view(-1).nonzero().squeeze(1)))
+            gx, gy = dense_local(self.G, None, None, base)
             x1, y1, x2, y2 = (v[:, None, None] for v in self.rect.unbind(1))
             vals = torch.stack([x1 + gx * (x2 - x1), y1 + gy * (y2 - y1)], -1) * 2 - 1
-            grid.view(-1, 2)[flat[valid]] = vals[valid]
+            grid.view(-1, 2)[dst] = vals.view(-1, 2)[src]  # = vals[valid], indices built once
         return grid.to(dtype)
 
     def inverse_grid(self, n, h, w):
         """grid_sample grid (n, h, w, 2) un-warping canonical maps back to the image, and the log magnification
         (n, 2, h, w) at each image location (x, y; > 0 where the canonical frame magnifies)."""
+        dev, dt = self.rect.device, self.G.dtype
+        geo = self._cached(('inverse', n, h, w, dt), lambda: self._inverse_geometry(n, h, w, dt))
+        grid = geo['grid'].clone()
+        logm = torch.zeros(n, 2, h, w, device=dev, dtype=dt)
+        if geo['k'] is not None:  # pixels inside a region, by indices built once (= boolean mask m, same order)
+            k, r, tx, ty = geo['k'], geo['r'], geo['tx'], geo['ty']
+            u, v, sx, sy = inverse_points(self.G, k, tx, ty)
+            grid.view(-1, 2)[geo['mi']] = torch.stack([r[:, 0] + u * (r[:, 2] - r[:, 0]),
+                                                       r[:, 1] + v * (r[:, 3] - r[:, 1])], -1)
+            lm = -torch.log(torch.stack([sx, sy], -1).clamp_min(1e-6))
+            logm.permute(0, 2, 3, 1)[geo['mt']] = lm
+        return grid * 2 - 1, logm
+
+    def _inverse_geometry(self, n, h, w, dt):
+        """What inverse_grid needs besides the warps: the identity grid, the image pixels inside a region (m), their
+        region k, its rectangle r and their region coordinates tx, ty."""
         dev = self.rect.device
         idx = torch.full((n, h, w), -1, device=dev, dtype=torch.long)
         blocks = self._blocks(h, w) if len(self.b) else None
@@ -387,18 +437,14 @@ class Regions:
             idx.view(-1)[flat[valid]] = torch.arange(len(self.b), device=dev)[:, None, None].expand_as(flat)[valid]
         ys, xs = (torch.arange(h, device=dev) + 0.5) / h, (torch.arange(w, device=dev) + 0.5) / w
         py, px = [t.reshape(1, h, w).expand(n, h, w) for t in torch.meshgrid(ys, xs, indexing='ij')]
-        grid = torch.stack([px, py], -1).clone().to(self.G.dtype)
-        logm = torch.zeros(n, 2, h, w, device=dev, dtype=self.G.dtype)
+        geo = dict(grid=torch.stack([px, py], -1).clone().to(dt), k=None)
         m = idx >= 0
         if blocks is not None and m.any():
             k = idx[m]
-            r = self.rect[k].to(self.G.dtype)
+            r = self.rect[k].to(dt)
             tx, ty = (px[m] - r[:, 0]) / (r[:, 2] - r[:, 0]), (py[m] - r[:, 1]) / (r[:, 3] - r[:, 1])
-            u, v, sx, sy = inverse_points(self.G, k, tx, ty)
-            grid[m] = torch.stack([r[:, 0] + u * (r[:, 2] - r[:, 0]), r[:, 1] + v * (r[:, 3] - r[:, 1])], -1)
-            lm = -torch.log(torch.stack([sx, sy], -1).clamp_min(1e-6))
-            logm.permute(0, 2, 3, 1)[m] = lm
-        return grid * 2 - 1, logm
+            geo.update(k=k, r=r, tx=tx, ty=ty, mi=m.view(-1).nonzero().squeeze(1), mt=m.nonzero(as_tuple=True))
+        return geo
 
     def warp(self, x, antialias=False):
         """x warped into the canonical frame (antialias: blur before shrinking, for images)."""
@@ -412,7 +458,7 @@ class Regions:
         sampling grid inside a checkpoint: backward recomputes it from the warp parameters instead of storing its
         per-pixel intermediates."""
         def f(t, G):
-            r, (h, w) = Regions(self.b, self.rect, G), t.shape[-2:]
+            r, (h, w) = Regions(self.b, self.rect, G, self.cache), t.shape[-2:]
             grid = r.inverse_grid(t.shape[0], h, w)[0] if inverse else r.sampling_grid(t.shape[0], h, w, t.dtype)
             if antialias:
                 return antialiased_sample(t, grid)
