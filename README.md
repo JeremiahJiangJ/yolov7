@@ -377,11 +377,11 @@ Weights for a purpose, computed from the sources' frame counts (no training; the
 `name` and `path`, weights and `target` are not needed):
 
 ```bash
-python tools/propose_weights.py --data data.yaml --purpose generalist --epochs 100
-python tools/propose_weights.py --data data.yaml --purpose generalist --balance-by frames --img-size 640 --epochs 100
+python tools/propose_weights.py --data data.yaml --purpose generalist --img-size 640 --hyp data/hyp.scratch.tiny.yaml
+python tools/propose_weights.py --data data.yaml --purpose generalist --balance-by samples --epochs 100
 python tools/propose_weights.py --data data.yaml --purpose generalist --max-repeat 300 --epochs 100
 python tools/propose_weights.py --data data.yaml --purpose finetune --target camC --epochs 40 --out camC_ft.yaml
-python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --frames camA=12285 camB=40048
+python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --balance-by samples --frames camA=12285 camB=40048
 python tools/propose_weights.py --data data.yaml --purpose generalist --simulated sim --sim-final 0.08 --max-repeat 300
 ```
 
@@ -396,8 +396,8 @@ python tools/propose_weights.py --data data.yaml --purpose generalist --simulate
 sized by their frame count, which would let a large simulated set lead the mix: `--sim-share`, by default 15% for
 `generalist` / `balanced` / `specialist` (its generalist mix) and 4% for `finetune`, split among the simulated sources
 ~ frames ^ `--power`. The real sources share the rest by the purpose's rule, and `--max-repeat` caps real sources only.
-- `--sim-final S` fades simulation linearly to S (of the `--balance-by` quantity) by 60% of `--epochs` (front-loaded `weight_schedule`); the freed share
-  goes to the real sources not capped by `--max-repeat`. `specialist` fades to 4% by default.
+- `--sim-final S` fades simulation linearly to S (of the `--balance-by` quantity) by 60% of `--epochs` (front-loaded
+  `weight_schedule`); the freed share goes to the real sources not capped by `--max-repeat`. `specialist` fades to 4% by default.
 - A generalist's `epoch_size` is then the real frame count (an integer), so an epoch is a pass's worth of real data
   whatever the simulated count.
 - The target must be a real source (without `--target`, the smallest real source is marked). Simulated sources need
@@ -406,10 +406,11 @@ sized by their frame count, which would let a large simulated set lead the mix: 
 **Shares of what (`--balance-by`).** The weights set each source's share of the training samples (compute). A sample of
 a source with small frames holds more frames (mosaic), and object density differs between sources, so the shares of the
 frames loaded and of the objects can differ a lot from it (the data plan shows all three).
-- `samples` (default): the purpose's shares are sample shares.
-- `frames`: they are shares of the frames loaded, i.e. of the distinct content each source contributes. The tool
-  converts them to sample weights with each source's frames per sample (from its frame size, `--img-size`, `--hyp`, as
-  in the data plan). Sources with large frames (fewer per sample) get more weight.
+- `frames` (default): the purpose's shares are shares of the frames loaded, i.e. of the distinct content each source
+  contributes. The tool converts them to sample weights with each source's frames per sample (from its frame size,
+  `--img-size`, `--hyp`, as in the data plan: pass the ones you train with). Sources with large frames (fewer per
+  sample) get more weight.
+- `samples`: the shares are sample shares (compute), whatever the frame sizes.
 - `objects`: shares of the objects, i.e. of the supervision. Objects per sample are measured on `--measure` built
   samples per source (256 by default; reads labels, slower).
 
@@ -417,7 +418,7 @@ Weights are percentages to 0.1, summing to 100 (rounding never lifts a capped so
 source's weight and its shares of the samples, frames loaded (and objects, with `--measure`) over the
 run, samples and loads per frame (warning above `--warn-repeat`, 300 by default: a rule of thumb for full
 augmentation, about 100 with light and 50 with no augmentation), and the yaml to merge; `--out` writes the whole data
-yaml (comments are not kept). `--frames name=N ...` skips reading the folders (samples only). For `generalist` /
+yaml (comments are not kept). `--frames name=N ...` skips reading the folders (with `--balance-by samples` only). For `generalist` /
 `balanced` without `--target`, the smallest source is marked target (its val picks `best.pt`). These are starting
 points: check each source's val in `source_results.txt` and adjust.
 

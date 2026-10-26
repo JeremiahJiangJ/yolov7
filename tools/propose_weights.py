@@ -19,18 +19,20 @@
 #
 # Shares of what (--balance-by): the weights set each source's share of the training samples (compute). A sample of a
 # source with small frames holds more frames (mosaic), and object density differs, so the shares of the frames loaded
-# and of the objects differ from it (the dry run, python -m utils.mixed_data, shows all three). --balance-by frames or
-# objects applies the purpose's shares to that quantity instead, and converts them to sample weights using each
-# source's frames per sample (from its frame size, --img-size and --hyp) or measured objects per sample.
+# and of the objects differ from it (the dry run, python -m utils.mixed_data, shows all three). By default (frames) the
+# purpose's shares are of the frames loaded, converted to sample weights using each source's frames per sample (from
+# its frame size, --img-size and --hyp); objects uses measured objects per sample, samples the sample shares as they
+# are.
 #
 # Starting points, not optima: check each source's val (source_results.txt) and adjust.
 #
 # Usage:
 #   python tools/propose_weights.py --data data/mixed/template.yaml --purpose generalist --epochs 100
-#   python tools/propose_weights.py --data data.yaml --purpose generalist --balance-by frames --img-size 640
+#   python tools/propose_weights.py --data data.yaml --purpose generalist --img-size 640 --hyp my_hyp.yaml
 #   python tools/propose_weights.py --data data.yaml --purpose finetune --target camC --epochs 40 --out camC_ft.yaml
 #   python tools/propose_weights.py --data data.yaml --purpose generalist --max-repeat 300 --epochs 100
-#   python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --frames camA=12285 camB=40048
+#   python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --balance-by samples \
+#       --frames camA=12285 camB=40048
 #   python tools/propose_weights.py --data data.yaml --purpose generalist --simulated sim --sim-final 0.08
 # The data yaml needs train_sources with name and path; weights and target are not needed (they are proposed).
 
@@ -122,9 +124,9 @@ def main():
     parser.add_argument('--target', default=None, help='the source to train for (required by finetune, specialist; '
                                                         'for generalist / balanced: the source whose val picks best.pt)')
     parser.add_argument('--epochs', type=int, default=100, help='planned --epochs (repetition report, --max-repeat)')
-    parser.add_argument('--balance-by', default='samples', choices=BALANCE_BY,
-                        help='what the shares are of: samples (compute, the default), frames (frames loaded, i.e. '
-                             'distinct content) or objects (supervision; measured, slower)')
+    parser.add_argument('--balance-by', default='frames', choices=BALANCE_BY,
+                        help='what the shares are of: frames (frames loaded, i.e. distinct content; the default), '
+                             'samples (compute) or objects (supervision; measured, slower)')
     parser.add_argument('--power', type=float, default=0.5,
                         help='generalist split: shares ~ frames ^ power (1 = proportional, 0 = equal, 0.5 = square root)')
     parser.add_argument('--max-repeat', type=float, default=None,
@@ -157,7 +159,8 @@ def main():
     if opt.purpose in ('finetune', 'specialist') and not opt.target:
         parser.error(f'--purpose {opt.purpose} needs --target <source name>')
     if opt.frames and opt.balance_by != 'samples':
-        parser.error('--frames skips reading the sources, but --balance-by frames / objects needs them')
+        parser.error(f'--frames skips reading the sources, but --balance-by {opt.balance_by} needs them (frames is '
+                     f'the default): add --balance-by samples, or drop --frames')
     measure = opt.measure if opt.measure is not None else (MEASURE_DEFAULT if opt.balance_by == 'objects' else 0)
 
     with open(opt.data) as f:
@@ -188,7 +191,8 @@ def main():
                      f'fades to)')
     else:
         if opt.sim_share is not None or opt.sim_final is not None:
-            sys.exit('error: --sim-share / --sim-final given, but no source is simulated (simulated: true, --simulated)')
+            sys.exit('error: --sim-share / --sim-final given, but no source is simulated (simulated: true or '
+                     '--simulated)')
         sim_share, sim_final = 0.0, None
 
     # target
@@ -338,7 +342,8 @@ def main():
             schedule = {'mode': 'linear',
                         'points': [{'progress': SCHEDULE_PROGRESS,
                                     'weights': dict(zip(names, to_weights(final, ceiling)))}]}
-            notes.append(f'simulated faded linearly to {sim_final:.0%} of the {what} at {SCHEDULE_PROGRESS:.0%} of --epochs '
+            notes.append(f'simulated faded linearly to {sim_final:.0%} of the {what} at {SCHEDULE_PROGRESS:.0%} of '
+                         f'--epochs '
                          f'(weight_schedule, front-loaded); the freed share goes to the '
                          f'{"uncapped " if hit.any() else ""}real sources')
         elif opt.purpose == 'specialist':
