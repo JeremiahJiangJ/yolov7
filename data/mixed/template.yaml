@@ -83,6 +83,10 @@ train_sources:
   #   path: /data/rgb/images/train
   #   weight: 10
   #   to_gray: 1.0                                               # chance a training frame is converted to gray
+  # - name: sim
+  #   path: /data/sim/images/train
+  #   weight: 15                                                 # simulated: a fixed share, not sized by frame count
+  #   simulated: true                                            # read by tools/propose_weights.py; training ignores it
 
 # --- Weight schedule (optional) ----------------------------------------------------------------------------------------
 # The weights above apply from the start. Front-loaded: broad mix first so the large sources are covered, then shift

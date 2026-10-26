@@ -334,6 +334,7 @@ Per-source keys (most can also be set at the top level as the default for every 
 | `to_gray` | top-level, else 0 (off) | chance a training frame is converted to gray (3 equal channels), e.g. `1.0` for RGB frames supplementing IR. `1.0` also converts the source's val frames (section 12) |
 | `label_folder` | top-level, else `--label-folder-name` | label folder next to `images` |
 | `cache_images` | target: `--cache-images`, others: off | cache this source's images in RAM |
+| `simulated` | `false` | marks a simulated (synthetic) source for `tools/propose_weights.py` (fixed share, never the target); training ignores it |
 | `cache_path`, `val_cache_path` | from `--train-cache-path` / `--test-cache-path`, else next to the labels | this source's label cache file or directory (overrides the flags, section 4) |
 
 ### Several datasets in one source
@@ -381,6 +382,7 @@ python tools/propose_weights.py --data data.yaml --purpose generalist --balance-
 python tools/propose_weights.py --data data.yaml --purpose generalist --max-repeat 300 --epochs 100
 python tools/propose_weights.py --data data.yaml --purpose finetune --target camC --epochs 40 --out camC_ft.yaml
 python tools/propose_weights.py --data data.yaml --purpose specialist --target camB --frames camA=12285 camB=40048
+python tools/propose_weights.py --data data.yaml --purpose generalist --simulated sim --sim-final 0.08 --max-repeat 300
 ```
 
 | `--purpose` | For | Shares | `epoch_size` |
@@ -389,6 +391,17 @@ python tools/propose_weights.py --data data.yaml --purpose specialist --target c
 | `balanced` | every source trained as much | equal (small sources repeated most) | `total` |
 | `finetune` (`--target` required) | fine-tuning from a model that already knows the domain (e.g. a generalist) | fixed: the target gets 90% (20k+ frames), 80% (5k+) or 70% (smaller), or `--target-share`; the others split the rest ~ frames ^ `--power` | `target` |
 | `specialist` (`--target` required) | training for one source from a generic start (`yolov7-tiny.pt`) | the generalist mix first, then a linear `weight_schedule` to the finetune mix at 60% of `--epochs` | `target` |
+
+**Simulated sources** (`simulated: true` on the source, or `--simulated name ...`) get a fixed share instead of one
+sized by their frame count, which would let a large simulated set lead the mix: `--sim-share`, by default 15% for
+`generalist` / `balanced` / `specialist` (its generalist mix) and 4% for `finetune`, split among the simulated sources
+~ frames ^ `--power`. The real sources share the rest by the purpose's rule, and `--max-repeat` caps real sources only.
+- `--sim-final S` fades simulation linearly to S by 60% of `--epochs` (front-loaded `weight_schedule`); the freed share
+  goes to the real sources not capped by `--max-repeat`. `specialist` fades to 4% by default.
+- A generalist's `epoch_size` is then the real frame count (an integer), so an epoch is a pass's worth of real data
+  whatever the simulated count.
+- The target must be a real source (without `--target`, the smallest real source is marked). Simulated sources need
+  no val set; check that their objects have the real cameras' pixel size (`resize`, section 9).
 
 **Shares of what (`--balance-by`).** The weights set each source's share of the training samples (compute). A sample of
 a source with small frames holds more frames (mosaic), and object density differs between sources, so the shares of the
@@ -400,7 +413,8 @@ frames loaded and of the objects can differ a lot from it (the data plan shows a
 - `objects`: shares of the objects, i.e. of the supervision. Objects per sample are measured on `--measure` built
   samples per source (256 by default; reads labels, slower).
 
-It prints each source's weight and its shares of the samples, frames loaded (and objects, with `--measure`) over the
+Weights are percentages to 0.1, summing to 100 (rounding never lifts a capped source above its cap). It prints each
+source's weight and its shares of the samples, frames loaded (and objects, with `--measure`) over the
 run, samples and loads per frame (warning above `--warn-repeat`, 300 by default: a rule of thumb for full
 augmentation, about 100 with light and 50 with no augmentation), and the yaml to merge; `--out` writes the whole data
 yaml (comments are not kept). `--frames name=N ...` skips reading the folders (samples only). For `generalist` /
@@ -693,7 +707,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
-| `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects (section 8) |
+| `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects, with a fixed share for simulated sources (section 8) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
 | `data/mixed/1_...` to `6_...` | Experiment ladder (below) |

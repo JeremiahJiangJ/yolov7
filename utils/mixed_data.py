@@ -125,7 +125,7 @@ class MixedConfig:
     reads them (check_dataset, W&B)."""
     KEYS = {'name', 'path', 'weight', 'target', 'val', 'resize', 'fg_crop_prob', 'mosaic_max_cells',
             'repeat_factor_threshold', 'px_inversion_prob', 'inversion_border', 'to_gray', 'cache_images',
-            'label_folder', 'cache_path', 'val_cache_path'}
+            'label_folder', 'cache_path', 'val_cache_path', 'simulated'}  # simulated: tools/propose_weights.py only
 
     def __init__(self, data_dict, label_folder_name=DEFAULT_LABEL_FOLDER):
         srcs = data_dict['train_sources']
