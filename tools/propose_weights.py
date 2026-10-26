@@ -322,15 +322,23 @@ def main():
         notes.append('simulated: no val set needed (best.pt is picked on real data); check their objects have the '
                      'real cameras\' pixel size (resize, section 9) and watch the real val curves')
         if sim_final is not None and opt.purpose != 'specialist':  # front-loaded: fade simulation out
-            final = shares.copy()
-            final[sim] = shares[sim] * sim_final / shares[sim].sum()
+            # sample shares: capped sources fixed, simulated scaled by a, uncapped real by b, so that simulated is
+            # sim_final of the --balance-by quantity: a*Sq*(1-f) - b*f*Uq = f*Cq and a*Ss + b*Us = 1 - Cs
             recv = real & ~hit  # capped sources keep their share
             recv = recv if recv.any() else real
-            final[recv] += (shares[sim].sum() - sim_final) * shares[recv] / shares[recv].sum()
+            fixed = ~sim & ~recv
+            p = shares * per_sample
+            f = sim_final
+            a, b = np.linalg.solve([[p[sim].sum() * (1 - f), -f * p[recv].sum()],
+                                    [shares[sim].sum(), shares[recv].sum()]],
+                                   [f * p[fixed].sum(), 1 - shares[fixed].sum()])
+            final = shares.copy()
+            final[sim] *= a
+            final[recv] *= b
             schedule = {'mode': 'linear',
                         'points': [{'progress': SCHEDULE_PROGRESS,
                                     'weights': dict(zip(names, to_weights(final, ceiling)))}]}
-            notes.append(f'simulated faded linearly to {sim_final:.0%} at {SCHEDULE_PROGRESS:.0%} of --epochs '
+            notes.append(f'simulated faded linearly to {sim_final:.0%} of the {what} at {SCHEDULE_PROGRESS:.0%} of --epochs '
                          f'(weight_schedule, front-loaded); the freed share goes to the '
                          f'{"uncapped " if hit.any() else ""}real sources')
         elif opt.purpose == 'specialist':

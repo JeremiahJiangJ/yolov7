@@ -396,7 +396,7 @@ python tools/propose_weights.py --data data.yaml --purpose generalist --simulate
 sized by their frame count, which would let a large simulated set lead the mix: `--sim-share`, by default 15% for
 `generalist` / `balanced` / `specialist` (its generalist mix) and 4% for `finetune`, split among the simulated sources
 ~ frames ^ `--power`. The real sources share the rest by the purpose's rule, and `--max-repeat` caps real sources only.
-- `--sim-final S` fades simulation linearly to S by 60% of `--epochs` (front-loaded `weight_schedule`); the freed share
+- `--sim-final S` fades simulation linearly to S (of the `--balance-by` quantity) by 60% of `--epochs` (front-loaded `weight_schedule`); the freed share
   goes to the real sources not capped by `--max-repeat`. `specialist` fades to 4% by default.
 - A generalist's `epoch_size` is then the real frame count (an integer), so an epoch is a pass's worth of real data
   whatever the simulated count.
