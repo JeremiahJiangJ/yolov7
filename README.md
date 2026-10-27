@@ -708,6 +708,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | Path | What |
 |---|---|
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
+| `tools/inspect_sample.py` | Shows how training loads one image: its label file, the labels training uses (cache), its size as cached and loaded, the frame with its labels drawn, and augmented samples built around it (for an object that looks unlabelled in `train_batch*.jpg`) |
 | `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects, with a fixed share for simulated sources (section 8) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
