@@ -85,8 +85,9 @@ stock data yaml), not 4's automatic cache deletion, 7, 8, 9 or 10.
 | Change | Upstream | Now | Why |
 |---|---|---|---|
 | Default label folder | `labels` | `labels_upright` | project convention; `--label-folder-name labels` restores upstream |
-| Label caches | kept next to the labels, never checked | deleted when the run ends; rebuilt if made for other images or another label folder | stale caches silently fed old labels to new runs |
+| Label caches | kept next to the labels, never checked | deleted when the run ends; rebuilt if made for other images, another label folder, or label / image files of another size | stale caches silently fed old labels to new runs |
 | Pooled `train:` lists | cache named after the first folder (overwriting that folder's own cache) | own cache file, `<name>_pooled_<hash>.cache` | a later single-folder run loaded every pooled image as that folder |
+| Mosaics mixing polygon- and box-labelled images | labels matched to the wrong polygons; the rest zeroed and dropped | polygons used only when every label in the mosaic has one, else boxes | objects lost their boxes whenever a mosaic mixed the two label formats |
 | No label files found | warning, then metrics of 0 | error naming the folder searched | a wrong label folder looked like a bad model |
 | `--adam` | Adam | AdamW | decoupled weight decay |
 | `test.test()` | returns 3 values | returns 4: `(results, maps, times, area_results)` | per-area metrics; update scripts that unpack it |
@@ -181,14 +182,15 @@ every run reads the current label files; `--keep-cache` keeps them (also for `te
 
 **Implementation (`utils/datasets.py`).**
 - `LoadImagesAndLabels`: cache path resolution (file, or directory + `labels_<hash of image paths>.cache`); pooled
-  lists get `_pooled_<hash>`; a cache is rebuilt if its image list or label folder differs from the current ones.
+  lists get `_pooled_<hash>`; a cache is rebuilt if its image list or label folder differs from the current ones, or
+  the total size of the label and image files changed (upstream's check, which upstream disables).
 - `delete_label_caches_at_exit()`: every cache read or written is recorded; an `atexit` handler deletes them (and
   directories left empty). SIGTERM / SIGHUP are turned into a normal exit. Only the main process cleans up (not
   dataloader workers, not other DDP ranks). Called by `train.py` and `test.py`.
 
 **Notes.** A hard kill (SIGKILL, out-of-memory killer) cannot be caught: delete the caches listed at startup by hand.
-Edited label contents with the same images are not detected by the validity check (upstream's hash check is
-disabled), which is why caches are deleted after each run.
+The size check catches added, removed or emptied label files and most edits, but not an edit that keeps a file's
+size exactly, which is why caches are also deleted after each run.
 
 ---
 

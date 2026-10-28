@@ -560,8 +560,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 # built for a different image set (corrupt images are left out of a cache, hence <=)
                 logging.info(f'{prefix}Cache {cache_path} does not match the images, re-caching')
                 cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
-            #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-            #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+            elif cache.get('hash') != get_hash(self.label_files + self.img_files):  # label or image file sizes changed
+                # e.g. a cache left by a killed run, from before labels were added or edited
+                logging.info(f'{prefix}Cache {cache_path} does not match the label / image files, re-caching')
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
@@ -1502,7 +1504,9 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     # Transform label coordinates
     n = len(targets)
     if n:
-        use_segments = any(x.any() for x in segments)
+        # segments only if every label has one: a mosaic mixing polygon- and box-labelled images has fewer segments than
+        # labels, and warping those would give labels the wrong (or zero, i.e. dropped) boxes
+        use_segments = len(segments) == n and any(x.any() for x in segments)
         new = np.zeros((n, 4))
         if use_segments:  # warp segments
             segments = resample_segments(segments)  # upsample
