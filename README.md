@@ -272,6 +272,7 @@ All off by default; in `train.py`.
 | `--clip-grad X` | Clip the gradient norm, against loss spikes | `scaler.unscale_` then `clip_grad_norm_` before the optimizer step |
 | `--patience N` | Stop after N validated epochs without fitness improvement | best epoch tracked with `best_fitness`; DDP ranks stop together (broadcast); no effect with `--notest` |
 | `--save-period N` | Also save `weights/epoch_NNN.pt` every N epochs (upstream: `--save_period`, W&B upload only). Upstream already saves epoch 0, every 25th epoch and the last 5 | the checkpoint block in `train.py` / `train_aux.py` |
+| `nwd: r` (hyp) | Tiny objects: box loss `(1 - r)(1 - CIoU) + r(1 - NWD)`, the Normalized Wasserstein Distance ([Wang et al. 2021](https://arxiv.org/abs/2110.13389)). IoU collapses when a tiny box is a pixel or two off (6 px box, 2 px shift: IoU 0.50, NWD 0.86) and is 0 without overlap; NWD decays smoothly. `nwd_c` (default 12.8): its constant in pixels, about the typical object size. Objectness targets stay CIoU. Try `r` 0.5 | `utils/loss.py: box_loss()`, `utils/general.py: bbox_nwd()` (all loss classes) |
 | `--unfreeze-epoch N` | Train with `--freeze` layers frozen, then unfreeze them from epoch N | re-enables `requires_grad` (frozen weights are already in the optimizer); not in DDP mode |
 
 ---
@@ -769,8 +770,8 @@ python -m pytest tests -m "not slow"   # without the end-to-end train.py / test.
 | `tests/test_mixed_loader.py` | the training loader as `train.py` builds it: samples per source match the weights every epoch, linear / step schedules, mosaic / mixup / paste-in partners stay within the source, every visible object keeps its label, frames used equally often, same batches with 0 or 2 workers and after resume, `--close-mosaic` rebuild, proportional sampling, `epoch_size` (total / target / source / int), DDP ranks, repeat-factor sampling |
 | `tests/test_labels.py` | native and fit samples (mosaic, crop, zoom, mixup, paste-in) keep every visible label; `fg_crop_prob`; mosaics mixing polygon and box labels; polygon -> box; pooled folders; label cache rebuilt for changed labels or another label folder; missing label folder / files |
 | `tests/test_propose_weights.py` | reference weights, `--max-repeat` caps after rounding, `--sim-final`, finetune / specialist, errors, auto target, frames balancing against the frames per sample training uses, the written yaml accepted by training |
-| `tests/test_models.py` | yolov7-tiny and the P2 config: strides, loss weights, both losses, output shapes, pretrained weight transfer |
-| `tests/test_train_smoke.py` (`slow`) | `train.py` with a multi-source yaml (schedule, `simulated`, `--close-mosaic`, `--save-period`) and `test.py` on it; the P2 model on a plain yaml, two seeded runs identical |
+| `tests/test_models.py` | yolov7-tiny and the P2 config: strides, loss weights, both losses, output shapes, pretrained weight transfer; NWD values, the box-loss blend (`nwd: 0` unchanged) and a training step with it |
+| `tests/test_train_smoke.py` (`slow`) | `train.py` with a multi-source yaml (schedule, `simulated`, `--close-mosaic`, `--save-period`, `nwd`) and `test.py` on it; the P2 model on a plain yaml, two seeded runs identical |
 
 **Earlier manual checks**, all on CPU with synthetic data (generated frames with known objects; real camera data and
 GPUs were not available):

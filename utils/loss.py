@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.general import bbox_iou, bbox_nwd, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
 from utils.torch_utils import is_parallel
 
 
@@ -14,10 +14,27 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
 
 
 def obj_balance(det):
-    # Objectness loss weight per output level: stock P3-P5 [4.0, 1.0, 0.4], P3-P7 [4.0, 1.0, 0.25, 0.06, .02]. A stride-4
-    # (P2) level, e.g. cfg/training/yolov7-tiny-p2.yaml, gets 4.0 and the P3-P5 levels after it keep their stock weights
+    # Objectness loss weight per output level: stock P3-P5 [4.0, 1.0, 0.4], P3-P7 [4.0, 1.0, 0.25, 0.06, .02].
+    # A stride-4 (P2) level, e.g. cfg/training/yolov7-tiny-p2.yaml, gets 4.0 and the P3-P5 levels after it keep their
+    # stock weights
     p2 = int(float(det.stride[0]) == 4)
     return [4.0] * p2 + {3: [4.0, 1.0, 0.4]}.get(det.nl - p2, [4.0, 1.0, 0.25, 0.06, .02])
+
+
+def box_loss(pbox, tbox, stride, hyp):
+    """Box regression loss and the CIoU (objectness target) of predictions pbox vs targets tbox, (n, 4) xywh in grid
+    units of a level with this stride. Stock: mean(1 - CIoU). hyp 'nwd' r > 0 blends in the Normalized Wasserstein
+    Distance (Wang et al. 2021, for tiny objects, where IoU collapses for offsets of a pixel or two):
+    mean((1 - r)(1 - CIoU) + r(1 - NWD)), NWD computed in pixels with constant hyp 'nwd_c' (default 12.8 px, about
+    the typical object size)."""
+    iou = bbox_iou(pbox.T, tbox, x1y1x2y2=False, CIoU=True)
+    loss = 1.0 - iou
+    r = float(hyp.get('nwd', 0.0))
+    if r > 0:
+        s = float(stride)
+        loss = (1.0 - r) * loss + r * (1.0 - bbox_nwd(pbox * s, tbox * s, float(hyp.get('nwd_c', 12.8))))
+    return loss.mean(), iou
+
 
 class BCEBlurWithLogitsLoss(nn.Module):
     # BCEwithLogitLoss() with reduced missing label effects.
@@ -450,7 +467,7 @@ class ComputeLoss:
         #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.5, 0.4, .1])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
-        for k in 'na', 'nc', 'nl', 'anchors':
+        for k in 'na', 'nc', 'nl', 'anchors', 'stride':
             setattr(self, k, getattr(det, k))
 
     def __call__(self, p, targets):  # predictions, targets, model
@@ -471,8 +488,8 @@ class ComputeLoss:
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                lb, iou = box_loss(pbox, tbox[i], self.stride[i], self.hyp)  # iou(prediction, target)
+                lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -609,8 +626,8 @@ class ComputeLossOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -932,8 +949,8 @@ class ComputeLossBinOTA:
                 
                 
                 
-                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -1234,8 +1251,8 @@ class ComputeLossAuxOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -1261,8 +1278,8 @@ class ComputeLossAuxOTA:
                 pbox_aux = torch.cat((pxy_aux, pwh_aux), 1)  # predicted box
                 selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
                 selected_tbox_aux[:, :2] -= grid_aux
-                iou_aux = bbox_iou(pbox_aux.T, selected_tbox_aux, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += 0.25 * (1.0 - iou_aux).mean()  # iou loss
+                lb_aux, iou_aux = box_loss(pbox_aux, selected_tbox_aux, self.stride[i], self.hyp)
+                lbox += 0.25 * lb_aux  # iou loss
 
                 # Objectness
                 tobj_aux[b_aux, a_aux, gj_aux, gi_aux] = (1.0 - self.gr) + self.gr * iou_aux.detach().clamp(0).type(tobj_aux.dtype)  # iou ratio

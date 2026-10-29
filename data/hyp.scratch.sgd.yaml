@@ -7,6 +7,8 @@ warmup_epochs: 3.0  # warmup epochs (fractions ok)
 warmup_momentum: 0.8  # warmup initial momentum (SGD only, Adam betas are not warmed up)
 warmup_bias_lr: 0.1  # warmup initial bias lr
 box: 0.05  # box loss gain
+# nwd: 0.5  # tiny objects: blend the box loss with NWD, 0-1 (0 = stock CIoU; README.md, section 7)
+# nwd_c: 12.8  # NWD constant in pixels, about the typical object size
 cls: 0.5  # cls loss gain
 cls_pw: 1.0  # cls BCELoss positive_weight
 obj: 1.0  # obj loss gain (scale with pixels)

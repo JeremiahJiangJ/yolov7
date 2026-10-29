@@ -1,6 +1,6 @@
-# End to end on CPU: train.py with a multi-source yaml (schedule, simulated key, --close-mosaic, --save-period) and with
-# a plain yaml (P2 model), test.py on the result, and seeded reproducibility. Tiny data and image size: this checks that
-# everything runs and is wired together, not accuracy.
+# End to end on CPU: train.py with a multi-source yaml (schedule, simulated key, --close-mosaic, --save-period, NWD
+# box loss) and with a plain yaml (P2 model), test.py on the result, and seeded reproducibility. Tiny data and image
+# size: this checks that everything runs and is wired together, not accuracy.
 
 import subprocess
 import sys
@@ -26,16 +26,20 @@ def data(tmp_path_factory):
              'weight_schedule': {'mode': 'linear', 'points': [{'progress': 0.5,
                                                                'weights': {'camA': 60, 'camB': 30, 'sim': 10}}]}}
     plain = {'nc': 1, 'names': ['o'], 'train': [a, b], 'val': a}
+    with open(ROOT / 'data' / 'hyp.scratch.tiny.yaml') as f:
+        hyp = yaml.safe_load(f)
+    hyp['nwd'] = 0.5  # the multi-source run also trains with the NWD box loss
     paths = {}
-    for name, d in (('mixed', mixed), ('plain', plain)):
+    for name, d in (('mixed', mixed), ('plain', plain), ('hyp_nwd', hyp)):
         paths[name] = root / f'{name}.yaml'
         paths[name].write_text(yaml.safe_dump(d))
     return root, paths
 
 
-def train(root, data_yaml, name, *extra, cfg='cfg/training/yolov7-tiny.yaml', epochs=2):
+def train(root, data_yaml, name, *extra, cfg='cfg/training/yolov7-tiny.yaml', epochs=2,
+          hyp='data/hyp.scratch.tiny.yaml'):
     cmd = [sys.executable, 'train.py', '--weights', '', '--cfg', cfg, '--data', str(data_yaml),
-           '--hyp', 'data/hyp.scratch.tiny.yaml', '--epochs', str(epochs), '--batch-size', '4', '--img-size', '160',
+           '--hyp', str(hyp), '--epochs', str(epochs), '--batch-size', '4', '--img-size', '160',
            '160', '--device', 'cpu', '--workers', '2', '--project', str(root / 'runs'), '--name', name, '--exist-ok',
            '--seed', '0', *extra]
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=1200)
@@ -45,7 +49,8 @@ def train(root, data_yaml, name, *extra, cfg='cfg/training/yolov7-tiny.yaml', ep
 
 def test_train_mixed_then_test(data):
     root, paths = data
-    run, log = train(root, paths['mixed'], 'mixed', '--close-mosaic', '1', '--save-period', '1', epochs=3)
+    run, log = train(root, paths['mixed'], 'mixed', '--close-mosaic', '1', '--save-period', '1', epochs=3,
+                     hyp=paths['hyp_nwd'])
     w = run / 'weights'
     assert (w / 'last.pt').exists() and (w / 'best.pt').exists()
     assert (w / 'epoch_001.pt').exists()  # --save-period 1 (upstream saves epoch 0 and the last 5 anyway)

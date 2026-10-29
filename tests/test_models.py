@@ -50,3 +50,38 @@ def test_p2_takes_every_pretrained_layer_but_the_new_ones(hyp):
     stock = [k for k in tiny.state_dict() if not k.startswith('model.77.')]  # all but the detection layer
     moved = intersect_dicts(tiny.state_dict(), p2.state_dict())
     assert set(stock) <= set(moved)
+
+
+def test_nwd_values():
+    from utils.general import bbox_iou, bbox_nwd
+    a = torch.tensor([[10.0, 10, 6, 6]])
+    shifted = lambda dx: torch.tensor([[10.0 + dx, 10, 6, 6]])  # noqa: E731
+    assert torch.isclose(bbox_nwd(a, a), torch.tensor(1.0), atol=1e-3)
+    assert bbox_nwd(a, shifted(2)).item() > 0.85 > bbox_iou(a[0], shifted(2), x1y1x2y2=False).item()  # 0.86 vs 0.50
+    assert bbox_iou(a[0], shifted(8), x1y1x2y2=False).item() == 0 and bbox_nwd(a, shifted(8)).item() > 0.5
+    assert torch.isclose(bbox_nwd(a, shifted(2), c=6.4), bbox_nwd(a, shifted(2)) ** 2)  # exp(-d / c)
+
+
+def test_box_loss_nwd_blend(hyp):
+    from utils.general import bbox_iou, bbox_nwd
+    from utils.loss import box_loss
+    p = torch.tensor([[0.5, 0.5, 1.0, 1.2], [0.4, 0.6, 0.5, 0.5]], requires_grad=True)
+    t = torch.tensor([[0.6, 0.5, 1.1, 1.0], [0.5, 0.5, 0.5, 0.5]])
+    stock, iou = box_loss(p, t, 8, {})
+    assert torch.allclose(stock, (1 - bbox_iou(p.T, t, x1y1x2y2=False, CIoU=True)).mean())  # nwd off: unchanged
+    blend, iou2 = box_loss(p, t, 8, {'nwd': 0.5, 'nwd_c': 12.8})
+    ref = 0.5 * (1 - bbox_iou(p.T, t, x1y1x2y2=False, CIoU=True)) + 0.5 * (1 - bbox_nwd(p * 8, t * 8, 12.8))
+    assert torch.allclose(blend, ref.mean()) and torch.equal(iou, iou2)  # objectness target stays CIoU
+    blend.backward()
+    assert torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('cfg', [TINY, P2])
+def test_training_step_with_nwd(cfg, hyp):
+    m = build(cfg, {**hyp, 'nwd': 0.5})
+    m.train()
+    x = torch.rand(2, 3, 256, 256)
+    targets = torch.tensor([[0, 0, 0.5, 0.5, 0.02, 0.02], [1, 1, 0.3, 0.3, 0.05, 0.05]])
+    loss = ComputeLossOTA(m)(m(x), targets, x)[0]
+    loss.backward()
+    assert torch.isfinite(loss).all()

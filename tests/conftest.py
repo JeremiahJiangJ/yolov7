@@ -68,8 +68,9 @@ def unlabelled_objects(img_hwc, boxes_xywh_px, thr=200, min_px=8):
     n, cc, st, _ = cv2.connectedComponentsWithStats(mask)
     covered = np.zeros((H, W), bool)
     for cx, cy, bw, bh in boxes_xywh_px:
-        covered[max(int(cy - bh / 2), 0):int(np.ceil(cy + bh / 2)), max(int(cx - bw / 2), 0):int(np.ceil(cx + bw / 2))] \
-            = True
+        y1, y2 = max(int(cy - bh / 2), 0), int(np.ceil(cy + bh / 2))
+        x1, x2 = max(int(cx - bw / 2), 0), int(np.ceil(cx + bw / 2))
+        covered[y1:y2, x1:x2] = True
     checked = missing = 0
     for c in range(1, n):
         x, y, w, h, _ = st[c]

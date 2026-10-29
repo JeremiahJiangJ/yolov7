@@ -341,6 +341,15 @@ def clip_coords(boxes, img_shape):
     boxes[:, 3].clamp_(0, img_shape[0])  # y2
 
 
+def bbox_nwd(box1, box2, c=12.8, eps=1e-7):
+    # Normalized Gaussian Wasserstein Distance (Wang et al. 2021, https://arxiv.org/abs/2110.13389) between boxes
+    # box1 and box2, (n, 4) xywh, in the units of c (pixels): each box as a 2D Gaussian, exp(-W2 / c). 1 for identical
+    # boxes, decaying smoothly with centre and size differences whatever the overlap, so tiny boxes keep a useful signal
+    d2 = (box1[:, 0] - box2[:, 0]) ** 2 + (box1[:, 1] - box2[:, 1]) ** 2 + \
+         ((box1[:, 2] - box2[:, 2]) / 2) ** 2 + ((box1[:, 3] - box2[:, 3]) / 2) ** 2
+    return torch.exp(-torch.sqrt(d2 + eps) / c)
+
+
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
     box2 = box2.T
