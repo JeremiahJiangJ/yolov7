@@ -271,6 +271,7 @@ All off by default; in `train.py`.
 | `--close-mosaic N` | Last N epochs on clean images (no mosaic, mixup or paste-in), as in later YOLO versions | `LoadImagesAndLabels.close_mosaic()` / `MixedDataset.close_mosaic()`, then `utils/datasets.py: rebuild_loader` restarts the workers (they hold their own copy of the dataset) |
 | `--clip-grad X` | Clip the gradient norm, against loss spikes | `scaler.unscale_` then `clip_grad_norm_` before the optimizer step |
 | `--patience N` | Stop after N validated epochs without fitness improvement | best epoch tracked with `best_fitness`; DDP ranks stop together (broadcast); no effect with `--notest` |
+| `--save-period N` | Also save `weights/epoch_NNN.pt` every N epochs (upstream: `--save_period`, W&B upload only). Upstream already saves epoch 0, every 25th epoch and the last 5 | the checkpoint block in `train.py` / `train_aux.py` |
 | `--unfreeze-epoch N` | Train with `--freeze` layers frozen, then unfreeze them from epoch N | re-enables `requires_grad` (frozen weights are already in the optimizer); not in DDP mode |
 
 ---
