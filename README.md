@@ -710,6 +710,7 @@ and `0.5`), against 16-19% with the border set to 0.
 
 | Path | What |
 |---|---|
+| `tests/`, `.github/workflows/tests.yml` | Test suite and its CI workflow ([What was tested](#what-was-tested)) |
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
 | `tools/inspect_sample.py` | Shows how training loads one image: its label file, the labels training uses (cache), its size as cached and loaded, the frame with its labels drawn, and augmented samples built around it (for an object that looks unlabelled in `train_batch*.jpg`) |
 | `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects, with a fixed share for simulated sources (section 8) |
@@ -754,7 +755,25 @@ Each step changes one thing, so comparing neighbours isolates its effect:
 
 ## What was tested
 
-All on CPU with synthetic data (generated frames with known objects; real camera data and GPUs were not available):
+**Automated tests** (`tests/`, run by GitHub Actions on every push and pull request, `.github/workflows/tests.yml`; CPU,
+synthetic frames with known objects, about 5 minutes):
+
+```bash
+pip install pytest
+python -m pytest tests                 # everything
+python -m pytest tests -m "not slow"   # without the end-to-end train.py / test.py runs
+```
+
+| File | Checks |
+|---|---|
+| `tests/test_mixed_loader.py` | the training loader as `train.py` builds it: samples per source match the weights every epoch, linear / step schedules, mosaic / mixup / paste-in partners stay within the source, every visible object keeps its label, frames used equally often, same batches with 0 or 2 workers and after resume, `--close-mosaic` rebuild, proportional sampling, `epoch_size` (total / target / source / int), DDP ranks, repeat-factor sampling |
+| `tests/test_labels.py` | native and fit samples (mosaic, crop, zoom, mixup, paste-in) keep every visible label; `fg_crop_prob`; mosaics mixing polygon and box labels; polygon -> box; pooled folders; label cache rebuilt for changed labels or another label folder; missing label folder / files |
+| `tests/test_propose_weights.py` | reference weights, `--max-repeat` caps after rounding, `--sim-final`, finetune / specialist, errors, auto target, frames balancing against the frames per sample training uses, the written yaml accepted by training |
+| `tests/test_models.py` | yolov7-tiny and the P2 config: strides, loss weights, both losses, output shapes, pretrained weight transfer |
+| `tests/test_train_smoke.py` (`slow`) | `train.py` with a multi-source yaml (schedule, `simulated`, `--close-mosaic`, `--save-period`) and `test.py` on it; the P2 model on a plain yaml, two seeded runs identical |
+
+**Earlier manual checks**, all on CPU with synthetic data (generated frames with known objects; real camera data and
+GPUs were not available):
 
 - Stock pipeline unchanged: a seeded 2-epoch run reproduces the pre-change `results.txt` exactly (re-checked after each
   change to the data loading).

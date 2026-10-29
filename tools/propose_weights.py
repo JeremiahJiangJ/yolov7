@@ -223,15 +223,21 @@ def main():
     n = np.asarray(n, dtype=float)
 
     target_note = ''
-    if target is None:  # generalist / balanced without a target: the smallest real source, the most at risk
-        target = names[int(np.argmin(np.where(real, n, np.inf)))]
-        target_note = (f'no target given: {target} (the smallest {"real " if sim.any() else ""}source) is marked '
-                       f'target, so its val picks best.pt and --patience; pass --target to choose another')
+    has_val = np.array([bool(s.get('val') or data.get('val')) for s in srcs])  # training needs the target's val
+    if target is None:  # generalist / balanced without a target: the smallest real source with a val, the most at risk
+        pick = real & has_val if (real & has_val).any() else real
+        target = names[int(np.argmin(np.where(pick, n, np.inf)))]
+        target_note = (f'no target given: {target} (the smallest {"real " if sim.any() else ""}source'
+                       f'{" with a val" if (real & has_val).any() else ""}) is marked target, so its val picks best.pt '
+                       f'and --patience; pass --target to choose another')
     if target not in names:
         sys.exit(f'error: --target {target}: no such source (sources: {names})')
     t = names.index(target)
     if sim[t]:
         sys.exit(f'error: the target {target} is simulated: the target (its val picks best.pt) must be a real source')
+    if not has_val[t]:
+        target_note += ('; ' if target_note else '') + (f'WARNING: the target {target} has no val (nor a top-level '
+                                                        f'val:): add one before training, it picks best.pt')
 
     # frames and objects per sample, as training builds the samples
     fps = ops = None

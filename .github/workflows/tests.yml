@@ -1,0 +1,29 @@
+# CPU test suite (tests/): multi-source sampling and loading, augmentation label safety, label caches,
+# tools/propose_weights.py, model configs, and end-to-end train.py / test.py runs on tiny synthetic data.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies (CPU PyTorch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy opencv-python-headless matplotlib Pillow PyYAML requests scipy tqdm pandas seaborn \
+            tensorboard pytest
+      - name: Fast tests
+        run: python -m pytest tests -m "not slow" -v --durations=10
+      - name: End-to-end train.py / test.py
+        run: python -m pytest tests -m slow -v --durations=10
