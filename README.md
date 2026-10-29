@@ -714,6 +714,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | `tools/inspect_sample.py` | Shows how training loads one image: its label file, the labels training uses (cache), its size as cached and loaded, the frame with its labels drawn, and augmented samples built around it (for an object that looks unlabelled in `train_batch*.jpg`) |
 | `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects, with a fixed share for simulated sources (section 8) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
+| `cfg/training/yolov7-tiny-p2.yaml` | yolov7-tiny with a fourth, stride-4 (P2) output for small objects: 6.05M parameters, 14.6 GFLOPs at 640 (stock 13.0), 4x the predictions before NMS. Layers 0-76 equal yolov7-tiny's, so `yolov7-tiny.pt` transfers to all but the P2 branch and the detection layer; the objectness loss weights become P2-P5 [4, 4, 1, 0.4] (`utils/loss.py: obj_balance`) |
 | `data/mixed/template.yaml` | Commented multi-source template (target camC, supplementary camA / camB, IR / RGB example) |
 | `data/mixed/1_...` to `6_...` | Experiment ladder (below) |
 | `scripts/train_mixed_ladder.sh` | Trains and tests the ladder with identical settings (`STEPS="1 5 6"` for a subset) |
