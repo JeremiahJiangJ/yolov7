@@ -1,6 +1,6 @@
 # End to end on CPU: train.py with a multi-source yaml (schedule, simulated key, --close-mosaic, --save-period, NWD
-# box loss) and with a plain yaml (P2 model), test.py on the result, and seeded reproducibility. Tiny data and image
-# size: this checks that everything runs and is wired together, not accuracy.
+# box loss) and with a plain yaml (P2 model, Wise-IoU v3, slide loss), test.py on the result, and seeded
+# reproducibility. Tiny data and image size: this checks that everything runs and is wired together, not accuracy.
 
 import subprocess
 import sys
@@ -28,9 +28,10 @@ def data(tmp_path_factory):
     plain = {'nc': 1, 'names': ['o'], 'train': [a, b], 'val': a}
     with open(ROOT / 'data' / 'hyp.scratch.tiny.yaml') as f:
         hyp = yaml.safe_load(f)
-    hyp['nwd'] = 0.5  # the multi-source run also trains with the NWD box loss
+    hyp_nwd = {**hyp, 'nwd': 0.5}  # the multi-source run also trains with the NWD box loss
+    hyp_wiou = {**hyp, 'iou_loss': 'wiou', 'slide': 1}  # the plain runs with Wise-IoU v3 and slide loss
     paths = {}
-    for name, d in (('mixed', mixed), ('plain', plain), ('hyp_nwd', hyp)):
+    for name, d in (('mixed', mixed), ('plain', plain), ('hyp_nwd', hyp_nwd), ('hyp_wiou', hyp_wiou)):
         paths[name] = root / f'{name}.yaml'
         paths[name].write_text(yaml.safe_dump(d))
     return root, paths
@@ -64,8 +65,9 @@ def test_train_mixed_then_test(data):
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
 
 
-def test_train_plain_p2_is_reproducible(data):
+def test_train_plain_p2_wiou_slide_is_reproducible(data):
     root, paths = data
-    runs = [train(root, paths['plain'], f'plain{i}', cfg='cfg/training/yolov7-tiny-p2.yaml')[0] for i in range(2)]
+    runs = [train(root, paths['plain'], f'plain{i}', cfg='cfg/training/yolov7-tiny-p2.yaml', hyp=paths['hyp_wiou'])[0]
+            for i in range(2)]
     a, b = [(r / 'results.txt').read_text() for r in runs]
     assert a == b  # same seed, same CPU: identical losses and metrics

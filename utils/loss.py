@@ -1,5 +1,7 @@
 # Loss functions
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,19 +23,83 @@ def obj_balance(det):
     return [4.0] * p2 + {3: [4.0, 1.0, 0.4]}.get(det.nl - p2, [4.0, 1.0, 0.25, 0.06, .02])
 
 
-def box_loss(pbox, tbox, stride, hyp):
+def box_loss(pbox, tbox, stride, hyp, wiou=None):
     """Box regression loss and the CIoU (objectness target) of predictions pbox vs targets tbox, (n, 4) xywh in grid
-    units of a level with this stride. Stock: mean(1 - CIoU). hyp 'nwd' r > 0 blends in the Normalized Wasserstein
-    Distance (Wang et al. 2021, for tiny objects, where IoU collapses for offsets of a pixel or two):
-    mean((1 - r)(1 - CIoU) + r(1 - NWD)), NWD computed in pixels with constant hyp 'nwd_c' (default 12.8 px, about
-    the typical object size)."""
+    units of a level with this stride. Stock: mean(1 - CIoU). With wiou (hyp iou_loss: wiou, see wiou_state()) the
+    Wise-IoU v3 loss replaces 1 - CIoU. hyp 'nwd' r > 0 blends in the Normalized Wasserstein Distance (Wang et al.
+    2021, for tiny objects, where IoU collapses for offsets of a pixel or two): mean((1 - r) L + r(1 - NWD)), NWD
+    computed in pixels with constant hyp 'nwd_c' (default 12.8 px, about the typical object size)."""
     iou = bbox_iou(pbox.T, tbox, x1y1x2y2=False, CIoU=True)
-    loss = 1.0 - iou
+    loss = wiou_v3(pbox, tbox, wiou) if wiou is not None else 1.0 - iou
     r = float(hyp.get('nwd', 0.0))
     if r > 0:
         s = float(stride)
         loss = (1.0 - r) * loss + r * (1.0 - bbox_nwd(pbox * s, tbox * s, float(hyp.get('nwd_c', 12.8))))
     return loss.mean(), iou
+
+
+class WIoUState:
+    """Wise-IoU v3 settings and the running mean of 1 - IoU it normalises by (one per loss object)."""
+
+    def __init__(self, h):
+        self.mean = 1.0
+        self.momentum = 1 - 0.5 ** (1 / float(h.get('wiou_halflife', 7000)))  # half-life in loss calls (batches)
+        self.alpha, self.delta = float(h.get('wiou_alpha', 1.9)), float(h.get('wiou_delta', 3.0))
+
+
+def wiou_state(h):
+    kind = h.get('iou_loss', 'ciou')
+    assert kind in ('ciou', 'wiou'), f"hyp iou_loss must be ciou or wiou, got {kind!r}"
+    return WIoUState(h) if kind == 'wiou' else None
+
+
+def wiou_v3(pbox, tbox, state, eps=1e-7):
+    """Wise-IoU v3 (Tong et al. 2023, https://arxiv.org/abs/2301.10051), boxes (n, 4) xywh. v1: (1 - IoU) scaled by
+    exp(centre distance^2 / enclosing-box diagonal^2), the denominator detached. v3 adds a non-monotonic focusing
+    weight r = beta / (delta * alpha^(beta - delta)), beta = (1 - IoU) / running mean of (1 - IoU): ordinary boxes
+    get the most weight, very good ones and outliers (beta large: e.g. loose or wrong labels) less. The running mean
+    is updated in training only (autograd on), so validation losses do not move it."""
+    (px, py, pw, ph), (tx, ty, tw, th) = pbox.T, tbox.T
+    inter = (torch.min(px + pw / 2, tx + tw / 2) - torch.max(px - pw / 2, tx - tw / 2)).clamp(0) * \
+            (torch.min(py + ph / 2, ty + th / 2) - torch.max(py - ph / 2, ty - th / 2)).clamp(0)
+    l_iou = 1.0 - inter / (pw * ph + tw * th - inter + eps)
+    cw = torch.max(px + pw / 2, tx + tw / 2) - torch.min(px - pw / 2, tx - tw / 2)  # enclosing box
+    ch = torch.max(py + ph / 2, ty + th / 2) - torch.min(py - ph / 2, ty - th / 2)
+    r_wiou = torch.exp(((px - tx) ** 2 + (py - ty) ** 2) / (cw ** 2 + ch ** 2 + eps).detach())
+    if torch.is_grad_enabled() and len(l_iou):
+        state.mean = (1 - state.momentum) * state.mean + state.momentum * float(l_iou.detach().mean())
+    beta = l_iou.detach() / max(state.mean, eps)
+    r = beta / (state.delta * state.alpha ** (beta - state.delta))
+    return r * r_wiou * l_iou
+
+
+class SlideLoss(nn.Module):
+    """Slide loss (Yu et al. 2022, YOLO-FaceV2, https://arxiv.org/abs/2208.02019) around a BCE loss_fcn, for
+    objectness (targets: the IoU of positives, 0 elsewhere). Per element weight 1 for targets <= mu - 0.1 (negatives,
+    poor positives), e^(1 - mu) between mu - 0.1 and mu, e^(1 - target) from mu: the most weight near the boundary
+    between positives and negatives, the hard cases. mu: mean IoU of the positives (slide_mu()), at least 0.2."""
+
+    def __init__(self, loss_fcn):
+        super().__init__()
+        self.loss_fcn, self.reduction, self.mu = loss_fcn, loss_fcn.reduction, 0.5
+        self.loss_fcn.reduction = 'none'
+
+    def forward(self, pred, true):
+        loss = self.loss_fcn(pred, true)
+        mu = self.mu
+        w = torch.where(true <= mu - 0.1, torch.ones_like(true),
+                        torch.where(true < mu, torch.full_like(true, math.exp(1 - mu)), torch.exp(1 - true)))
+        loss = loss * w
+        return loss.mean() if self.reduction == 'mean' else loss.sum() if self.reduction == 'sum' else loss
+
+
+def slide_wrap(BCEobj, h):
+    return SlideLoss(BCEobj) if h.get('slide', 0) else BCEobj
+
+
+def slide_mu(BCEobj, iou):
+    if isinstance(BCEobj, SlideLoss) and len(iou):
+        BCEobj.mu = max(float(iou.detach().mean()), 0.2)
 
 
 class BCEBlurWithLogitsLoss(nn.Module):
@@ -466,7 +532,9 @@ class ComputeLoss:
         #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.1, .05])  # P3-P7
         #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.5, 0.4, .1])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        BCEobj = slide_wrap(BCEobj, h)  # slide loss on objectness (hyp slide: 1)
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        self.wiou = wiou_state(h)  # Wise-IoU v3 running mean (hyp iou_loss: wiou), else None
         for k in 'na', 'nc', 'nl', 'anchors', 'stride':
             setattr(self, k, getattr(det, k))
 
@@ -488,11 +556,12 @@ class ComputeLoss:
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                lb, iou = box_loss(pbox, tbox[i], self.stride[i], self.hyp)  # iou(prediction, target)
+                lb, iou = box_loss(pbox, tbox[i], self.stride[i], self.hyp, self.wiou)  # iou(prediction, target)
                 lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                slide_mu(self.BCEobj, iou)  # slide loss: mean IoU of this level's positives
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -598,7 +667,9 @@ class ComputeLossOTA:
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = obj_balance(det)  # P3-P7, or P2-P5
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        BCEobj = slide_wrap(BCEobj, h)  # slide loss on objectness (hyp slide: 1)
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        self.wiou = wiou_state(h)  # Wise-IoU v3 running mean (hyp iou_loss: wiou), else None
         for k in 'na', 'nc', 'nl', 'anchors', 'stride':
             setattr(self, k, getattr(det, k))
 
@@ -626,11 +697,12 @@ class ComputeLossOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp, self.wiou)  # iou(prediction, target)
                 lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                slide_mu(self.BCEobj, iou)  # slide loss: mean IoU of this level's positives
 
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
@@ -892,7 +964,9 @@ class ComputeLossBinOTA:
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = obj_balance(det)  # P3-P7, or P2-P5
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        BCEobj = slide_wrap(BCEobj, h)  # slide loss on objectness (hyp slide: 1)
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        self.wiou = wiou_state(h)  # Wise-IoU v3 running mean (hyp iou_loss: wiou), else None
         for k in 'na', 'nc', 'nl', 'anchors', 'stride', 'bin_count':
             setattr(self, k, getattr(det, k))
 
@@ -949,11 +1023,12 @@ class ComputeLossBinOTA:
                 
                 
                 
-                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp, self.wiou)  # iou(prediction, target)
                 lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                slide_mu(self.BCEobj, iou)  # slide loss: mean IoU of this level's positives
 
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
@@ -1218,7 +1293,9 @@ class ComputeLossAuxOTA:
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = obj_balance(det)  # P3-P7, or P2-P5
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        BCEobj = slide_wrap(BCEobj, h)  # slide loss on objectness (hyp slide: 1)
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        self.wiou = wiou_state(h)  # Wise-IoU v3 running mean (hyp iou_loss: wiou), else None
         for k in 'na', 'nc', 'nl', 'anchors', 'stride':
             setattr(self, k, getattr(det, k))
 
@@ -1251,11 +1328,12 @@ class ComputeLossAuxOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp)  # iou(prediction, target)
+                lb, iou = box_loss(pbox, selected_tbox, self.stride[i], self.hyp, self.wiou)  # iou(prediction, target)
                 lbox += lb  # iou loss (1 - CIoU, blended with 1 - NWD: hyp nwd)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                slide_mu(self.BCEobj, iou)  # slide loss: mean IoU of this level's positives
 
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
@@ -1278,7 +1356,7 @@ class ComputeLossAuxOTA:
                 pbox_aux = torch.cat((pxy_aux, pwh_aux), 1)  # predicted box
                 selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
                 selected_tbox_aux[:, :2] -= grid_aux
-                lb_aux, iou_aux = box_loss(pbox_aux, selected_tbox_aux, self.stride[i], self.hyp)
+                lb_aux, iou_aux = box_loss(pbox_aux, selected_tbox_aux, self.stride[i], self.hyp, self.wiou)
                 lbox += 0.25 * lb_aux  # iou loss
 
                 # Objectness

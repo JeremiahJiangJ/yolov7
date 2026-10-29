@@ -9,6 +9,8 @@ warmup_bias_lr: 0.0  # warmup initial bias lr
 box: 0.05  # box loss gain
 # nwd: 0.5  # tiny objects: blend the box loss with NWD, 0-1 (0 = stock CIoU; README.md, section 7)
 # nwd_c: 12.8  # NWD constant in pixels, about the typical object size
+# iou_loss: wiou  # box loss: ciou (default) or wiou (Wise-IoU v3, robust to loose / wrong boxes; README.md, section 7)
+# slide: 1  # slide loss on objectness: more weight near the positive / negative boundary (hard cases), 0 = off
 cls: 0.5  # cls loss gain
 cls_pw: 1.0  # cls BCELoss positive_weight
 obj: 1.0  # obj loss gain (scale with pixels)

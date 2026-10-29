@@ -85,3 +85,65 @@ def test_training_step_with_nwd(cfg, hyp):
     loss = ComputeLossOTA(m)(m(x), targets, x)[0]
     loss.backward()
     assert torch.isfinite(loss).all()
+
+
+def test_wise_iou_v3():
+    import math
+    from utils.loss import WIoUState, wiou_v3
+    state = WIoUState({})
+    t = torch.tensor([[5.0, 5, 2, 2]])
+    with torch.no_grad():
+        assert wiou_v3(t, t, state).abs().item() < 1e-6  # perfect box: no loss
+        assert state.mean == 1.0  # no autograd (validation): the running mean does not move
+    p = torch.tensor([[5.5, 5, 2, 2]])
+    l_iou = 1 - (1.5 * 2) / (8 - 1.5 * 2)  # IoU of a 2x2 box shifted by 0.5
+    enclosing = 2.5 ** 2 + 2 ** 2
+    state.mean = l_iou / 3  # beta = 3 = delta: focusing weight 1
+    state.momentum = 0.0
+    assert math.isclose(wiou_v3(p, t, state).item(), math.exp(0.25 / enclosing) * l_iou, rel_tol=1e-5)
+    # non-monotonic focusing: the weight peaks for ordinary boxes (beta = 1 / ln(alpha), about 1.56) and is low for
+    # very good boxes (beta near 0) and outliers (beta large, e.g. loose or wrong labels)
+    r = lambda beta: beta / (3 * 1.9 ** (beta - 3))  # noqa: E731
+    peak = 1 / math.log(1.9)
+    assert r(peak) > max(r(1), r(3)) and r(0.1) < 0.3 and r(10) < 0.05
+    state.momentum = 0.5
+    wiou_v3(p.requires_grad_(), t, state)  # training: the running mean moves halfway to this batch's mean
+    assert math.isclose(state.mean, 0.5 * l_iou / 3 + 0.5 * l_iou, rel_tol=1e-6)
+
+
+def test_slide_loss_weights():
+    import math
+    from utils.loss import SlideLoss, slide_mu
+    s = SlideLoss(torch.nn.BCEWithLogitsLoss())
+    slide_mu(s, torch.tensor([0.5, 0.7, 0.6]))  # mu = 0.6
+    pred, true = torch.zeros(4), torch.tensor([0.0, 0.55, 0.6, 0.9])
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(pred, true, reduction='none')
+    w = torch.tensor([1.0, math.exp(0.4), math.exp(0.4), math.exp(0.1)])  # <= mu - 0.1 | (mu - 0.1, mu) | >= mu
+    assert torch.isclose(s(pred, true), (bce * w).mean())
+    slide_mu(s, torch.tensor([0.05]))
+    assert s.mu == 0.2  # floor
+
+
+def test_new_losses_off_by_default_and_validated(hyp):
+    from utils.loss import SlideLoss
+    m = build(TINY, hyp)
+    loss = ComputeLossOTA(m)
+    assert loss.wiou is None and not isinstance(loss.BCEobj, SlideLoss)  # stock hyp: stock loss
+    with pytest.raises(AssertionError):
+        ComputeLossOTA(build(TINY, {**hyp, 'iou_loss': 'giou'}))
+
+
+@pytest.mark.parametrize('cfg', [TINY, P2])
+@pytest.mark.parametrize('loss_cls', [ComputeLoss, ComputeLossOTA])
+def test_training_step_with_wiou_slide_nwd(cfg, loss_cls, hyp):
+    m = build(cfg, {**hyp, 'iou_loss': 'wiou', 'slide': 1, 'nwd': 0.5})
+    m.train()
+    x = torch.rand(2, 3, 256, 256)
+    targets = torch.tensor([[0, 0, 0.5, 0.5, 0.02, 0.02], [1, 1, 0.3, 0.3, 0.05, 0.05]])
+    crit = loss_cls(m)
+    for _ in range(2):  # the Wise-IoU running mean moves in training
+        out = m(x)
+        loss = crit(out, targets, x)[0] if loss_cls is ComputeLossOTA else crit(out, targets)[0]
+        loss.backward()
+        assert torch.isfinite(loss).all()
+    assert crit.wiou.mean != 1.0
