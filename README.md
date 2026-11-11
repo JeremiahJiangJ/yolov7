@@ -207,9 +207,15 @@ augmentation and loss gains):
 | `hyp.finetune.sgd.yaml` | 0.001 | 0.1 | 0.0005 | 1 | 0.01 |
 | `hyp.scratch.adamw.yaml` | 0.001 | 0.01 | 0.05 | 3 | 0 |
 | `hyp.finetune.adamw.yaml` | 1e-5 | 0.1 | 0.05 | 1 | 0 |
+| `hyp.scratch.p5.adamw.yaml` | 0.001 | 0.01 | 0.05 | 3 | 0 |
+
+`hyp.scratch.p5.adamw.yaml` is for the full `yolov7` / `yolov7x` (`train.py`, `cfg/training/yolov7.yaml`, from
+`yolov7_training.pt`): `hyp.scratch.p5.yaml`'s loss gains (`cls` 0.3, `obj` 0.7) and augmentation (`scale` 0.9,
+`translate` 0.2, `mixup` and `paste_in` 0.15) with the AdamW settings above.
 
 `train.py` warns if the hyp file name says AdamW but `--adam` is missing, or the reverse. The files contain
-commented-out `scale_min` / `scale_max` ([section 9](#scale-augmentation-scale_min--scale_max)).
+commented-out `scale_min` / `scale_max` ([section 9](#scale-augmentation-scale_min--scale_max)) and the optional
+losses (`nwd`, `iou_loss`, `slide`; [section 7](#7-training-recipe-options)).
 
 ---
 
