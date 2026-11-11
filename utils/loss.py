@@ -38,6 +38,40 @@ def box_loss(pbox, tbox, stride, hyp, wiou=None):
     return loss.mean(), iou
 
 
+def simota_match(txyxy, pxyxys, p_cls, p_obj, tcls, hyp, topk=10, eps=1e-7):
+    """SimOTA matching of one image's targets (boxes txyxy (t, 4), classes tcls (t,)) to candidate predictions (boxes
+    pxyxys (n, 4) in pixels, class logits p_cls (n, nc), objectness logits p_obj (n, 1)). Returns (fg mask (n,),
+    matched target index per foreground prediction). Same result as upstream YOLOv7, computed without the
+    (t, n, nc) copies of the predictions upstream made per image (memory quadratic in the number of objects: the
+    reported out-of-memory errors and slowdowns with loss_ota), with the per-target top-k loop vectorised, and in
+    float32 with the class scores clamped (under AMP an fp16 sigmoid of exactly 1 made the cost inf / NaN)."""
+    sim = assign_similarity(txyxy.float(), pxyxys.float(), hyp)  # (t, n) IoU, blended with NWD: hyp nwd_assign
+    iou_cost = -torch.log(sim + 1e-8)
+    dynamic_ks = torch.clamp(torch.topk(sim, min(topk, sim.shape[1]), dim=1)[0].sum(1).int(), min=1)
+    # class cost: BCE of y = sqrt(sigmoid(cls) * sigmoid(obj)) against the one-hot class, per (target, prediction)
+    # = -[sum_k log(1 - y_k) + log y_c - log(1 - y_c)], c the target's class
+    y = (p_cls.float().sigmoid() * p_obj.float().sigmoid()).sqrt().clamp(eps, 1 - eps)  # (n, nc)
+    log_y, log_1y = torch.log(y), torch.log1p(-y)
+    cls_cost = -(log_1y.sum(1)[None] + (log_y - log_1y).T[tcls])  # (t, n)
+    cost = cls_cost + 3.0 * iou_cost
+    # each target takes its dynamic_k lowest-cost predictions: one batched topk per distinct k (at most topk calls,
+    # not one per target with a GPU sync each), with the same k as upstream's per-target topk, so that ties between
+    # duplicate candidates (find_3_positive lists a cell / anchor once per target near it) break the same way
+    matching = torch.zeros_like(cost, dtype=torch.bool)
+    for k in dynamic_ks.unique().tolist():
+        rows = (dynamic_ks == k).nonzero(as_tuple=True)[0]
+        matching[rows[:, None], torch.topk(cost[rows], k, dim=1, largest=False)[1]] = True
+    # a prediction taken by several targets goes to the one with the lowest cost
+    multi = matching.sum(0) > 1
+    if multi.any():
+        cols = multi.nonzero(as_tuple=True)[0]
+        best = cost[:, cols].argmin(0)
+        matching[:, cols] = False
+        matching[best, cols] = True
+    fg = matching.any(0)
+    return fg, matching[:, fg].float().argmax(0)
+
+
 def assign_similarity(txyxy, pxyxys, hyp):
     """Target-prediction similarity (n, m) for SimOTA assignment, boxes xyxy in pixels. Stock: IoU, which sets each
     target's number of positives (sum of its top-k IoUs) and its -log cost. hyp 'nwd_assign' r > 0 blends in NWD
@@ -743,6 +777,7 @@ class ComputeLossOTA:
         loss = lbox + lobj + lcls
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
+    @torch.no_grad()  # assignment only: no autograd graph for its large intermediate tensors
     def build_targets(self, p, targets, imgs):
         
         #indices, anch = self.find_positive(p, targets)
@@ -767,7 +802,7 @@ class ComputeLossOTA:
             if this_target.shape[0] == 0:
                 continue
                 
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            txywh = this_target[:, 2:6] * torch.tensor(imgs.shape[3:1:-1] * 2, device=targets.device)  # px: W, H, W, H
             txyxy = xywh2xyxy(txywh)
 
             pxyxys = []
@@ -816,53 +851,8 @@ class ComputeLossOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
-
-            pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
-
-            top_k, _ = torch.topk(pair_wise_iou, min(10, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
-            gt_cls_per_image = (
-                F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
-                .float()
-                .unsqueeze(1)
-                .repeat(1, pxyxys.shape[0], 1)
-            )
-
-            num_gt = this_target.shape[0]
-            cls_preds_ = (
-                p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-                * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-            )
-
-            y = cls_preds_.sqrt_()
-            pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
-               torch.log(y/(1-y)) , gt_cls_per_image, reduction="none"
-            ).sum(-1)
-            del cls_preds_
-        
-            cost = (
-                pair_wise_cls_loss
-                + 3.0 * pair_wise_iou_loss
-            )
-
-            matching_matrix = torch.zeros_like(cost, device=device)
-
-            for gt_idx in range(num_gt):
-                _, pos_idx = torch.topk(
-                    cost[gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-                )
-                matching_matrix[gt_idx][pos_idx] = 1.0
-
-            del top_k, dynamic_ks
-            anchor_matching_gt = matching_matrix.sum(0)
-            if (anchor_matching_gt > 1).sum() > 0:
-                _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
-                matching_matrix[:, anchor_matching_gt > 1] *= 0.0
-                matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
-            fg_mask_inboxes = (matching_matrix.sum(0) > 0.0).to(device)
-            matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+            fg_mask_inboxes, matched_gt_inds = simota_match(txyxy, pxyxys, p_cls, p_obj, this_target[:, 1].long(),
+                                                            self.hyp, topk=10)
         
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
@@ -891,12 +881,12 @@ class ComputeLossOTA:
                 matching_targets[i] = torch.cat(matching_targets[i], dim=0)
                 matching_anchs[i] = torch.cat(matching_anchs[i], dim=0)
             else:
-                matching_bs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_as[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gjs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gis[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_targets[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_anchs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
+                matching_bs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_as[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gjs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gis[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_targets[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_anchs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
 
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs           
 
@@ -1069,6 +1059,7 @@ class ComputeLossBinOTA:
         loss = lbox + lobj + lcls
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
+    @torch.no_grad()  # assignment only: no autograd graph for its large intermediate tensors
     def build_targets(self, p, targets, imgs):
         
         #indices, anch = self.find_positive(p, targets)
@@ -1093,7 +1084,7 @@ class ComputeLossBinOTA:
             if this_target.shape[0] == 0:
                 continue
                 
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            txywh = this_target[:, 2:6] * torch.tensor(imgs.shape[3:1:-1] * 2, device=targets.device)  # px: W, H, W, H
             txyxy = xywh2xyxy(txywh)
 
             pxyxys = []
@@ -1146,53 +1137,8 @@ class ComputeLossBinOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
-
-            pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
-
-            top_k, _ = torch.topk(pair_wise_iou, min(10, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
-            gt_cls_per_image = (
-                F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
-                .float()
-                .unsqueeze(1)
-                .repeat(1, pxyxys.shape[0], 1)
-            )
-
-            num_gt = this_target.shape[0]            
-            cls_preds_ = (
-                p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-                * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-            )
-
-            y = cls_preds_.sqrt_()
-            pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
-               torch.log(y/(1-y)) , gt_cls_per_image, reduction="none"
-            ).sum(-1)
-            del cls_preds_
-        
-            cost = (
-                pair_wise_cls_loss
-                + 3.0 * pair_wise_iou_loss
-            )
-
-            matching_matrix = torch.zeros_like(cost)
-
-            for gt_idx in range(num_gt):
-                _, pos_idx = torch.topk(
-                    cost[gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-                )
-                matching_matrix[gt_idx][pos_idx] = 1.0
-
-            del top_k, dynamic_ks
-            anchor_matching_gt = matching_matrix.sum(0)
-            if (anchor_matching_gt > 1).sum() > 0:
-                _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
-                matching_matrix[:, anchor_matching_gt > 1] *= 0.0
-                matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
-            fg_mask_inboxes = matching_matrix.sum(0) > 0.0
-            matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+            fg_mask_inboxes, matched_gt_inds = simota_match(txyxy, pxyxys, p_cls, p_obj, this_target[:, 1].long(),
+                                                            self.hyp, topk=10)
         
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
@@ -1221,12 +1167,12 @@ class ComputeLossBinOTA:
                 matching_targets[i] = torch.cat(matching_targets[i], dim=0)
                 matching_anchs[i] = torch.cat(matching_anchs[i], dim=0)
             else:
-                matching_bs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_as[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gjs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gis[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_targets[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_anchs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
+                matching_bs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_as[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gjs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gis[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_targets[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_anchs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
 
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs       
 
@@ -1398,6 +1344,7 @@ class ComputeLossAuxOTA:
         loss = lbox + lobj + lcls
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
+    @torch.no_grad()  # assignment only: no autograd graph for its large intermediate tensors
     def build_targets(self, p, targets, imgs):
         
         indices, anch = self.find_3_positive(p, targets)
@@ -1418,7 +1365,7 @@ class ComputeLossAuxOTA:
             if this_target.shape[0] == 0:
                 continue
                 
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            txywh = this_target[:, 2:6] * torch.tensor(imgs.shape[3:1:-1] * 2, device=targets.device)  # px: W, H, W, H
             txyxy = xywh2xyxy(txywh)
 
             pxyxys = []
@@ -1467,53 +1414,8 @@ class ComputeLossAuxOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
-
-            pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
-
-            top_k, _ = torch.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
-            gt_cls_per_image = (
-                F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
-                .float()
-                .unsqueeze(1)
-                .repeat(1, pxyxys.shape[0], 1)
-            )
-
-            num_gt = this_target.shape[0]
-            cls_preds_ = (
-                p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-                * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-            )
-
-            y = cls_preds_.sqrt_()
-            pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
-               torch.log(y/(1-y)) , gt_cls_per_image, reduction="none"
-            ).sum(-1)
-            del cls_preds_
-        
-            cost = (
-                pair_wise_cls_loss
-                + 3.0 * pair_wise_iou_loss
-            )
-
-            matching_matrix = torch.zeros_like(cost)
-
-            for gt_idx in range(num_gt):
-                _, pos_idx = torch.topk(
-                    cost[gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-                )
-                matching_matrix[gt_idx][pos_idx] = 1.0
-
-            del top_k, dynamic_ks
-            anchor_matching_gt = matching_matrix.sum(0)
-            if (anchor_matching_gt > 1).sum() > 0:
-                _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
-                matching_matrix[:, anchor_matching_gt > 1] *= 0.0
-                matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
-            fg_mask_inboxes = matching_matrix.sum(0) > 0.0
-            matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+            fg_mask_inboxes, matched_gt_inds = simota_match(txyxy, pxyxys, p_cls, p_obj, this_target[:, 1].long(),
+                                                            self.hyp, topk=20)
         
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
@@ -1542,15 +1444,16 @@ class ComputeLossAuxOTA:
                 matching_targets[i] = torch.cat(matching_targets[i], dim=0)
                 matching_anchs[i] = torch.cat(matching_anchs[i], dim=0)
             else:
-                matching_bs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_as[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gjs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gis[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_targets[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_anchs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
+                matching_bs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_as[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gjs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gis[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_targets[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_anchs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
 
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs
 
+    @torch.no_grad()  # assignment only: no autograd graph for its large intermediate tensors
     def build_targets2(self, p, targets, imgs):
         
         indices, anch = self.find_5_positive(p, targets)
@@ -1571,7 +1474,7 @@ class ComputeLossAuxOTA:
             if this_target.shape[0] == 0:
                 continue
                 
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            txywh = this_target[:, 2:6] * torch.tensor(imgs.shape[3:1:-1] * 2, device=targets.device)  # px: W, H, W, H
             txyxy = xywh2xyxy(txywh)
 
             pxyxys = []
@@ -1620,53 +1523,8 @@ class ComputeLossAuxOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
-
-            pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
-
-            top_k, _ = torch.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
-            gt_cls_per_image = (
-                F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
-                .float()
-                .unsqueeze(1)
-                .repeat(1, pxyxys.shape[0], 1)
-            )
-
-            num_gt = this_target.shape[0]
-            cls_preds_ = (
-                p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-                * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
-            )
-
-            y = cls_preds_.sqrt_()
-            pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
-               torch.log(y/(1-y)) , gt_cls_per_image, reduction="none"
-            ).sum(-1)
-            del cls_preds_
-        
-            cost = (
-                pair_wise_cls_loss
-                + 3.0 * pair_wise_iou_loss
-            )
-
-            matching_matrix = torch.zeros_like(cost)
-
-            for gt_idx in range(num_gt):
-                _, pos_idx = torch.topk(
-                    cost[gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-                )
-                matching_matrix[gt_idx][pos_idx] = 1.0
-
-            del top_k, dynamic_ks
-            anchor_matching_gt = matching_matrix.sum(0)
-            if (anchor_matching_gt > 1).sum() > 0:
-                _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
-                matching_matrix[:, anchor_matching_gt > 1] *= 0.0
-                matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
-            fg_mask_inboxes = matching_matrix.sum(0) > 0.0
-            matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+            fg_mask_inboxes, matched_gt_inds = simota_match(txyxy, pxyxys, p_cls, p_obj, this_target[:, 1].long(),
+                                                            self.hyp, topk=20)
         
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
@@ -1695,12 +1553,12 @@ class ComputeLossAuxOTA:
                 matching_targets[i] = torch.cat(matching_targets[i], dim=0)
                 matching_anchs[i] = torch.cat(matching_anchs[i], dim=0)
             else:
-                matching_bs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_as[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gjs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_gis[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_targets[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
-                matching_anchs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
+                matching_bs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_as[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gjs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_gis[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_targets[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
+                matching_anchs[i] = torch.tensor([], device=targets.device, dtype=torch.int64)
 
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs              
 
