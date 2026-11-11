@@ -147,3 +147,43 @@ def test_training_step_with_wiou_slide_nwd(cfg, loss_cls, hyp):
         loss.backward()
         assert torch.isfinite(loss).all()
     assert crit.wiou.mean != 1.0
+
+
+def test_assign_similarity():
+    from utils.general import box_iou, box_nwd, xywh2xyxy
+    from utils.loss import assign_similarity
+    t = xywh2xyxy(torch.tensor([[10.0, 10, 6, 6], [80, 80, 40, 30]]))
+    p = xywh2xyxy(torch.tensor([[12.0, 10, 6, 6], [30, 10, 8, 8], [82, 80, 40, 30]]))
+    assert torch.equal(assign_similarity(t, p, {}), box_iou(t, p))  # nwd_assign off: stock IoU
+    s = assign_similarity(t, p, {'nwd_assign': 0.5, 'nwd_c': 12.8})
+    assert torch.allclose(s, 0.5 * box_iou(t, p) + 0.5 * box_nwd(t, p, 12.8))
+    assert box_iou(t, p)[0, 1] == 0 and s[0, 1] > 0.1  # no overlap, still ranked by distance
+
+
+@pytest.mark.parametrize('cfg, px, stock_n', [(TINY, 12, 2), (P2, 5, 1)])
+def test_nwd_assignment_gives_small_objects_more_positives(cfg, px, stock_n, hyp):
+    """At the start of training a small object's IoU with every candidate prediction is near 0, so SimOTA gives it
+    one or two positives; blended with NWD it gets several. (A 5 px object on stock yolov7-tiny has only 5 candidates,
+    from the 3-cell prior and anchor-shape filter, so NWD assignment adds little there: P2 supplies the candidates.)"""
+    imgs = torch.zeros(1, 3, 256, 256)
+    targets = torch.tensor([[0, 0, 0.5, 0.5, px / 256, px / 256]])
+
+    def positives(h):
+        torch.manual_seed(0)
+        m = build(cfg, h)
+        m.train()
+        with torch.no_grad():
+            bs = ComputeLossOTA(m).build_targets(m(imgs), targets, imgs)[0]
+        return sum(len(b) for b in bs)
+
+    assert positives(hyp) == stock_n and positives({**hyp, 'nwd_assign': 0.5}) >= 2 * stock_n
+
+
+def test_training_step_with_nwd_assignment(hyp):
+    m = build(P2, {**hyp, 'nwd_assign': 0.5, 'nwd': 0.5})
+    m.train()
+    x = torch.rand(2, 3, 256, 256)
+    targets = torch.tensor([[0, 0, 0.5, 0.5, 0.02, 0.02], [1, 1, 0.3, 0.3, 0.2, 0.2]])
+    loss = ComputeLossOTA(m)(m(x), targets, x)[0]
+    loss.backward()
+    assert torch.isfinite(loss).all()

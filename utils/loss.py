@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.general import bbox_iou, bbox_nwd, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.general import bbox_iou, bbox_nwd, bbox_alpha_iou, box_iou, box_nwd, box_giou, box_diou, box_ciou, xywh2xyxy
 from utils.torch_utils import is_parallel
 
 
@@ -36,6 +36,19 @@ def box_loss(pbox, tbox, stride, hyp, wiou=None):
         s = float(stride)
         loss = (1.0 - r) * loss + r * (1.0 - bbox_nwd(pbox * s, tbox * s, float(hyp.get('nwd_c', 12.8))))
     return loss.mean(), iou
+
+
+def assign_similarity(txyxy, pxyxys, hyp):
+    """Target-prediction similarity (n, m) for SimOTA assignment, boxes xyxy in pixels. Stock: IoU, which sets each
+    target's number of positives (sum of its top-k IoUs) and its -log cost. hyp 'nwd_assign' r > 0 blends in NWD
+    (Wang et al. 2021, where most of NWD's gain on tiny objects came from assignment): (1 - r) IoU + r NWD, NWD with
+    constant hyp 'nwd_c'. A tiny target then gets more positives, ranked by distance, instead of one chosen among
+    predictions that all have IoU near 0."""
+    iou = box_iou(txyxy, pxyxys)
+    r = float(hyp.get('nwd_assign', 0.0))
+    if r > 0:
+        iou = (1.0 - r) * iou + r * box_nwd(txyxy, pxyxys, float(hyp.get('nwd_c', 12.8)))
+    return iou
 
 
 class WIoUState:
@@ -803,7 +816,7 @@ class ComputeLossOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = box_iou(txyxy, pxyxys)
+            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
@@ -1133,7 +1146,7 @@ class ComputeLossBinOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = box_iou(txyxy, pxyxys)
+            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
@@ -1454,7 +1467,7 @@ class ComputeLossAuxOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = box_iou(txyxy, pxyxys)
+            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
@@ -1607,7 +1620,7 @@ class ComputeLossAuxOTA:
             all_gi = torch.cat(all_gi, dim=0)
             all_anch = torch.cat(all_anch, dim=0)
         
-            pair_wise_iou = box_iou(txyxy, pxyxys)
+            pair_wise_iou = assign_similarity(txyxy, pxyxys, self.hyp)  # IoU, blended with NWD: hyp nwd_assign
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 

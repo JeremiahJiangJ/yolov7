@@ -450,6 +450,15 @@ def bbox_alpha_iou(box1, box2, x1y1x2y2=False, GIoU=False, DIoU=False, CIoU=Fals
         return iou # torch.log(iou+eps) or iou
 
 
+def box_nwd(box1, box2, c=12.8):
+    # Pairwise Normalized Wasserstein Distance (see bbox_nwd()) of boxes box1 (n, 4) and box2 (m, 4), xyxy, in the units
+    # of c (pixels): (n, m)
+    (x1, y1, x2, y2), (u1, v1, u2, v2) = box1.T[:, :, None], box2.T[:, None, :]
+    d2 = ((x1 + x2 - u1 - u2) / 2) ** 2 + ((y1 + y2 - v1 - v2) / 2) ** 2 + \
+         (((x2 - x1) - (u2 - u1)) / 2) ** 2 + (((y2 - y1) - (v2 - v1)) / 2) ** 2
+    return torch.exp(-torch.sqrt(d2 + 1e-7) / c)
+
+
 def box_iou(box1, box2):
     # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
     """

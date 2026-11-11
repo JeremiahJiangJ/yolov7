@@ -28,7 +28,7 @@ def data(tmp_path_factory):
     plain = {'nc': 1, 'names': ['o'], 'train': [a, b], 'val': a}
     with open(ROOT / 'data' / 'hyp.scratch.tiny.yaml') as f:
         hyp = yaml.safe_load(f)
-    hyp_nwd = {**hyp, 'nwd': 0.5}  # the multi-source run also trains with the NWD box loss
+    hyp_nwd = {**hyp, 'nwd': 0.5, 'nwd_assign': 0.5}  # the multi-source run also trains with NWD (loss, assignment)
     hyp_wiou = {**hyp, 'iou_loss': 'wiou', 'slide': 1}  # the plain runs with Wise-IoU v3 and slide loss
     paths = {}
     for name, d in (('mixed', mixed), ('plain', plain), ('hyp_nwd', hyp_nwd), ('hyp_wiou', hyp_wiou)):
