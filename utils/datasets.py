@@ -726,7 +726,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         x['version'] = 0.1  # cache version
         x['label_folder'] = self.label_folder_name
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(x, path)  # save for next time
+        # save for next time, atomically: runs started together on the same labels (seeds, propose_weights.py) may
+        # read the cache while another writes it, and must never see a half-written file
+        tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+        torch.save(x, tmp)
+        os.replace(tmp, path)
         logging.info(f'{prefix}New cache created: {path}')
         return x
 

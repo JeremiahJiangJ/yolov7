@@ -185,6 +185,8 @@ every run reads the current label files; `--keep-cache` keeps them (also for `te
 - `LoadImagesAndLabels`: cache path resolution (file, or directory + `labels_<hash of image paths>.cache`); pooled
   lists get `_pooled_<hash>`; a cache is rebuilt if its image list or label folder differs from the current ones, or
   the total size of the label and image files changed (upstream's check, which upstream disables).
+- Caches are written atomically (a temporary file, then renamed), so runs started together on the same labels
+  (parallel seeds, several `propose_weights.py --measure`) never read a half-written cache.
 - `delete_label_caches_at_exit()`: every cache read or written is recorded; an `atexit` handler deletes them (and
   directories left empty). SIGTERM / SIGHUP are turned into a normal exit. Only the main process cleans up (not
   dataloader workers, not other DDP ranks). Called by `train.py` and `test.py`.

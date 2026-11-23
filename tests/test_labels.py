@@ -144,3 +144,25 @@ def test_caches_are_deleted_at_exit_registration():
     # train.py / test.py call this; it registers an atexit handler (idempotent)
     delete_label_caches_at_exit()
     delete_label_caches_at_exit()
+
+
+def test_concurrent_runs_share_a_label_cache(tmp_path):
+    """Several processes building the same dataset at once (parallel seeds, propose_weights.py runs) all succeed and
+    leave no temporary files. Cache writes are atomic (temporary file, then rename), so a reader never sees a
+    half-written cache; the race is rare at this size, so this is a smoke test rather than a reproduction."""
+    import subprocess
+    import sys
+    from conftest import ROOT
+    src = make_source(tmp_path, 's', (320, 320), (60, 60, 60), 400, seed=3)
+    code = ('import sys; sys.path.insert(0, sys.argv[1]); import utils.general; '
+            'from utils.datasets import LoadImagesAndLabels; '
+            'd = LoadImagesAndLabels(sys.argv[2], 640, 1); assert sum(len(l) for l in d.labels) == 800')
+    for _ in range(3):
+        for f in (tmp_path / 's').glob('*.cache'):
+            f.unlink()
+        procs = [subprocess.Popen([sys.executable, '-c', code, str(ROOT), src], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        for p in procs:
+            _, err = p.communicate(timeout=300)
+            assert p.returncode == 0, err[-2000:]
+    assert not list((tmp_path / 's').glob('*.tmp'))

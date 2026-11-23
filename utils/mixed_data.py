@@ -626,7 +626,8 @@ def measure_datasets(cfg, hyp, img_size):
     delete_label_caches_at_exit()
     datasets = [LoadImagesAndLabels(src.path, img_size, 16, augment=True, hyp=hyp, prefix=f'[{src.name}] ',
                                     label_folder_name=src.label_folder, resize=src.resize,
-                                    fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells)
+                                    fg_crop_prob=src.fg_crop_prob, mosaic_max_cells=src.mosaic_max_cells,
+                                    cache_path=src.cache_path)
                 for src in cfg.sources]
     for d, src in zip(datasets, cfg.sources):  # partners by repeat factor, as in training
         if src.repeat_factor_threshold > 0:
