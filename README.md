@@ -751,6 +751,13 @@ Options: `--split train|val`, `--bins` (size bin edges, px; default 7 12 16), `-
 with fewer than N instances in the largest bin; default 10), `--hierarchy` (yaml mapping fine class names to coarse
 class names, e.g. `{sedan: car, pickup: car}`), `--csv` (also write the table to a file).
 
+`--by-source` (with `--img-size`, default 640) adds, per class and source, the median smallest box side as training
+sees it (native or the source's `resize` factor) and as stock YOLOv7 would (each frame's long side resized to
+`--img-size`), with the spread of those medians across sources (largest / smallest). A spread near 1x means the class
+appears at a consistent pixel size on every camera; stock resizing typically widens it, since each camera is shrunk by
+its own factor. Use it to check that native-resolution training keeps scale consistent, or to set per-source `resize`
+factors where cameras see the same objects at different sizes.
+
 ### Experiment ladder
 
 Each step changes one thing, so comparing neighbours isolates its effect:
@@ -780,7 +787,7 @@ python -m pytest tests -m "not slow"   # without the end-to-end train.py / test.
 | File | Checks |
 |---|---|
 | `tests/test_mixed_loader.py` | the training loader as `train.py` builds it: samples per source match the weights every epoch, linear / step schedules, mosaic / mixup / paste-in partners stay within the source, every visible object keeps its label, frames used equally often, same batches with 0 or 2 workers and after resume, `--close-mosaic` rebuild, proportional sampling, `epoch_size` (total / target / source / int), DDP ranks, repeat-factor sampling |
-| `tests/test_labels.py` | native and fit samples (mosaic, crop, zoom, mixup, paste-in) keep every visible label; `fg_crop_prob`; mosaics mixing polygon and box labels; polygon -> box; pooled folders; label cache rebuilt for changed labels or another label folder; missing label folder / files |
+| `tests/test_labels.py` | `class_audit.py --by-source` scale spread; concurrent label caches; native and fit samples (mosaic, crop, zoom, mixup, paste-in) keep every visible label; `fg_crop_prob`; mosaics mixing polygon and box labels; polygon -> box; pooled folders; label cache rebuilt for changed labels or another label folder; missing label folder / files |
 | `tests/test_propose_weights.py` | reference weights, `--max-repeat` caps after rounding, `--sim-final`, finetune / specialist, errors, auto target, frames balancing against the frames per sample training uses, the written yaml accepted by training |
 | `tests/test_ota.py` | OTA assignment: identical to upstream on dense scenes with duplicate candidates; no NaN from saturated scores; no targets on CPU; non-square images; no autograd graph |
 | `tests/test_models.py` | yolov7-tiny and the P2 config: strides, loss weights, both losses, output shapes, pretrained weight transfer; NWD values and the box-loss blend; NWD assignment (stock unchanged, more positives for small objects); Wise-IoU v3 (value, focusing, running mean in training only); slide loss weights; new losses off by default; training steps with all of them |

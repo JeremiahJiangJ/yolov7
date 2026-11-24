@@ -9,6 +9,10 @@
 #   python tools/class_audit.py --data data/mixed/template.yaml                     # train_sources or train: yaml
 #   python tools/class_audit.py --data data.yaml --label-folder-name labels --bins 7 12 16 --csv audit.csv
 #   python tools/class_audit.py --data data.yaml --hierarchy hierarchy.yaml        # also totals per coarse class
+#   python tools/class_audit.py --data data.yaml --by-source --img-size 640        # object size per class and source
+# --by-source: per class, each source's median smallest box side as training sees it (native / resize factor) and as
+# stock YOLOv7 would see it (each frame resized so its long side is --img-size), and the spread of those medians
+# across sources (largest / smallest): whether a class appears at a consistent size on different cameras.
 # hierarchy.yaml maps fine class names to coarse class names: {sedan: car, pickup: car, ...}
 
 import argparse
@@ -36,7 +40,7 @@ def group_of(frames):
 
 
 def scan(path, label_folder, scale, split_name):
-    """Yield (class, smallest side in px, frame id) for every label of the frames of `path`."""
+    """Yield (class, smallest side in px as training sees it, frame id, frame long side in px) for every label."""
     files = list_images(path)
     bad = 0
     for f, lb in zip(files, img2label_paths(files, label_folder)):
@@ -58,7 +62,7 @@ def scan(path, label_folder, scale, split_name):
             continue
         for r in rows:
             c, bw, bh = int(float(r[0])), float(r[3]), float(r[4])
-            yield c, min(bw * w, bh * h) * s, f
+            yield c, min(bw * w, bh * h) * s, f, max(w, h)
     if bad:
         print(f'WARNING: {split_name}: {bad} images could not be read', file=sys.stderr)
 
@@ -75,6 +79,9 @@ def main():
                         help='flag classes with fewer instances than this in the largest size bin')
     parser.add_argument('--hierarchy', default='', help='yaml mapping fine class names to coarse class names')
     parser.add_argument('--csv', default='', help='also write the table to this csv file')
+    parser.add_argument('--by-source', action='store_true',
+                        help='per class and source: median size as training sees it and as stock YOLOv7 sees it')
+    parser.add_argument('--img-size', type=int, default=640, help='--by-source: stock (fit) training size')
     opt = parser.parse_args()
 
     with open(opt.data) as f:
@@ -92,16 +99,21 @@ def main():
     inst = np.zeros((len(names), len(bin_names)), dtype=int)
     frames = defaultdict(set)
     per_source = defaultdict(lambda: np.zeros(len(names), dtype=int))
+    sizes = defaultdict(lambda: ([], []))  # (source, class) -> (sizes as trained, sizes resized to --img-size)
     n_frames = 0
     for src_name, path, folder, scale in parts:
         n_frames += len(list_images(path))
-        for c, side, f in scan(path, folder, scale, src_name):
+        s_raw = 1.0 if scale in ('fit', 'native') else float(scale)
+        for c, side, f, long_side in scan(path, folder, scale, src_name):
             if not 0 <= c < len(names):
                 print(f'WARNING: class {c} out of range in {f}', file=sys.stderr)
                 continue
             inst[c, int(np.searchsorted(edges, side, side='right'))] += 1
             frames[c].add(f)
             per_source[src_name][c] += 1
+            if opt.by_source:
+                sizes[(src_name, c)][0].append(side)
+                sizes[(src_name, c)][1].append(side / s_raw * opt.img_size / long_side)
 
     rows = []
     for c, name in enumerate(names):
@@ -130,6 +142,22 @@ def main():
           (f': {", ".join(map(str, few[:30]))}{" ..." if len(few) > 30 else ""}' if few else ''))
     tiny = inst[:, 0].sum() / max(inst.sum(), 1)
     print(f'  {tiny:.1%} of all instances are {bin_names[0]} px')
+
+    if opt.by_source:  # does a class appear at a consistent size across sources?
+        print(f'\nMedian smallest box side (px) per source: as trained here (native / resize factor) vs stock '
+              f'YOLOv7 (long side resized to {opt.img_size}); spread = largest / smallest median across sources')
+        srcs = [p[0] for p in parts]
+        print(f"{'class':>16}{'source':>14}{'instances':>11}{'trained':>10}{'stock':>9}")
+        for c, name in enumerate(names):
+            meds = [(sname, len(sizes[(sname, c)][0]), np.median(sizes[(sname, c)][0]), np.median(sizes[(sname, c)][1]))
+                    for sname in srcs if sizes[(sname, c)][0]]
+            if not meds:
+                continue
+            for sname, n, m_t, m_s in meds:
+                print(f'{name:>16}{sname:>14}{n:>11}{m_t:>10.1f}{m_s:>9.1f}')
+            if len(meds) > 1:
+                t, st = [m[2] for m in meds], [m[3] for m in meds]
+                print(f"{'':>16}{'spread':>14}{'':>11}{max(t) / min(t):>9.2f}x{max(st) / min(st):>8.2f}x")
 
     if opt.hierarchy:  # totals per coarse class
         with open(opt.hierarchy) as f:

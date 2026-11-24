@@ -166,3 +166,24 @@ def test_concurrent_runs_share_a_label_cache(tmp_path):
             _, err = p.communicate(timeout=300)
             assert p.returncode == 0, err[-2000:]
     assert not list((tmp_path / 's').glob('*.tmp'))
+
+
+def test_class_audit_by_source_shows_scale_consistency(tmp_path):
+    """Objects of the same size on a 1280 px and a 640 px camera: about equal as trained at native resolution, 2x
+    apart once stock YOLOv7 resizes each frame's long side to 640."""
+    import subprocess
+    import sys
+    import yaml
+    from conftest import ROOT
+    a = make_source(tmp_path, 'camA', (1280, 720), (60, 60, 60), 4, seed=1, obj_px=(20, 21))
+    b = make_source(tmp_path, 'camB', (640, 480), (60, 60, 60), 4, seed=2, obj_px=(20, 21))
+    d = tmp_path / 'd.yaml'
+    d.write_text(yaml.safe_dump({'nc': 1, 'names': ['veh'], 'resize': 'native', 'train_sources': [
+        {'name': 'camA', 'path': a, 'val': a, 'target': True, 'weight': 1}, {'name': 'camB', 'path': b, 'weight': 1}]}))
+    out = subprocess.run([sys.executable, 'tools/class_audit.py', '--data', str(d), '--by-source', '--img-size', '640'],
+                         capture_output=True, text=True, cwd=ROOT, check=True).stdout
+    rows = {l.split()[1]: l.split() for l in out.splitlines() if l.split()[:1] == ['veh'] and len(l.split()) == 5}
+    assert float(rows['camA'][3]) == 20.0 and float(rows['camA'][4]) == 10.0  # native 20 px; stock 20 x 640/1280
+    assert float(rows['camB'][3]) == float(rows['camB'][4]) == 20.0  # a 640 px camera is not resized
+    spread = [l.split() for l in out.splitlines() if l.split()[:1] == ['spread']][0]
+    assert spread[1] == '1.00x' and spread[2] == '2.00x'
