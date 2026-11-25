@@ -71,6 +71,7 @@ python train.py --weights yolov7-tiny.pt --cfg cfg/training/yolov7-tiny.yaml --d
 | 11 | [Knowledge distillation](#11-knowledge-distillation) | `--teacher`, `--distill-weight` | `utils/distill.py`, `train.py`, `train_aux.py` |
 | 12 | [IR polarity inversion and grayscale](#12-ir-polarity-inversion-and-grayscale) | `px_inversion_prob:` + `inversion_border:`, `to_gray:` in the data yaml; `test.py --invert` | `utils/datasets.py`, `utils/mixed_data.py`, `test.py` |
 | 13 | [Tools, scripts and example configs](#13-tools-scripts-and-example-configs) | | `tools/class_audit.py`, `tools/propose_weights.py`, `scripts/`, `data/mixed/` |
+| 14 | [Video annotation tool](#14-video-annotation-tool) | `python tools/annotator/server.py` | `tools/annotator/` |
 
 Also: [Behaviour changes without new flags](#behaviour-changes-without-new-flags), [What was tested](#what-was-tested),
 [Known limitations](#known-limitations), [Citation](#citation).
@@ -726,6 +727,7 @@ and `0.5`), against 16-19% with the border set to 0.
 | `tests/`, `.github/workflows/tests.yml` | Test suite and its CI workflow ([What was tested](#what-was-tested)) |
 | `tools/class_audit.py` | Class x size audit from label files and image headers (see below) |
 | `tools/inspect_sample.py` | Shows how training loads one image: its label file, the labels training uses (cache), its size as cached and loaded, the frame with its labels drawn, and augmented samples built around it (for an object that looks unlabelled in `train_batch*.jpg`) |
+| `tools/annotator/` | Video annotation tool with CVAT for video export (section 14) |
 | `tools/propose_weights.py` | Proposes `train_sources` weights for a purpose (generalist, balanced, finetune, specialist), as shares of the samples, frames loaded or objects, with a fixed share for simulated sources (section 8) |
 | `python -m utils.mixed_data` | Dry run of a multi-source config: the data plan without training (section 8) |
 | `cfg/training/yolov7-tiny-p2.yaml` | yolov7-tiny with a fourth, stride-4 (P2) output for small objects: 6.05M parameters, 14.6 GFLOPs at 640 (stock 13.0), 4x the predictions before NMS. Layers 0-76 equal yolov7-tiny's, so `yolov7-tiny.pt` transfers to all but the P2 branch and the detection layer; the objectness loss weights become P2-P5 [4, 4, 1, 0.4] (`utils/loss.py: obj_balance`) |
@@ -773,6 +775,100 @@ Each step changes one thing, so comparing neighbours isolates its effect:
 
 ---
 
+## 14. Video annotation tool
+
+`tools/annotator/` is a local web app for annotating video with boxes, built around the problems of CVAT's free
+version: model-assisted labelling, task-specific tags and correcting a tracker that drifted. It needs only the packages
+this repository already uses (the server is Python's standard library, the page plain JavaScript), runs offline, and
+writes CVAT for video 1.1 XML.
+
+```bash
+python tools/annotator/server.py --frames /data/flight3/images --labels vehicle aircraft --tags truncated
+python tools/annotator/server.py --video flight3.mp4 --weights best.pt         # pre-labelling with your model
+python tools/annotator/server.py --frames ... --import-cvat task.xml --import-as-auto   # fix a CVAT task
+# then open http://127.0.0.1:8765
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--frames` / `--video` | required | a folder of frames (sorted by file name, CVAT's default order) or a video (extracted once to `<name>_frames/`) |
+| `--project` | `<frames folder>.annotations.json` | the project file; autosaved every second after a change, and on exit |
+| `--export` | the project path with `.xml` | where Export writes the CVAT XML |
+| `--labels`, `--tags` | | labels and tags to start with; both can be added in the page at any time |
+| `--import-cvat`, `--import-as-auto` | | start from a CVAT for video file; with `--import-as-auto` every box becomes an auto box (see below) |
+| `--weights`, `--device`, `--img-size` | | a YOLOv7 checkpoint for pre-labelling, at native resolution unless `--img-size` is given |
+| `--host`, `--port` | 127.0.0.1, 8765 | |
+
+### Keyframes and auto boxes
+
+A track has explicit boxes on some frames and is interpolated between them, as in CVAT. Each explicit box is either a
+**keyframe** (placed or approved by a person; drawn thick) or an **auto box** (from the tracker, the detector or an
+edit; drawn thin). Interpolated frames are dashed.
+
+In CVAT, tracker output is a keyframe on every frame, so when the tracker drifts every box has to be fixed by hand.
+Here a correction spreads over the auto boxes, chosen at the top of the page (S cycles):
+
+| Correction | Effect of moving one box |
+|---|---|
+| **drift** (default) | that box becomes a keyframe; the auto boxes before it move by the same correction scaled down to 0 at the previous keyframe; the ones after it move by the full correction, scaled down to 0 at the next keyframe if there is one. Fix the frame where the drift is worst; a keyframe where the tracker was right bounds the change |
+| **shift run** | the same correction on every auto box between the keyframes around it (a constant offset) |
+| **this frame** | only that box |
+
+Other ways to fix many boxes at once:
+
+- **Several tracks together:** select them (Shift+click, Ctrl+A) and drag one; all move, each with the correction mode.
+  For boxes that all moved because the camera moved.
+- **A range** ([ and ] at its first and last frame, or Shift+drag on the timeline): **Alt+drag** moves the selected
+  tracks by the same amount on every frame of the range; **R** drops the auto boxes in it (back to interpolation);
+  **U** unlocks keyframes into auto boxes, so corrections spread over them (for tracker output imported from CVAT);
+  **L** locks auto boxes as keyframes.
+- **Tracking to a keyframe:** **T** tracks forward to the next keyframe (or 300 frames). The tracker's error at the
+  keyframe is spread back over the run, so a long track only needs a keyframe at its end.
+- **Camera motion** (Tools): estimates each frame's camera motion once (background features, robust to moving
+  objects), after which interpolation, holding and the tracker's predictions follow the scene, so keyframes can be
+  much further apart when the camera pans or zooms.
+
+### Tags
+
+Tags are yes/no properties defined per project and added, renamed or removed at any time in the side panel (a removed
+tag is removed from every box; undo restores it). **Alt+1-9** toggles them, **C** toggles occluded and **O** marks the
+object leaving (outside) or coming back. A change applies from the current frame up to the track's next keyframe, so
+it covers a run of tracker boxes; when the current frame is inside the selected range it applies to exactly that range.
+In the CVAT export each tag is a checkbox attribute on every label.
+
+### Pre-labelling
+
+With `--weights`, Tools > Pre-label runs the detector on a range of frames (at the given confidence) and links the
+detections into tracks: same class, overlapping or within 1.5x the box size of the track's last box (small objects
+rarely overlap between frames), gaps of up to 5 frames interpolated, tracks shorter than the minimum length dropped.
+The tracks are auto boxes with their scores, so review means deleting false tracks, correcting drift as above and
+adding what was missed. Use your largest model at a low confidence: reviewing is faster than drawing.
+
+### Export
+
+Export writes CVAT for video 1.1 XML as CVAT does: every frame of each track from its first box to the frame it leaves
+(that frame as an outside box), keyframes and auto boxes with `keyframe="1"`, interpolated frames with `keyframe="0"`.
+To load it into CVAT, create the task from the same frames in the same order (CVAT's default lexicographical sort) and
+upload the file as "CVAT for video 1.1". Optionally the same export writes YOLO labels (one `.txt` per frame,
+`class cx cy w h`, classes in the project's label order) for training with this repository directly.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| D / F, arrows (Shift: 10), Space, `,` / `.` | previous / next frame, play, previous / next keyframe of the selected track |
+| N, 1-9, Shift+1-9 | draw mode, label for new boxes, change the selected tracks' label |
+| click, Shift+click, Tab, Ctrl+A, Esc | select, add to selection, cycle, all, clear |
+| drag, Alt+drag | move or resize (boxes under 20 px on screen move; zoom in to resize), move over the range |
+| T, K, O, C, Alt+1-9 | track, keyframe, outside, occluded, tags |
+| [ ] \\, R, U, L | range start / end / clear, re-interpolate, unlock, lock |
+| Delete, Shift+Delete | delete this frame's box, delete the selected tracks |
+| H, M, wheel, right-drag, 0 | hide boxes, magnifier, zoom, pan, fit |
+| Ctrl+Z, Ctrl+S | undo (300 steps), save |
+
+Files: `core.py` (tracks, interpolation, corrections, undo), `cvat.py` (import / export), `vision.py` (frames, camera
+motion, template tracker, detector), `server.py` (HTTP API and command line), `static/` (the page).
+
 ## What was tested
 
 **Automated tests** (`tests/`, run by GitHub Actions on every push and pull request, `.github/workflows/tests.yml`; CPU,
@@ -791,6 +887,7 @@ python -m pytest tests -m "not slow"   # without the end-to-end train.py / test.
 | `tests/test_propose_weights.py` | reference weights, `--max-repeat` caps after rounding, `--sim-final`, finetune / specialist, errors, auto target, frames balancing against the frames per sample training uses, the written yaml accepted by training |
 | `tests/test_ota.py` | OTA assignment: identical to upstream on dense scenes with duplicate candidates; no NaN from saturated scores; no targets on CPU; non-square images; no autograd graph |
 | `tests/test_models.py` | yolov7-tiny and the P2 config: strides, loss weights, both losses, output shapes, pretrained weight transfer; NWD values and the box-loss blend; NWD assignment (stock unchanged, more positives for small objects); Wise-IoU v3 (value, focusing, running mean in training only); slide loss weights; new losses off by default; training steps with all of them |
+| `tests/test_annotator.py` | annotation tool: interpolation and holding, outside, drift / shift / frame-only corrections, group moves as one undo step, unlocking keyframes, range shift / re-interpolate, tags on ranges and single frames, tag rename / removal, CVAT for video export (every frame, outside, attributes) and round trip, YOLO export, template tracker on a moving 8 px object, camera-motion estimate and world-coordinate interpolation, detection linking across gaps, pre-labelling with a yolov7-tiny checkpoint, the HTTP API end to end |
 | `tests/test_train_smoke.py` (`slow`) | `train.py` with a multi-source yaml (schedule, `simulated`, `--close-mosaic`, `--save-period`, `nwd`, `nwd_assign`) and `test.py` on it; the P2 model on a plain yaml with `iou_loss: wiou` and `slide: 1`, two seeded runs identical |
 
 **Earlier manual checks**, all on CPU with synthetic data (generated frames with known objects; real camera data and
